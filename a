@@ -108,7 +108,7 @@ gui.Parent = parent or lp:WaitForChild("PlayerGui")
 -- Single draggable container holds both panels.
 local container = Instance.new("Frame")
 container.Name = "FarmAssistContainer"
-container.Size = UDim2.fromOffset(270, 322)   -- 214 (freeze) + 8 gap + 100 (log)
+container.Size = UDim2.fromOffset(270, 402)   -- 214 (freeze) + 8 gap + 180 (log)
 container.Position = UDim2.new(1, -290, 0, 100)
 container.BackgroundTransparency = 1
 container.BorderSizePixel = 0
@@ -200,15 +200,26 @@ hint.Size = UDim2.new(1, 0, 0, 16)
 hint.TextXAlignment = Enum.TextXAlignment.Center
 
 -- Activity Log panel (bottom)
-local wframe = makePanel(container, 222, 100)
+local wframe = makePanel(container, 222, 180)
 local wTitleBar = makeTitle(wframe, "Activity Log")
 local wDot  = makeDot(wframe, 33)
 local wMain = makeLabel(wframe, 31, 13, Color3.new(1, 1, 1),
     Enum.Font.GothamBold, "Activity Log: RUNNING", 32, -44)
 local wRecover = makeLabel(wframe, 50, 11, Color3.fromRGB(190, 190, 190),
     nil, "Auto-recover: 0", 12, -24)
-local wLast = makeLabel(wframe, 68, 11, Color3.fromRGB(170, 170, 170),
-    Enum.Font.Code, "(no output yet)", 12, -24)
+
+local wLast = Instance.new("TextLabel")
+wLast.Size = UDim2.new(1, -24, 0, 110)
+wLast.Position = UDim2.new(0, 12, 0, 68)
+wLast.BackgroundTransparency = 1
+wLast.Font = Enum.Font.Code
+wLast.TextSize = 11
+wLast.TextColor3 = Color3.fromRGB(170, 170, 170)
+wLast.TextXAlignment = Enum.TextXAlignment.Left
+wLast.TextYAlignment = Enum.TextYAlignment.Top
+wLast.TextWrapped = true
+wLast.Text = "(no output yet)"
+wLast.Parent = wframe
 
 -- Drag: both title bars move the shared container.
 local dragStart, startPos
@@ -608,7 +619,11 @@ local function refreshLogGui()
         wMain.Text = string.format("Activity Log: PAUSED  (%d lines)", logLineCount)
     end
     wRecover.Text = string.format("Auto-recover: %d   (range %d studs)", autoRecovers, STUCK_TELEPORT_RANGE)
-    wLast.Text = lastLogLine ~= "" and lastLogLine:sub(1, 58) or "(no output yet)"
+    -- Show the last few lines so long RECOVER messages wrap instead of clipping.
+    local tail = {}
+    local startIdx = math.max(1, #logBuffer - 2)
+    for i = startIdx, #logBuffer do tail[#tail + 1] = logBuffer[i] end
+    wLast.Text = #tail > 0 and table.concat(tail, "\n") or "(no output yet)"
 end
 
 task.spawn(function()
