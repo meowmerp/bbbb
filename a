@@ -41,6 +41,10 @@ local IGNORE = {
     "Stack End",
     "will be suppressed",
 }
+-- Remote names to skip entirely (not logged, not counted)
+local REMOTE_IGNORE = {
+    ["replicate_hit"] = true,
+}
 
 -- Auto-recover
 local AUTO_RECOVER            = true
@@ -54,6 +58,12 @@ local GOODPOS_MAX_AGE         = 120
 local PROP_BLACKLIST = {
     "morvik_intro_human",
 }
+
+-- File I/O capability check
+local HAS_READ   = (type(readfile) == "function") and (type(isfile) == "function")
+local HAS_WRITE  = (type(writefile) == "function")
+local HAS_APPEND = (type(appendfile) == "function")
+local FILE_STATUS = "unknown"   -- shown in the panel
 
 -- STATE
 local killed = false
@@ -71,7 +81,7 @@ local lastLogLine    = ""
 local logTotalLines  = 0
 local logWrittenLines = 0
 
-local knownMobs      = {}    -- starts empty; fills up from what the script sees
+local knownMobs      = {}
 local knownMobsCount = 0
 local lastMobSeen    = ""
 
@@ -95,16 +105,27 @@ if getgenv then
     g.ActivityLog = {}
 end
 
--- MOB LIST: load names from previous sessions, if the file exists
-if isfile and readfile and isfile(MOB_FILE) then
-    pcall(function()
-        for line in readfile(MOB_FILE):gmatch("[^\r\n]+") do
+-- Determine initial file status
+if not HAS_WRITE then
+    FILE_STATUS = "unsupported"
+    warn("[FarmAssist] Executor has no writefile — mob_list.txt cannot be saved.")
+else
+    FILE_STATUS = "ready"
+end
+
+-- Load existing mob list
+if HAS_READ and HAS_WRITE and isfile(MOB_FILE) then
+    local ok, data = pcall(readfile, MOB_FILE)
+    if ok and type(data) == "string" then
+        for line in data:gmatch("[^\r\n]+") do
             if line ~= "" then
                 knownMobs[line] = true
                 knownMobsCount = knownMobsCount + 1
             end
         end
-    end)
+        FILE_STATUS = "loaded"
+        print(string.format("[FarmAssist] Loaded %d mobs from %s", knownMobsCount, MOB_FILE))
+    end
 end
 
 local function isBlacklistedName(name)
@@ -114,9 +135,10 @@ local function isBlacklistedName(name)
     return false
 end
 
+-- Save one mob. Tries appendfile first; falls back to writefile; verifies
+-- the file actually exists afterward and reports failure clearly.
 local function saveMobName(name)
-    if not name or name == "" then return end
-    if name == "none" then return end
+    if not name or name == "" or name == "none" then return end
     if isBlacklistedName(name) then return end
     if knownMobs[name] then return end
 
@@ -124,18 +146,45 @@ local function saveMobName(name)
     knownMobsCount = knownMobsCount + 1
     lastMobSeen = name
 
-    pcall(function()
-        if appendfile then
-            appendfile(MOB_FILE, name .. "\n")
-        elseif writefile then
+    if not HAS_WRITE then
+        -- No file support at all: internal only.
+        FILE_STATUS = "unsupported"
+        print("[MOB SAVED-INTERNAL] " .. name .. " (executor cannot write files)")
+        return
+    end
+
+    local wroteOk = false
+
+    -- Try appendfile only if the file already exists (some executors refuse
+    -- to create files with appendfile).
+    if HAS_APPEND and HAS_READ and isfile(MOB_FILE) then
+        wroteOk = pcall(appendfile, MOB_FILE, name .. "\n")
+    end
+
+    -- Fall back to writefile (full rewrite from current set)
+    if not wroteOk then
+        wroteOk = pcall(function()
             local names = {}
             for m in pairs(knownMobs) do names[#names + 1] = m end
             table.sort(names)
             writefile(MOB_FILE, table.concat(names, "\n") .. "\n")
-        end
-    end)
+        end)
+    end
 
-    print("[MOB SAVED] " .. name)
+    -- Verify the file is really there
+    local exists = false
+    if HAS_READ then
+        pcall(function() exists = isfile(MOB_FILE) end)
+    end
+
+    if wroteOk and exists then
+        FILE_STATUS = "saving"
+        print("[MOB SAVED] " .. name)
+    else
+        FILE_STATUS = "write failed"
+        warn("[MOB SAVED-INTERNAL] " .. name ..
+            " (file write failed — check your executor's workspace folder)")
+    end
 end
 
 local function extractMobName(line)
@@ -163,7 +212,7 @@ gui.Parent = parent or lp:WaitForChild("PlayerGui")
 
 local container = Instance.new("Frame")
 container.Name = "FarmAssistContainer"
-container.Size = UDim2.fromOffset(270, 422)
+container.Size = UDim2.fromOffset(270, 442)
 container.Position = UDim2.new(1, -290, 0, 100)
 container.BackgroundTransparency = 1
 container.BorderSizePixel = 0
@@ -254,8 +303,8 @@ local hint = makeLabel(frame, 197, 11, Color3.fromRGB(140, 140, 140), nil,
 hint.Size = UDim2.new(1, 0, 0, 16)
 hint.TextXAlignment = Enum.TextXAlignment.Center
 
--- Activity Log panel (bottom)
-local wframe = makePanel(container, 222, 200)
+-- Activity Log panel (bottom) - grew 20px for the file status line
+local wframe = makePanel(container, 222, 220)
 local wTitleBar = makeTitle(wframe, "Activity Log")
 local wDot  = makeDot(wframe, 33)
 local wMain = makeLabel(wframe, 31, 13, Color3.new(1, 1, 1),
@@ -278,6 +327,9 @@ wLast.Parent = wframe
 
 local wMobs = makeLabel(wframe, 176, 11, Color3.fromRGB(150, 200, 150),
     Enum.Font.Code, "Mobs known: 0", 12, -24)
+
+local wFileStatus = makeLabel(wframe, 196, 10, Color3.fromRGB(150, 150, 150),
+    Enum.Font.Code, "File: unknown", 12, -24)
 
 -- Drag: both title bars move the shared container.
 local dragStart, startPos
@@ -412,8 +464,9 @@ local function logLine(tag, msg)
 end
 
 local function flushLog()
+    if not HAS_WRITE then return end
     pcall(function()
-        if appendfile and logTotalLines > logWrittenLines then
+        if HAS_APPEND and isfile("activity_log.txt") and logTotalLines > logWrittenLines then
             local firstInBuffer = logTotalLines - #logBuffer + 1
             local fromIdx = (logWrittenLines + 1) - firstInBuffer + 1
             if fromIdx < 1 then fromIdx = 1 end
@@ -425,7 +478,7 @@ local function flushLog()
                 appendfile("activity_log.txt", table.concat(chunk, "\n") .. "\n")
             end
             logWrittenLines = logTotalLines
-        elseif writefile then
+        else
             writefile("activity_log.txt", table.concat(logBuffer, "\n"))
         end
     end)
@@ -490,6 +543,10 @@ pcall(function()
         if not killed and logRunning
             and (method == "FireServer" or method == "InvokeServer") then
             local name = self.Name
+            -- Skip noisy remotes entirely (still passes the call through below)
+            if REMOTE_IGNORE[name] then
+                return old(self, ...)
+            end
             local now  = os.clock()
             local rec  = remoteCounts[name] or { n = 0, t = now }
             remoteCounts[name] = rec
@@ -687,6 +744,16 @@ local function refreshLogGui()
     else
         wMobs.Text = string.format("Mobs known: %d", knownMobsCount)
     end
+
+    -- File status line
+    local color = Color3.fromRGB(150, 150, 150)
+    if FILE_STATUS == "saving" or FILE_STATUS == "loaded" then
+        color = Color3.fromRGB(120, 200, 120)
+    elseif FILE_STATUS == "write failed" or FILE_STATUS == "unsupported" then
+        color = Color3.fromRGB(220, 120, 120)
+    end
+    wFileStatus.TextColor3 = color
+    wFileStatus.Text = string.format("File (%s): %s", MOB_FILE, FILE_STATUS)
 end
 
 task.spawn(function()
@@ -713,7 +780,7 @@ local function kill()
     wDot.BackgroundColor3 = Color3.fromRGB(150, 150, 150)
     wMain.Text = "Activity Log: STOPPED"
     task.delay(1.2, function() gui:Destroy() end)
-    print("[FarmAssist] Killed. Log saved to activity_log.txt (if supported).")
+    print("[FarmAssist] Killed.")
 end
 if getgenv then
     getgenv().FallFreeze.kill   = kill
@@ -743,5 +810,5 @@ end)
 
 pushFreezeLog("loaded")
 logLine("INFO", string.format(
-    "FarmAssist loaded. F7 = toggle both. = = kill. Auto-recover = %s. Mobs known: %d.",
-    AUTO_RECOVER and "on" or "off", knownMobsCount))
+    "FarmAssist loaded. F7 = toggle both. = = kill. Auto-recover = %s. Mobs known: %d. File: %s.",
+    AUTO_RECOVER and "on" or "off", knownMobsCount, FILE_STATUS))
