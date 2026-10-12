@@ -1,5 +1,6 @@
 -- FarmAssist: Fall Freeze (catches falls, drops you on the floor) +
--- Activity Log (logs farm activity, auto-recovers you when stuck).
+-- Activity Log (logs farm activity, auto-recovers you when stuck,
+-- and records unique mob names to mob_list.txt).
 -- F7 = toggle both. "=" (equals) = kill.
 -- Drag either title bar to move both panels together.
 
@@ -32,7 +33,8 @@ local FREEZE_LOG_LINES = 5
 local TELEPORT_DIST = 12
 local STUCK_SECONDS = 10
 local STUCK_MOVE    = 1
-local LOG_BUFFER_MAX = 1000    -- memory cap; older lines get trimmed
+local LOG_BUFFER_MAX = 1000
+local MOB_FILE       = "mob_list.txt"
 local IGNORE = {
     "render_class_body_particles",
     "Stack Begin",
@@ -66,8 +68,12 @@ local logBuffer      = {}
 local logT0          = os.clock()
 local logLineCount   = 0
 local lastLogLine    = ""
-local logTotalLines  = 0     -- monotonic count of every line ever logged
-local logWrittenLines = 0    -- how many of those have been flushed to disk
+local logTotalLines  = 0
+local logWrittenLines = 0
+
+local knownMobs      = {}    -- starts empty; fills up from what the script sees
+local knownMobsCount = 0
+local lastMobSeen    = ""
 
 local lastAutoRecover  = 0
 local autoRecovers     = 0
@@ -75,7 +81,6 @@ local lastGoodPos      = nil
 local lastGoodTime     = 0
 local lastActivityTime = os.clock()
 
--- log-position trackers (declared here so the F7 toggle handler can reset them)
 local wLastPos, wLastMoveCheckPos, wLastMoveTime = nil, nil, os.clock()
 local wLastStuckLog = 0
 
@@ -85,9 +90,60 @@ if getgenv then
     local g = getgenv()
     if g.FallFreeze and g.FallFreeze.kill then pcall(g.FallFreeze.kill) end
     if g.ActivityLog and g.ActivityLog.stop then pcall(g.ActivityLog.stop) end
-    if g.OuroWatcher and g.OuroWatcher.stop then pcall(g.OuroWatcher.stop) end  -- legacy cleanup
+    if g.OuroWatcher and g.OuroWatcher.stop then pcall(g.OuroWatcher.stop) end
     g.FallFreeze = {}
     g.ActivityLog = {}
+end
+
+-- MOB LIST: load names from previous sessions, if the file exists
+if isfile and readfile and isfile(MOB_FILE) then
+    pcall(function()
+        for line in readfile(MOB_FILE):gmatch("[^\r\n]+") do
+            if line ~= "" then
+                knownMobs[line] = true
+                knownMobsCount = knownMobsCount + 1
+            end
+        end
+    end)
+end
+
+local function isBlacklistedName(name)
+    for _, n in ipairs(PROP_BLACKLIST) do
+        if name == n then return true end
+    end
+    return false
+end
+
+local function saveMobName(name)
+    if not name or name == "" then return end
+    if name == "none" then return end
+    if isBlacklistedName(name) then return end
+    if knownMobs[name] then return end
+
+    knownMobs[name] = true
+    knownMobsCount = knownMobsCount + 1
+    lastMobSeen = name
+
+    pcall(function()
+        if appendfile then
+            appendfile(MOB_FILE, name .. "\n")
+        elseif writefile then
+            local names = {}
+            for m in pairs(knownMobs) do names[#names + 1] = m end
+            table.sort(names)
+            writefile(MOB_FILE, table.concat(names, "\n") .. "\n")
+        end
+    end)
+
+    print("[MOB SAVED] " .. name)
+end
+
+local function extractMobName(line)
+    local name = line:match("nearest enemy:%s*([%w_%-]+)")
+    if not name then
+        name = line:match("nearest enemy%s+([%w_%-]+)")
+    end
+    return name
 end
 
 -- GUI
@@ -105,10 +161,9 @@ if not parent then
 end
 gui.Parent = parent or lp:WaitForChild("PlayerGui")
 
--- Single draggable container holds both panels.
 local container = Instance.new("Frame")
 container.Name = "FarmAssistContainer"
-container.Size = UDim2.fromOffset(270, 322)   -- 214 (freeze) + 8 gap + 100 (log)
+container.Size = UDim2.fromOffset(270, 422)
 container.Position = UDim2.new(1, -290, 0, 100)
 container.BackgroundTransparency = 1
 container.BorderSizePixel = 0
@@ -200,15 +255,29 @@ hint.Size = UDim2.new(1, 0, 0, 16)
 hint.TextXAlignment = Enum.TextXAlignment.Center
 
 -- Activity Log panel (bottom)
-local wframe = makePanel(container, 222, 100)
+local wframe = makePanel(container, 222, 200)
 local wTitleBar = makeTitle(wframe, "Activity Log")
 local wDot  = makeDot(wframe, 33)
 local wMain = makeLabel(wframe, 31, 13, Color3.new(1, 1, 1),
     Enum.Font.GothamBold, "Activity Log: RUNNING", 32, -44)
 local wRecover = makeLabel(wframe, 50, 11, Color3.fromRGB(190, 190, 190),
     nil, "Auto-recover: 0", 12, -24)
-local wLast = makeLabel(wframe, 68, 11, Color3.fromRGB(170, 170, 170),
-    Enum.Font.Code, "(no output yet)", 12, -24)
+
+local wLast = Instance.new("TextLabel")
+wLast.Size = UDim2.new(1, -24, 0, 100)
+wLast.Position = UDim2.new(0, 12, 0, 68)
+wLast.BackgroundTransparency = 1
+wLast.Font = Enum.Font.Code
+wLast.TextSize = 11
+wLast.TextColor3 = Color3.fromRGB(170, 170, 170)
+wLast.TextXAlignment = Enum.TextXAlignment.Left
+wLast.TextYAlignment = Enum.TextYAlignment.Top
+wLast.TextWrapped = true
+wLast.Text = "(no output yet)"
+wLast.Parent = wframe
+
+local wMobs = makeLabel(wframe, 176, 11, Color3.fromRGB(150, 200, 150),
+    Enum.Font.Code, "Mobs known: 0", 12, -24)
 
 -- Drag: both title bars move the shared container.
 local dragStart, startPos
@@ -337,17 +406,17 @@ local function logLine(tag, msg)
     if not NON_ACTIVITY_TAGS[tag] then
         lastActivityTime = os.clock()
     end
+
+    local mobName = extractMobName(line)
+    if mobName then saveMobName(mobName) end
 end
 
--- Flush to disk. If appendfile is available, only write the lines we haven't
--- written yet; otherwise rewrite the capped buffer.
 local function flushLog()
     pcall(function()
         if appendfile and logTotalLines > logWrittenLines then
-            -- buffer holds total lines (logTotalLines - #logBuffer + 1) .. logTotalLines
             local firstInBuffer = logTotalLines - #logBuffer + 1
             local fromIdx = (logWrittenLines + 1) - firstInBuffer + 1
-            if fromIdx < 1 then fromIdx = 1 end  -- very old lines already culled
+            if fromIdx < 1 then fromIdx = 1 end
             if fromIdx <= #logBuffer then
                 local chunk = {}
                 for i = fromIdx, #logBuffer do
@@ -556,7 +625,6 @@ conns[#conns + 1] = lp.CharacterAdded:Connect(function(c)
     task.spawn(watchChar, c)
 end)
 
--- Periodic flush (memory-safe; appendfile used when available)
 task.spawn(function()
     while not killed do
         task.wait(5)
@@ -608,7 +676,17 @@ local function refreshLogGui()
         wMain.Text = string.format("Activity Log: PAUSED  (%d lines)", logLineCount)
     end
     wRecover.Text = string.format("Auto-recover: %d   (range %d studs)", autoRecovers, STUCK_TELEPORT_RANGE)
-    wLast.Text = lastLogLine ~= "" and lastLogLine:sub(1, 58) or "(no output yet)"
+
+    local tail = {}
+    local startIdx = math.max(1, #logBuffer - 2)
+    for i = startIdx, #logBuffer do tail[#tail + 1] = logBuffer[i] end
+    wLast.Text = #tail > 0 and table.concat(tail, "\n") or "(no output yet)"
+
+    if lastMobSeen ~= "" then
+        wMobs.Text = string.format("Mobs known: %d   (last: %s)", knownMobsCount, lastMobSeen)
+    else
+        wMobs.Text = string.format("Mobs known: %d", knownMobsCount)
+    end
 end
 
 task.spawn(function()
@@ -645,15 +723,14 @@ end
 conns[#conns + 1] = UserInputService.InputBegan:Connect(function(input)
     if killed or UserInputService:GetFocusedTextBox() then return end
     if input.KeyCode == TOGGLE_KEY then
-        -- F7 toggles both freeze and log together
         local newState = not (freezeEnabled and logRunning)
         freezeEnabled = newState
         logRunning    = newState
         if newState then
             lastActivityTime  = os.clock()
             wLastMoveCheckPos = nil
-            wLastPos          = nil   -- don't log a phantom TELEPORT on resume
-            wLastStuckLog     = 0     -- clear stale stuck cooldown
+            wLastPos          = nil
+            wLastStuckLog     = 0
             pushFreezeLog("enabled (freeze + log)")
         else
             release(getRoot())
@@ -666,5 +743,5 @@ end)
 
 pushFreezeLog("loaded")
 logLine("INFO", string.format(
-    "FarmAssist loaded. F7 = toggle both. = = kill. Auto-recover = %s.",
-    AUTO_RECOVER and "on" or "off"))
+    "FarmAssist loaded. F7 = toggle both. = = kill. Auto-recover = %s. Mobs known: %d.",
+    AUTO_RECOVER and "on" or "off", knownMobsCount))
