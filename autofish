@@ -1,6 +1,6 @@
--- Auto Fisher v19 | calibrated cast + line-based landing check + recast on miss + stays put on the same circle
+-- Auto Fisher v20 | calibrated cast + line-based landing check + real unload on End
 -- Measured: landing distance = 30 studs per second of hold (linear), max range 75 studs (2.5s).
--- F8 = toggle (OFF by default), End = kill.
+-- F8 = toggle (OFF by default), End = kill (unloads everything).
 
 local Players              = game:GetService("Players")
 local RunService           = game:GetService("RunService")
@@ -12,6 +12,15 @@ local lp        = Players.LocalPlayer
 local playerGui = lp:WaitForChild("PlayerGui")
 local camera    = workspace.CurrentCamera
 
+-- Kill any previous copy of this script before we start
+if getgenv then
+    local g = getgenv()
+    if g.AutoFisher and g.AutoFisher.stop then
+        pcall(g.AutoFisher.stop)
+    end
+    g.AutoFisher = {}
+end
+
 -- CONFIG
 local TOGGLE_KEY = Enum.KeyCode.F8
 local KILL_KEY   = Enum.KeyCode.End
@@ -20,33 +29,28 @@ local FILL_TARGET         = 0.93
 local REEL_TAP_COUNT      = 10
 local REEL_TAP_INTERVAL   = 0.10
 
--- Cast calibration (measured in game):
---   hold seconds -> landing studs:  0.5->14.8  1.0->29.9  1.5->44.8  2.0->59.9  2.5->74.8
---   3.0 to 5.0 all land at 75.0, so 75 studs is the hard max range.
 local STUDS_PER_SECOND    = 30
 local SECONDS_PER_STUD    = 1 / STUDS_PER_SECOND
 local CAST_MAX_RANGE      = 75
 local CAST_MIN_HOLD       = 0.05
-local CAST_MAX_HOLD       = CAST_MAX_RANGE / STUDS_PER_SECOND   -- 2.5s
+local CAST_MAX_HOLD       = CAST_MAX_RANGE / STUDS_PER_SECOND
 
 local PRE_AIM_DELAY       = 0.20
 local CAST_COOLDOWN       = 1.5
 local NO_QTE_TIMEOUT      = 6.0
 
 local LUCK_TEXT_MATCH     = "Luck"
-local LUCK_MAX_DIST       = 100000   -- effectively unlimited; travel for the best
+local LUCK_MAX_DIST       = 100000
 local MIN_LUCK_PERCENT    = 0
-local MAX_FALLBACK_CAST   = 70       -- only fall back to "cast from here" if within this (max range is 75)
+local MAX_FALLBACK_CAST   = 70
 
--- Stand spots tried in this order (mid-range first, all under the 75 stud cap).
 local STAND_DISTANCES     = { 40, 30, 50, 60, 25, 20, 70 }
 local STAND_ANGLE_OFFSETS = { 0, 0.4, -0.4, 0.8, -0.8, 1.2, -1.2, 1.6, -1.6, 2.2, -2.2, 2.8, -2.8, 3.14 }
 local POST_TELEPORT_WAIT  = 0.35
 
--- Don't move if the next target is the same circle we're already fishing at
 local STAY_ON_SAME_CIRCLE = true
-local STAY_MAX_DIST       = 70   -- only stay if the circle is still within cast range from here
-local STAY_MOVE_TOLERANCE = 6    -- teleport again if I've been moved more than this from my stand spot
+local STAY_MAX_DIST       = 70
+local STAY_MOVE_TOLERANCE = 6
 
 local AUTO_CAST           = true
 local START_ENABLED       = false
@@ -56,26 +60,24 @@ local USE_FIXED_CLICK = true
 local FIXED_CLICK_X   = nil
 local FIXED_CLICK_Y   = nil
 
--- Landing check (reads the fishing line after the cast to see where it landed)
 local VERIFY_LANDING      = true
-local SETTLE_TIME         = 4.0     -- max seconds to wait for the line to land after release
-local NEAR_PLAYER         = 20      -- a line counts as mine if one end is within this many studs of me
-local DEFAULT_HIT_RADIUS  = 8       -- used when the circle's size can't be read
-local HIT_RADIUS_SCALE    = 0.8     -- count as a hit inside 80% of the circle radius
+local SETTLE_TIME         = 4.0
+local NEAR_PLAYER         = 20
+local DEFAULT_HIT_RADIUS  = 8
+local HIT_RADIUS_SCALE    = 0.8
 local HIT_RADIUS_MIN      = 3
 local RECAST_ON_MISS      = true
-local MAX_RECASTS         = 2       -- extra casts allowed per target after a miss
-local RESET_CLICK_GAP     = 0.7     -- seconds between the two FIGHT clicks
-local CLICK_INSET         = false   -- if the reset clicks do nothing, flip this to true
-local ADAPTIVE_TRIM       = true    -- nudge hold time based on measured over/undershoot
+local MAX_RECASTS         = 2
+local RESET_CLICK_GAP     = 0.7
+local CLICK_INSET         = false
+local ADAPTIVE_TRIM       = true
 local TRIM_LEARN_RATE     = 0.3
-local TRIM_LIMIT          = 0.15    -- seconds
+local TRIM_LIMIT          = 0.15
 
 -- STATE
 local enabled = START_ENABLED
 local killed  = false
 local state   = "idle"
-local stateEntered = os.clock()
 local idleSince    = os.clock()
 local lastQteTime  = os.clock()
 local lastRating   = ""
@@ -84,13 +86,20 @@ local lastLanding  = ""
 local holdTrim     = 0
 local savedAutoRotate = nil
 
-local cachedRipple, cachedFill, cachedReel = nil, nil, nil
+local cachedRipple, cachedFill = nil, nil
 local fillConn = nil
 local lastRatingInst = nil
 local currentCircle = nil
 local lastTargetCircle = nil
 local lastStandPos = nil
 local noTeleport = false
+
+-- Connection tracking for real unload
+local conns = {}
+local function track(conn)
+    conns[#conns + 1] = conn
+    return conn
+end
 
 local function log(msg) if PRINT_EVENTS then print("[Fisher] " .. msg) end end
 local function eDown() VirtualInputManager:SendKeyEvent(true,  Enum.KeyCode.E, false, game) end
@@ -140,7 +149,10 @@ end
 
 local setState
 local function bindFill(fill)
-    if fillConn then fillConn:Disconnect() fillConn = nil end
+    if fillConn then
+        fillConn:Disconnect()
+        fillConn = nil
+    end
     if not fill then return end
     fillConn = fill:GetPropertyChangedSignal("Size"):Connect(function()
         if state ~= "holding" then return end
@@ -153,8 +165,7 @@ local function bindFill(fill)
     end)
 end
 
--- ============ FIGHT / FISH BUTTON (line reset) ============
--- FIGHT showing = rod is out. Resetting a cast = click that button twice.
+-- ============ FIGHT / FISH BUTTON ============
 local function guiVisible(g)
     local cur = g
     while cur and cur ~= playerGui do
@@ -179,7 +190,10 @@ local function clickGui(g)
     local target = g
     local p = g
     while p and p ~= playerGui do
-        if p:IsA("GuiButton") then target = p break end
+        if p:IsA("GuiButton") then
+            target = p
+            break
+        end
         p = p.Parent
     end
     local c = target.AbsolutePosition + target.AbsoluteSize / 2
@@ -303,8 +317,6 @@ local function findStandPos(circle)
     return nil
 end
 
--- Best circle = highest luck within range, tiebreak by distance.
--- Walks down the sorted list until it finds one with reachable ground.
 local function findBestCircleWithStand()
     local root = getRoot()
     if not root then return nil end
@@ -333,7 +345,6 @@ local function findBestCircleWithStand()
             return entry.circle, entry.dist, entry.circle.luck, stand
         end
         if entry.dist <= MAX_FALLBACK_CAST then
-            -- No stand but close enough to cast from here
             return entry.circle, entry.dist, entry.circle.luck, nil
         end
     end
@@ -356,14 +367,12 @@ local function faceTarget(targetPos)
     root.CFrame = CFrame.lookAt(myPos, flatTarget)
 end
 
--- Horizontal distance from player to circle, ignoring Y
 local function horizDist(a, b)
     local dx = a.X - b.X
     local dz = a.Z - b.Z
     return math.sqrt(dx*dx + dz*dz)
 end
 
--- Same circle = same part, or a respawned one at (almost) the same spot
 local function sameCircle(a, b)
     if not a or not b then return false end
     if a.part == b.part then return true end
@@ -373,7 +382,6 @@ end
 -- ============ LINE / LANDING CHECK ============
 local LINE_CLASSES = { Beam = true, RopeConstraint = true, RodConstraint = true }
 
--- Snapshot every existing line so we can tell which ones are new or moved after the cast.
 local function beginLineWatch()
     local snap = {}
     for _, d in ipairs(workspace:GetDescendants()) do
@@ -398,7 +406,6 @@ local function beginLineWatch()
     return snap, ctx, conn
 end
 
--- Returns the far end of the new/moved line attached to me (that is where the bobber is).
 local function currentLanding(snap, ctx, origin)
     local bestEnd, bestd = nil, 0
 
@@ -407,7 +414,9 @@ local function currentLanding(snap, ctx, origin)
         if math.min(da, db) < NEAR_PLAYER then
             local farEnd = (da > db) and a or b
             local fd = horizDist(farEnd, origin)
-            if fd > bestd then bestEnd, bestd = farEnd, fd end
+            if fd > bestd then
+                bestEnd, bestd = farEnd, fd
+            end
         end
     end
 
@@ -426,15 +435,21 @@ local function currentLanding(snap, ctx, origin)
     for d in pairs(snap) do checkLine(d) end
     for d in pairs(ctx.newLines) do checkLine(d) end
 
-    -- fallback: a line drawn as a thin stretched part
     for inst in pairs(ctx.newParts) do
         if inst.Parent then
             local s = inst.Size
             local m = math.max(s.X, s.Y, s.Z)
             local axis, o1, o2
-            if s.X == m then axis = Vector3.new(1, 0, 0) o1, o2 = s.Y, s.Z
-            elseif s.Y == m then axis = Vector3.new(0, 1, 0) o1, o2 = s.X, s.Z
-            else axis = Vector3.new(0, 0, 1) o1, o2 = s.X, s.Y end
+            if s.X == m then
+                axis = Vector3.new(1, 0, 0)
+                o1, o2 = s.Y, s.Z
+            elseif s.Y == m then
+                axis = Vector3.new(0, 1, 0)
+                o1, o2 = s.X, s.Z
+            else
+                axis = Vector3.new(0, 0, 1)
+                o1, o2 = s.X, s.Y
+            end
             if m > 5 and o1 < 0.6 and o2 < 0.6 then
                 local dir = inst.CFrame:VectorToWorldSpace(axis)
                 consider(inst.Position - dir * (m / 2), inst.Position + dir * (m / 2))
@@ -456,7 +471,6 @@ local function circleHitRadius(circle)
     return math.max(HIT_RADIUS_MIN, r * HIT_RADIUS_SCALE)
 end
 
--- miss distance, plus error along the aim direction (+ = overshoot) and sideways (+ = right)
 local function evaluateLanding(circle, origin, landing)
     local flatErr = Vector3.new(landing.X - circle.pos.X, 0, landing.Z - circle.pos.Z)
     local aim = Vector3.new(circle.pos.X - origin.X, 0, circle.pos.Z - origin.Z)
@@ -469,7 +483,6 @@ local function evaluateLanding(circle, origin, landing)
     return flatErr.Magnitude, along, lateral
 end
 
--- One cast at the circle. Returns "released", info, origin  (or "aborted").
 local function castOnce(circle)
     faceTarget(circle.pos)
     task.wait(PRE_AIM_DELAY)
@@ -482,7 +495,6 @@ local function castOnce(circle)
         log("WARNING: FIGHT button not showing (rod not out?)")
     end
 
-    -- Compute hold from actual distance after teleport landed
     local dist2 = horizDist(origin, circle.pos)
     local rawHold = dist2 * SECONDS_PER_STUD + holdTrim
     local hold = math.clamp(rawHold, CAST_MIN_HOLD, CAST_MAX_HOLD)
@@ -493,7 +505,9 @@ local function castOnce(circle)
     log(string.format("dist %.0f studs -> hold %.2fs (trim %+.3f)", dist2, hold, holdTrim))
 
     local snap, ctx, conn
-    if VERIFY_LANDING then snap, ctx, conn = beginLineWatch() end
+    if VERIFY_LANDING then
+        snap, ctx, conn = beginLineWatch()
+    end
 
     local cx, cy = getClickPoint()
     VirtualInputManager:SendMouseButtonEvent(cx, cy, 0, true, game, 1)
@@ -520,7 +534,9 @@ local function castOnce(circle)
                 info.landing = endPos
                 if lastPos and (endPos - lastPos).Magnitude < 0.3 then
                     stableSince = stableSince or os.clock()
-                    if os.clock() - stableSince >= 0.5 and os.clock() - t0 >= 1.0 then break end
+                    if os.clock() - stableSince >= 0.5 and os.clock() - t0 >= 1.0 then
+                        break
+                    end
                 else
                     stableSince = nil
                 end
@@ -542,8 +558,11 @@ gui.ResetOnSpawn = false
 gui.IgnoreGuiInset = true
 gui.DisplayOrder = 999
 pcall(function()
-    if gethui then gui.Parent = gethui()
-    else gui.Parent = playerGui end
+    if gethui then
+        gui.Parent = gethui()
+    else
+        gui.Parent = playerGui
+    end
 end)
 if not gui.Parent then gui.Parent = playerGui end
 
@@ -627,7 +646,7 @@ hint.TextSize = 11
 hint.Parent = frame
 
 local dragStart, startPos
-dragBar.InputBegan:Connect(function(input)
+track(dragBar.InputBegan:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1
         or input.UserInputType == Enum.UserInputType.Touch then
         dragStart = input.Position
@@ -638,8 +657,8 @@ dragBar.InputBegan:Connect(function(input)
             end
         end)
     end
-end)
-UserInputService.InputChanged:Connect(function(input)
+end))
+track(UserInputService.InputChanged:Connect(function(input)
     if not dragStart then return end
     if input.UserInputType == Enum.UserInputType.MouseMovement
         or input.UserInputType == Enum.UserInputType.Touch then
@@ -649,13 +668,13 @@ UserInputService.InputChanged:Connect(function(input)
             startPos.Y.Scale, startPos.Y.Offset + delta.Y
         )
     end
-end)
-UserInputService.InputEnded:Connect(function(input)
+end))
+track(UserInputService.InputEnded:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1
         or input.UserInputType == Enum.UserInputType.Touch then
         dragStart = nil
     end
-end)
+end))
 
 local function updateGui()
     if killed then
@@ -679,7 +698,6 @@ end
 setState = function(s)
     if state == s then return end
     state = s
-    stateEntered = os.clock()
     if s == "idle" then idleSince = os.clock() end
     log("-> " .. s)
 end
@@ -692,7 +710,7 @@ local function restoreAutoRotate()
     end
 end
 
-RunService.Heartbeat:Connect(function()
+track(RunService.Heartbeat:Connect(function()
     if killed or not enabled then return end
     local now = os.clock()
 
@@ -706,10 +724,8 @@ RunService.Heartbeat:Connect(function()
             if state == "holding" then eUp() end
             setState("reeling")
         end
-        cachedReel = reel
         return
     end
-    cachedReel = nil
 
     if ripple then
         if state ~= "holding" then
@@ -730,7 +746,10 @@ RunService.Heartbeat:Connect(function()
 
     if cachedRipple then
         cachedRipple = nil
-        if fillConn then fillConn:Disconnect() fillConn = nil end
+        if fillConn then
+            fillConn:Disconnect()
+            fillConn = nil
+        end
         cachedFill = nil
     end
 
@@ -750,7 +769,7 @@ RunService.Heartbeat:Connect(function()
             setState("hunting")
         end
     end
-end)
+end))
 
 -- ============ HUNT / AIM LOOP ============
 task.spawn(function()
@@ -768,7 +787,6 @@ task.spawn(function()
                 lastCircleName = circle.text
                 log(string.format("target: %s (luck=%d) at %.0f studs", circle.text, luck, dist))
 
-                -- Stay put if this is the same circle as last time and we're still in range of it
                 local stay = false
                 if STAY_ON_SAME_CIRCLE and sameCircle(circle, lastTargetCircle) then
                     local root = getRoot()
@@ -890,7 +908,7 @@ task.spawn(function()
 end)
 
 -- Rating watcher
-RunService.Heartbeat:Connect(function()
+track(RunService.Heartbeat:Connect(function()
     if killed or not enabled then return end
     local rating = findVisibleGui("rating")
     if rating and rating ~= lastRatingInst and rating.Text ~= "" then
@@ -898,7 +916,7 @@ RunService.Heartbeat:Connect(function()
         lastRating = rating.Text
         log("RATING: " .. rating.Text)
     end
-end)
+end))
 
 -- GUI updater
 task.spawn(function()
@@ -908,8 +926,40 @@ task.spawn(function()
     end
 end)
 
-UserInputService.InputBegan:Connect(function(input)
-    if UserInputService:GetFocusedTextBox() then return end
+-- ============ SHUTDOWN ============
+local function shutdown()
+    if killed then return end
+    killed = true
+    enabled = false
+    eUp()
+    local cx, cy = getClickPoint()
+    pcall(function()
+        VirtualInputManager:SendMouseButtonEvent(cx, cy, 0, false, game, 1)
+    end)
+    restoreAutoRotate()
+    if fillConn then
+        pcall(function() fillConn:Disconnect() end)
+        fillConn = nil
+    end
+    for _, c in ipairs(conns) do
+        pcall(function() c:Disconnect() end)
+    end
+    table.clear(conns)
+    state = "idle"
+    updateGui()
+    print("[Fisher] Killed and unloaded.")
+    task.delay(0.15, function()
+        pcall(function() gui:Destroy() end)
+    end)
+end
+
+if getgenv then
+    getgenv().AutoFisher.stop = shutdown
+end
+
+-- ============ INPUT ============
+track(UserInputService.InputBegan:Connect(function(input)
+    if killed or UserInputService:GetFocusedTextBox() then return end
     if input.KeyCode == TOGGLE_KEY then
         enabled = not enabled
         if not enabled then
@@ -924,18 +974,9 @@ UserInputService.InputBegan:Connect(function(input)
         end
         updateGui()
     elseif input.KeyCode == KILL_KEY then
-        killed = true
-        enabled = false
-        eUp()
-        restoreAutoRotate()
-        setState("idle")
-        log("Killed")
-        updateGui()
-        task.delay(1.5, function()
-            pcall(function() gui:Destroy() end)
-        end)
+        shutdown()
     end
-end)
+end))
 
 updateGui()
 log(string.format("Loaded. F8 = toggle, End = kill. %d studs/sec, max range %d studs.", STUDS_PER_SECOND, CAST_MAX_RANGE))
