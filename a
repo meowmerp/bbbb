@@ -19,7 +19,6 @@ task.wait(1)
 -- CONFIG
 local TOGGLE_KEY = Enum.KeyCode.F7
 local KILL_KEY   = Enum.KeyCode.Equals
-local LOG_REMOTES = false   -- set to true to see [REMOTE] lines again
 
 -- Fall Freeze (original v2 values, unchanged)
 local FALL_SPEED   = -40
@@ -278,7 +277,7 @@ local hint = makeLabel(frame, 197, 11, Color3.fromRGB(140, 140, 140), nil,
 hint.Size = UDim2.new(1, 0, 0, 16)
 hint.TextXAlignment = Enum.TextXAlignment.Center
 
--- Activity Log panel (bottom)
+-- Activity Log panel (bottom) — no File status line, just these three rows
 local wframe = makePanel(container, 222, 200)
 local wTitleBar = makeTitle(wframe, "Activity Log")
 local wDot  = makeDot(wframe, 33)
@@ -507,9 +506,8 @@ conns[#conns + 1] = LogService.MessageOut:Connect(function(msg, mtype)
     logLine(mtype == Enum.MessageType.MessageError and "ERROR" or "WARN", msg)
 end)
 
--- Remote activity tracker. Remotes are not logged (LOG_REMOTES = false), but
--- they still count as "farm is alive" so stuck detection doesn't false-fire
--- while you're standing on a boss firing attacks.
+-- Remote hook: remotes are NOT logged at all. But they still count as
+-- "farm is alive" so stuck detection doesn't false-fire on a boss.
 pcall(function()
     local old
     old = hookmetamethod(game, "__namecall", function(self, ...)
