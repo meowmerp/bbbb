@@ -1,0 +1,941 @@
+-- Auto Fisher v19 | calibrated cast + line-based landing check + recast on miss + stays put on the same circle
+-- Measured: landing distance = 30 studs per second of hold (linear), max range 75 studs (2.5s).
+-- F8 = toggle (OFF by default), End = kill.
+
+local Players              = game:GetService("Players")
+local RunService           = game:GetService("RunService")
+local UserInputService     = game:GetService("UserInputService")
+local VirtualInputManager  = game:GetService("VirtualInputManager")
+local GuiService           = game:GetService("GuiService")
+
+local lp        = Players.LocalPlayer
+local playerGui = lp:WaitForChild("PlayerGui")
+local camera    = workspace.CurrentCamera
+
+-- CONFIG
+local TOGGLE_KEY = Enum.KeyCode.F8
+local KILL_KEY   = Enum.KeyCode.End
+
+local FILL_TARGET         = 0.93
+local REEL_TAP_COUNT      = 10
+local REEL_TAP_INTERVAL   = 0.10
+
+-- Cast calibration (measured in game):
+--   hold seconds -> landing studs:  0.5->14.8  1.0->29.9  1.5->44.8  2.0->59.9  2.5->74.8
+--   3.0 to 5.0 all land at 75.0, so 75 studs is the hard max range.
+local STUDS_PER_SECOND    = 30
+local SECONDS_PER_STUD    = 1 / STUDS_PER_SECOND
+local CAST_MAX_RANGE      = 75
+local CAST_MIN_HOLD       = 0.05
+local CAST_MAX_HOLD       = CAST_MAX_RANGE / STUDS_PER_SECOND   -- 2.5s
+
+local PRE_AIM_DELAY       = 0.20
+local CAST_COOLDOWN       = 1.5
+local NO_QTE_TIMEOUT      = 6.0
+
+local LUCK_TEXT_MATCH     = "Luck"
+local LUCK_MAX_DIST       = 100000   -- effectively unlimited; travel for the best
+local MIN_LUCK_PERCENT    = 0
+local MAX_FALLBACK_CAST   = 70       -- only fall back to "cast from here" if within this (max range is 75)
+
+-- Stand spots tried in this order (mid-range first, all under the 75 stud cap).
+local STAND_DISTANCES     = { 40, 30, 50, 60, 25, 20, 70 }
+local STAND_ANGLE_OFFSETS = { 0, 0.4, -0.4, 0.8, -0.8, 1.2, -1.2, 1.6, -1.6, 2.2, -2.2, 2.8, -2.8, 3.14 }
+local POST_TELEPORT_WAIT  = 0.35
+
+-- Don't move if the next target is the same circle we're already fishing at
+local STAY_ON_SAME_CIRCLE = true
+local STAY_MAX_DIST       = 70   -- only stay if the circle is still within cast range from here
+local STAY_MOVE_TOLERANCE = 6    -- teleport again if I've been moved more than this from my stand spot
+
+local AUTO_CAST           = true
+local START_ENABLED       = false
+local PRINT_EVENTS        = true
+
+local USE_FIXED_CLICK = true
+local FIXED_CLICK_X   = nil
+local FIXED_CLICK_Y   = nil
+
+-- Landing check (reads the fishing line after the cast to see where it landed)
+local VERIFY_LANDING      = true
+local SETTLE_TIME         = 4.0     -- max seconds to wait for the line to land after release
+local NEAR_PLAYER         = 20      -- a line counts as mine if one end is within this many studs of me
+local DEFAULT_HIT_RADIUS  = 8       -- used when the circle's size can't be read
+local HIT_RADIUS_SCALE    = 0.8     -- count as a hit inside 80% of the circle radius
+local HIT_RADIUS_MIN      = 3
+local RECAST_ON_MISS      = true
+local MAX_RECASTS         = 2       -- extra casts allowed per target after a miss
+local RESET_CLICK_GAP     = 0.7     -- seconds between the two FIGHT clicks
+local CLICK_INSET         = false   -- if the reset clicks do nothing, flip this to true
+local ADAPTIVE_TRIM       = true    -- nudge hold time based on measured over/undershoot
+local TRIM_LEARN_RATE     = 0.3
+local TRIM_LIMIT          = 0.15    -- seconds
+
+-- STATE
+local enabled = START_ENABLED
+local killed  = false
+local state   = "idle"
+local stateEntered = os.clock()
+local idleSince    = os.clock()
+local lastQteTime  = os.clock()
+local lastRating   = ""
+local lastCircleName = ""
+local lastLanding  = ""
+local holdTrim     = 0
+local savedAutoRotate = nil
+
+local cachedRipple, cachedFill, cachedReel = nil, nil, nil
+local fillConn = nil
+local lastRatingInst = nil
+local currentCircle = nil
+local lastTargetCircle = nil
+local lastStandPos = nil
+local noTeleport = false
+
+local function log(msg) if PRINT_EVENTS then print("[Fisher] " .. msg) end end
+local function eDown() VirtualInputManager:SendKeyEvent(true,  Enum.KeyCode.E, false, game) end
+local function eUp()   VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game) end
+
+local function getRoot()
+    local c = lp.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function getHumanoid()
+    local c = lp.Character
+    return c and c:FindFirstChildOfClass("Humanoid")
+end
+
+local function getClickPoint()
+    if not USE_FIXED_CLICK then
+        local mp = UserInputService:GetMouseLocation()
+        return mp.X, mp.Y
+    end
+    local x = FIXED_CLICK_X
+    local y = FIXED_CLICK_Y
+    if not x or not y then
+        local vp = camera and camera.ViewportSize or Vector2.new(1920, 1080)
+        x = math.floor(vp.X / 2)
+        y = math.floor(vp.Y / 2)
+    end
+    return x, y
+end
+
+local function findVisibleGui(name)
+    for _, d in ipairs(playerGui:GetDescendants()) do
+        if d.Name == name and d:IsA("GuiObject") and d.Visible then
+            return d
+        end
+    end
+    return nil
+end
+
+local function getFillOf(ripple)
+    if not ripple then return nil end
+    for _, d in ipairs(ripple:GetDescendants()) do
+        if d.Name == "fill" then return d end
+    end
+    return nil
+end
+
+local setState
+local function bindFill(fill)
+    if fillConn then fillConn:Disconnect() fillConn = nil end
+    if not fill then return end
+    fillConn = fill:GetPropertyChangedSignal("Size"):Connect(function()
+        if state ~= "holding" then return end
+        local f = fill.Size.X.Scale
+        if f >= FILL_TARGET then
+            eUp()
+            log(string.format("released at fill=%.4f", f))
+            setState("waiting")
+        end
+    end)
+end
+
+-- ============ FIGHT / FISH BUTTON (line reset) ============
+-- FIGHT showing = rod is out. Resetting a cast = click that button twice.
+local function guiVisible(g)
+    local cur = g
+    while cur and cur ~= playerGui do
+        if cur:IsA("GuiObject") and not cur.Visible then return false end
+        if cur:IsA("LayerCollector") and not cur.Enabled then return false end
+        cur = cur.Parent
+    end
+    return true
+end
+
+local function findText(word)
+    for _, d in ipairs(playerGui:GetDescendants()) do
+        if (d:IsA("TextLabel") or d:IsA("TextButton")) and guiVisible(d) then
+            local t = string.upper((d.Text:gsub("%s+", "")))
+            if t == word then return d end
+        end
+    end
+    return nil
+end
+
+local function clickGui(g)
+    local target = g
+    local p = g
+    while p and p ~= playerGui do
+        if p:IsA("GuiButton") then target = p break end
+        p = p.Parent
+    end
+    local c = target.AbsolutePosition + target.AbsoluteSize / 2
+    local x, y = c.X, c.Y
+    if CLICK_INSET then
+        local inset = GuiService:GetGuiInset()
+        x = x + inset.X
+        y = y + inset.Y
+    end
+    VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 1)
+    task.wait(0.05)
+    VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 1)
+end
+
+local function waitForFight(timeout)
+    local deadline = os.clock() + timeout
+    while os.clock() < deadline do
+        if findText("FIGHT") then return true end
+        if killed or not enabled then return false end
+        task.wait(0.25)
+    end
+    return findText("FIGHT") ~= nil
+end
+
+local function resetLine()
+    for i = 1, 2 do
+        if killed or not enabled or state ~= "aiming" then return false end
+        local b = findText("FIGHT") or findText("FISH")
+        if not b then
+            log("reset: no FIGHT/FISH button found")
+            return false
+        end
+        log(string.format("reset click %d on '%s'", i, b.Text))
+        clickGui(b)
+        task.wait(RESET_CLICK_GAP)
+    end
+    return waitForFight(3)
+end
+
+-- ============ LUCK CIRCLES ============
+local CIRCLE_NAMES = {
+    Common = true, Rare = true, Epic = true, Legendary = true, Vaulted = true,
+}
+
+local function getLuckValue(text)
+    local n = string.match(text, "%+(%d+)%%")
+    return tonumber(n) or 0
+end
+
+local function findLuckCircles()
+    local found = {}
+    for _, d in ipairs(workspace:GetDescendants()) do
+        if d:IsA("BillboardGui") then
+            local txt = nil
+            for _, c in ipairs(d:GetDescendants()) do
+                if c:IsA("TextLabel") and c.Text ~= "" then
+                    txt = c.Text
+                    break
+                end
+            end
+            if txt and string.find(txt, LUCK_TEXT_MATCH, 1, true) then
+                local parent = d.Parent
+                if parent and parent:IsA("BasePart") then
+                    found[#found + 1] = {
+                        part = parent,
+                        text = txt,
+                        pos  = parent.Position,
+                        luck = getLuckValue(txt),
+                    }
+                end
+            end
+        end
+    end
+    return found
+end
+
+local function isSolidGround(hit, circlePart)
+    if not hit then return false end
+    if hit.Normal.Y < 0.7 then return false end
+    if hit.Material == Enum.Material.Water then return false end
+    local name = hit.Instance.Name
+    if CIRCLE_NAMES[name] then return false end
+    if circlePart and (hit.Instance == circlePart) then return false end
+    return true
+end
+
+local function findStandPos(circle)
+    local root = getRoot()
+    if not root then return nil end
+    local myPos = root.Position
+    local circlePos = circle.pos
+
+    local baseDir = myPos - circlePos
+    baseDir = Vector3.new(baseDir.X, 0, baseDir.Z)
+    if baseDir.Magnitude < 0.1 then
+        baseDir = Vector3.new(1, 0, 0)
+    else
+        baseDir = baseDir.Unit
+    end
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { lp.Character }
+
+    for _, d in ipairs(STAND_DISTANCES) do
+        for _, ang in ipairs(STAND_ANGLE_OFFSETS) do
+            local cosA, sinA = math.cos(ang), math.sin(ang)
+            local dir = Vector3.new(
+                baseDir.X * cosA - baseDir.Z * sinA,
+                0,
+                baseDir.X * sinA + baseDir.Z * cosA
+            )
+            local want = circlePos + dir * d
+            local origin = Vector3.new(want.X, circlePos.Y + 200, want.Z)
+            local hit = workspace:Raycast(origin, Vector3.new(0, -800, 0), params)
+            if isSolidGround(hit, circle.part) then
+                return Vector3.new(hit.Position.X, hit.Position.Y + 3, hit.Position.Z)
+            end
+        end
+    end
+    return nil
+end
+
+-- Best circle = highest luck within range, tiebreak by distance.
+-- Walks down the sorted list until it finds one with reachable ground.
+local function findBestCircleWithStand()
+    local root = getRoot()
+    if not root then return nil end
+    local myPos = root.Position
+
+    local candidates = {}
+    for _, c in ipairs(findLuckCircles()) do
+        if c.luck >= MIN_LUCK_PERCENT then
+            local d = (c.pos - myPos).Magnitude
+            if d <= LUCK_MAX_DIST then
+                candidates[#candidates + 1] = { circle = c, dist = d }
+            end
+        end
+    end
+
+    table.sort(candidates, function(a, b)
+        if a.circle.luck ~= b.circle.luck then
+            return a.circle.luck > b.circle.luck
+        end
+        return a.dist < b.dist
+    end)
+
+    for _, entry in ipairs(candidates) do
+        local stand = findStandPos(entry.circle)
+        if stand then
+            return entry.circle, entry.dist, entry.circle.luck, stand
+        end
+        if entry.dist <= MAX_FALLBACK_CAST then
+            -- No stand but close enough to cast from here
+            return entry.circle, entry.dist, entry.circle.luck, nil
+        end
+    end
+    return nil
+end
+
+local function teleportTo(pos)
+    local root = getRoot()
+    if not root then return end
+    root.CFrame = CFrame.new(pos)
+    root.AssemblyLinearVelocity = Vector3.zero
+end
+
+local function faceTarget(targetPos)
+    local root = getRoot()
+    if not root then return end
+    local myPos = root.Position
+    local flatTarget = Vector3.new(targetPos.X, myPos.Y, targetPos.Z)
+    if (flatTarget - myPos).Magnitude < 0.1 then return end
+    root.CFrame = CFrame.lookAt(myPos, flatTarget)
+end
+
+-- Horizontal distance from player to circle, ignoring Y
+local function horizDist(a, b)
+    local dx = a.X - b.X
+    local dz = a.Z - b.Z
+    return math.sqrt(dx*dx + dz*dz)
+end
+
+-- Same circle = same part, or a respawned one at (almost) the same spot
+local function sameCircle(a, b)
+    if not a or not b then return false end
+    if a.part == b.part then return true end
+    return horizDist(a.pos, b.pos) < 2
+end
+
+-- ============ LINE / LANDING CHECK ============
+local LINE_CLASSES = { Beam = true, RopeConstraint = true, RodConstraint = true }
+
+-- Snapshot every existing line so we can tell which ones are new or moved after the cast.
+local function beginLineWatch()
+    local snap = {}
+    for _, d in ipairs(workspace:GetDescendants()) do
+        if LINE_CLASSES[d.ClassName] then
+            local a0, a1 = d.Attachment0, d.Attachment1
+            if a0 and a1 then
+                snap[d] = { a = a0.WorldPosition, b = a1.WorldPosition }
+            else
+                snap[d] = {}
+            end
+        end
+    end
+    local ctx = { newLines = {}, newParts = {} }
+    local char = lp.Character
+    local conn = workspace.DescendantAdded:Connect(function(d)
+        if LINE_CLASSES[d.ClassName] then
+            ctx.newLines[d] = true
+        elseif d:IsA("BasePart") and not (char and d:IsDescendantOf(char)) then
+            ctx.newParts[d] = true
+        end
+    end)
+    return snap, ctx, conn
+end
+
+-- Returns the far end of the new/moved line attached to me (that is where the bobber is).
+local function currentLanding(snap, ctx, origin)
+    local bestEnd, bestd = nil, 0
+
+    local function consider(a, b)
+        local da, db = (a - origin).Magnitude, (b - origin).Magnitude
+        if math.min(da, db) < NEAR_PLAYER then
+            local farEnd = (da > db) and a or b
+            local fd = horizDist(farEnd, origin)
+            if fd > bestd then bestEnd, bestd = farEnd, fd end
+        end
+    end
+
+    local function checkLine(d)
+        if not d.Parent then return end
+        local a0, a1 = d.Attachment0, d.Attachment1
+        if not (a0 and a1) then return end
+        if d.ClassName == "Beam" and not d.Enabled then return end
+        local a, b = a0.WorldPosition, a1.WorldPosition
+        local old = snap[d]
+        local changed = (old == nil) or (old.a == nil)
+            or (old.a - a).Magnitude > 0.5 or (old.b - b).Magnitude > 0.5
+        if changed then consider(a, b) end
+    end
+
+    for d in pairs(snap) do checkLine(d) end
+    for d in pairs(ctx.newLines) do checkLine(d) end
+
+    -- fallback: a line drawn as a thin stretched part
+    for inst in pairs(ctx.newParts) do
+        if inst.Parent then
+            local s = inst.Size
+            local m = math.max(s.X, s.Y, s.Z)
+            local axis, o1, o2
+            if s.X == m then axis = Vector3.new(1, 0, 0) o1, o2 = s.Y, s.Z
+            elseif s.Y == m then axis = Vector3.new(0, 1, 0) o1, o2 = s.X, s.Z
+            else axis = Vector3.new(0, 0, 1) o1, o2 = s.X, s.Y end
+            if m > 5 and o1 < 0.6 and o2 < 0.6 then
+                local dir = inst.CFrame:VectorToWorldSpace(axis)
+                consider(inst.Position - dir * (m / 2), inst.Position + dir * (m / 2))
+            end
+        end
+    end
+
+    return bestEnd, bestd
+end
+
+local function circleHitRadius(circle)
+    local r = DEFAULT_HIT_RADIUS
+    local p = circle.part
+    if p and p.Parent then
+        local s = p.Size
+        local half = math.max(s.X, s.Z) / 2
+        if half >= 2 and half <= 80 then r = half end
+    end
+    return math.max(HIT_RADIUS_MIN, r * HIT_RADIUS_SCALE)
+end
+
+-- miss distance, plus error along the aim direction (+ = overshoot) and sideways (+ = right)
+local function evaluateLanding(circle, origin, landing)
+    local flatErr = Vector3.new(landing.X - circle.pos.X, 0, landing.Z - circle.pos.Z)
+    local aim = Vector3.new(circle.pos.X - origin.X, 0, circle.pos.Z - origin.Z)
+    local along, lateral = 0, 0
+    if aim.Magnitude > 0.1 then
+        local u = aim.Unit
+        along = flatErr:Dot(u)
+        lateral = flatErr:Dot(Vector3.new(-u.Z, 0, u.X))
+    end
+    return flatErr.Magnitude, along, lateral
+end
+
+-- One cast at the circle. Returns "released", info, origin  (or "aborted").
+local function castOnce(circle)
+    faceTarget(circle.pos)
+    task.wait(PRE_AIM_DELAY)
+
+    local root = getRoot()
+    if not root then return "aborted" end
+    local origin = root.Position
+
+    if not waitForFight(3) then
+        log("WARNING: FIGHT button not showing (rod not out?)")
+    end
+
+    -- Compute hold from actual distance after teleport landed
+    local dist2 = horizDist(origin, circle.pos)
+    local rawHold = dist2 * SECONDS_PER_STUD + holdTrim
+    local hold = math.clamp(rawHold, CAST_MIN_HOLD, CAST_MAX_HOLD)
+    local clamped = (rawHold > CAST_MAX_HOLD) or (rawHold < CAST_MIN_HOLD)
+    if dist2 > CAST_MAX_RANGE then
+        log(string.format("WARNING: %.0f studs is beyond the %d stud max range, cast will fall short", dist2, CAST_MAX_RANGE))
+    end
+    log(string.format("dist %.0f studs -> hold %.2fs (trim %+.3f)", dist2, hold, holdTrim))
+
+    local snap, ctx, conn
+    if VERIFY_LANDING then snap, ctx, conn = beginLineWatch() end
+
+    local cx, cy = getClickPoint()
+    VirtualInputManager:SendMouseButtonEvent(cx, cy, 0, true, game, 1)
+
+    local holdStart = os.clock()
+    local holdEnd = holdStart + hold
+    while os.clock() < holdEnd and enabled and not killed do
+        faceTarget(circle.pos)
+        task.wait(0.02)
+    end
+
+    VirtualInputManager:SendMouseButtonEvent(cx, cy, 0, false, game, 1)
+    local realHold = os.clock() - holdStart
+    log(string.format("cast released (real hold %.2fs)", realHold))
+
+    local info = { dist = dist2, hold = hold, realHold = realHold, clamped = clamped }
+
+    if VERIFY_LANDING then
+        local t0 = os.clock()
+        local lastPos, stableSince = nil, nil
+        while os.clock() - t0 < SETTLE_TIME and enabled and not killed and state == "aiming" do
+            local endPos = currentLanding(snap, ctx, origin)
+            if endPos then
+                info.landing = endPos
+                if lastPos and (endPos - lastPos).Magnitude < 0.3 then
+                    stableSince = stableSince or os.clock()
+                    if os.clock() - stableSince >= 0.5 and os.clock() - t0 >= 1.0 then break end
+                else
+                    stableSince = nil
+                end
+                lastPos = endPos
+            end
+            task.wait(0.1)
+        end
+        conn:Disconnect()
+        info.bite = (state ~= "aiming")
+    end
+
+    return "released", info, origin
+end
+
+-- ============ GUI ============
+local gui = Instance.new("ScreenGui")
+gui.Name = "AutoFisherGui"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 999
+pcall(function()
+    if gethui then gui.Parent = gethui()
+    else gui.Parent = playerGui end
+end)
+if not gui.Parent then gui.Parent = playerGui end
+
+local frame = Instance.new("Frame")
+frame.Size = UDim2.new(0, 240, 0, 172)
+frame.Position = UDim2.new(0, 20, 0, 100)
+frame.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+frame.BorderSizePixel = 0
+frame.Active = true
+frame.Parent = gui
+Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+
+local dragBar = Instance.new("TextLabel")
+dragBar.Size = UDim2.new(1, 0, 0, 28)
+dragBar.BackgroundTransparency = 1
+dragBar.Text = "Auto Fisher"
+dragBar.TextColor3 = Color3.fromRGB(220, 220, 220)
+dragBar.Font = Enum.Font.GothamBold
+dragBar.TextSize = 14
+dragBar.Active = true
+dragBar.Parent = frame
+
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(1, 0, 0, 22)
+status.Position = UDim2.new(0, 0, 0, 28)
+status.BackgroundTransparency = 1
+status.Text = "OFF"
+status.TextColor3 = Color3.fromRGB(255, 90, 90)
+status.Font = Enum.Font.GothamBold
+status.TextSize = 16
+status.Parent = frame
+
+local stateLabel = Instance.new("TextLabel")
+stateLabel.Size = UDim2.new(1, 0, 0, 18)
+stateLabel.Position = UDim2.new(0, 0, 0, 52)
+stateLabel.BackgroundTransparency = 1
+stateLabel.Text = "state: idle"
+stateLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
+stateLabel.Font = Enum.Font.Code
+stateLabel.TextSize = 12
+stateLabel.Parent = frame
+
+local circleLabel = Instance.new("TextLabel")
+circleLabel.Size = UDim2.new(1, 0, 0, 18)
+circleLabel.Position = UDim2.new(0, 0, 0, 70)
+circleLabel.BackgroundTransparency = 1
+circleLabel.Text = "circle: (none)"
+circleLabel.TextColor3 = Color3.fromRGB(150, 220, 150)
+circleLabel.Font = Enum.Font.Code
+circleLabel.TextSize = 12
+circleLabel.Parent = frame
+
+local ratingLabel = Instance.new("TextLabel")
+ratingLabel.Size = UDim2.new(1, 0, 0, 18)
+ratingLabel.Position = UDim2.new(0, 0, 0, 88)
+ratingLabel.BackgroundTransparency = 1
+ratingLabel.Text = "last: (none)"
+ratingLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+ratingLabel.Font = Enum.Font.Code
+ratingLabel.TextSize = 12
+ratingLabel.Parent = frame
+
+local landLabel = Instance.new("TextLabel")
+landLabel.Size = UDim2.new(1, 0, 0, 18)
+landLabel.Position = UDim2.new(0, 0, 0, 106)
+landLabel.BackgroundTransparency = 1
+landLabel.Text = "land: (none)"
+landLabel.TextColor3 = Color3.fromRGB(150, 200, 255)
+landLabel.Font = Enum.Font.Code
+landLabel.TextSize = 12
+landLabel.Parent = frame
+
+local hint = Instance.new("TextLabel")
+hint.Size = UDim2.new(1, 0, 0, 18)
+hint.Position = UDim2.new(0, 0, 0, 134)
+hint.BackgroundTransparency = 1
+hint.Text = "F8 toggle · End kill · drag title"
+hint.TextColor3 = Color3.fromRGB(130, 130, 130)
+hint.Font = Enum.Font.Gotham
+hint.TextSize = 11
+hint.Parent = frame
+
+local dragStart, startPos
+dragBar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragStart = input.Position
+        startPos  = frame.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                dragStart = nil
+            end
+        end)
+    end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if not dragStart then return end
+    if input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch then
+        local delta = input.Position - dragStart
+        frame.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + delta.X,
+            startPos.Y.Scale, startPos.Y.Offset + delta.Y
+        )
+    end
+end)
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragStart = nil
+    end
+end)
+
+local function updateGui()
+    if killed then
+        status.Text = "KILLED"
+        status.TextColor3 = Color3.fromRGB(150, 150, 150)
+    elseif enabled then
+        status.Text = "ON"
+        status.TextColor3 = Color3.fromRGB(120, 230, 120)
+    else
+        status.Text = "OFF"
+        status.TextColor3 = Color3.fromRGB(255, 90, 90)
+    end
+    stateLabel.Text  = "state: " .. state
+    local suffix = noTeleport and " (no tp)" or ""
+    circleLabel.Text = "circle: " .. (lastCircleName ~= "" and lastCircleName or "(none)") .. suffix
+    ratingLabel.Text = "last: " .. (lastRating ~= "" and lastRating or "(none)")
+    landLabel.Text   = "land: " .. (lastLanding ~= "" and lastLanding or "(none)")
+end
+
+-- ============ STATE ============
+setState = function(s)
+    if state == s then return end
+    state = s
+    stateEntered = os.clock()
+    if s == "idle" then idleSince = os.clock() end
+    log("-> " .. s)
+end
+
+local function restoreAutoRotate()
+    if savedAutoRotate ~= nil then
+        local hum = getHumanoid()
+        if hum then hum.AutoRotate = savedAutoRotate end
+        savedAutoRotate = nil
+    end
+end
+
+RunService.Heartbeat:Connect(function()
+    if killed or not enabled then return end
+    local now = os.clock()
+
+    local ripple = findVisibleGui("Ripple")
+    local reel   = findVisibleGui("Reel")
+
+    if ripple or reel then lastQteTime = now end
+
+    if reel then
+        if state ~= "reeling" then
+            if state == "holding" then eUp() end
+            setState("reeling")
+        end
+        cachedReel = reel
+        return
+    end
+    cachedReel = nil
+
+    if ripple then
+        if state ~= "holding" then
+            local fill = getFillOf(ripple)
+            local f = fill and fill.Size.X.Scale or 0
+            if f < 0.3 then
+                cachedRipple = ripple
+                if fill ~= cachedFill then
+                    cachedFill = fill
+                    bindFill(fill)
+                end
+                eDown()
+                setState("holding")
+            end
+        end
+        return
+    end
+
+    if cachedRipple then
+        cachedRipple = nil
+        if fillConn then fillConn:Disconnect() fillConn = nil end
+        cachedFill = nil
+    end
+
+    if state == "holding" then
+        eUp()
+        setState("waiting")
+    elseif state == "reeling" then
+        log("reel disappeared -> cast complete")
+        setState("idle")
+    elseif state == "waiting" then
+        if now - lastQteTime > NO_QTE_TIMEOUT then
+            log("no QTE for " .. NO_QTE_TIMEOUT .. "s, re-casting")
+            setState("idle")
+        end
+    elseif state == "idle" then
+        if AUTO_CAST and now - idleSince >= CAST_COOLDOWN then
+            setState("hunting")
+        end
+    end
+end)
+
+-- ============ HUNT / AIM LOOP ============
+task.spawn(function()
+    while not killed do
+        task.wait(0.1)
+        if not enabled then continue end
+
+        if state == "hunting" then
+            local circle, dist, luck, stand = findBestCircleWithStand()
+            if not circle then
+                log("no reachable luck circle found")
+                task.wait(0.5)
+            else
+                currentCircle = circle
+                lastCircleName = circle.text
+                log(string.format("target: %s (luck=%d) at %.0f studs", circle.text, luck, dist))
+
+                -- Stay put if this is the same circle as last time and we're still in range of it
+                local stay = false
+                if STAY_ON_SAME_CIRCLE and sameCircle(circle, lastTargetCircle) then
+                    local root = getRoot()
+                    if root then
+                        local dHere = horizDist(root.Position, circle.pos)
+                        local nearStand = (not lastStandPos)
+                            or horizDist(root.Position, lastStandPos) < STAY_MOVE_TOLERANCE
+                        if dHere <= STAY_MAX_DIST and nearStand then stay = true end
+                    end
+                end
+
+                if stay then
+                    log("same circle as last cast, staying put")
+                elseif stand then
+                    noTeleport = false
+                    lastStandPos = stand
+                    log(string.format("teleporting to (%.1f, %.1f, %.1f)",
+                        stand.X, stand.Y, stand.Z))
+                    teleportTo(stand)
+                    task.wait(POST_TELEPORT_WAIT)
+                else
+                    noTeleport = true
+                    lastStandPos = nil
+                    log(string.format("no ground near circle, casting from here (%.0f studs away)", dist))
+                end
+                lastTargetCircle = circle
+
+                local hum = getHumanoid()
+                if hum then
+                    savedAutoRotate = hum.AutoRotate
+                    hum.AutoRotate = false
+                end
+
+                faceTarget(circle.pos)
+                setState("aiming")
+            end
+        end
+
+        if state == "aiming" then
+            if currentCircle then
+                local circle = currentCircle
+                local attempt = 0
+
+                while enabled and not killed and state == "aiming" do
+                    attempt = attempt + 1
+                    local status, info, origin = castOnce(circle)
+                    if status ~= "released" then break end
+
+                    if not VERIFY_LANDING then break end
+
+                    if not info.landing then
+                        log("landing: no line found, can't verify")
+                        lastLanding = "no line found"
+                        break
+                    end
+
+                    local miss, along, lateral = evaluateLanding(circle, origin, info.landing)
+                    local tol = circleHitRadius(circle)
+                    local hit = miss <= tol
+                    log(string.format("landing: %s | miss %.1f studs (tolerance %.1f) | %s %.1f | %s %.1f",
+                        hit and "HIT" or "MISS", miss, tol,
+                        along >= 0 and "long" or "short", math.abs(along),
+                        lateral >= 0 and "right" or "left", math.abs(lateral)))
+                    lastLanding = string.format("%s %.1f (%+.1f)", hit and "HIT" or "MISS", miss, along)
+
+                    if ADAPTIVE_TRIM and not info.clamped then
+                        holdTrim = math.clamp(
+                            holdTrim - (along / STUDS_PER_SECOND) * TRIM_LEARN_RATE,
+                            -TRIM_LIMIT, TRIM_LIMIT)
+                    end
+
+                    if hit or info.bite then break end
+                    if not RECAST_ON_MISS or attempt > MAX_RECASTS then
+                        log("giving up on this circle, fishing from here")
+                        break
+                    end
+
+                    log("missed the circle -> resetting line and recasting")
+                    if not resetLine() then
+                        log("reset didn't finish, fishing from here")
+                        break
+                    end
+                end
+
+                restoreAutoRotate()
+                lastQteTime = os.clock()
+                if state == "aiming" then
+                    log("waiting for bite")
+                    setState("waiting")
+                end
+            else
+                setState("idle")
+            end
+        end
+    end
+end)
+
+-- Reel tapping loop
+task.spawn(function()
+    while not killed do
+        task.wait(0.05)
+        if enabled and state == "reeling" then
+            log(string.format("reel: tapping E %d times", REEL_TAP_COUNT))
+            for i = 1, REEL_TAP_COUNT do
+                if killed or not enabled or state ~= "reeling" then break end
+                eDown()
+                task.wait(0.025)
+                eUp()
+                if i < REEL_TAP_COUNT then
+                    task.wait(REEL_TAP_INTERVAL - 0.025)
+                end
+            end
+            log("reel: done")
+            while enabled and not killed and state == "reeling" do
+                task.wait(0.05)
+            end
+        end
+    end
+end)
+
+-- Rating watcher
+RunService.Heartbeat:Connect(function()
+    if killed or not enabled then return end
+    local rating = findVisibleGui("rating")
+    if rating and rating ~= lastRatingInst and rating.Text ~= "" then
+        lastRatingInst = rating
+        lastRating = rating.Text
+        log("RATING: " .. rating.Text)
+    end
+end)
+
+-- GUI updater
+task.spawn(function()
+    while not killed do
+        task.wait(0.1)
+        pcall(updateGui)
+    end
+end)
+
+UserInputService.InputBegan:Connect(function(input)
+    if UserInputService:GetFocusedTextBox() then return end
+    if input.KeyCode == TOGGLE_KEY then
+        enabled = not enabled
+        if not enabled then
+            eUp()
+            local cx, cy = getClickPoint()
+            VirtualInputManager:SendMouseButtonEvent(cx, cy, 0, false, game, 1)
+            restoreAutoRotate()
+            setState("idle")
+            log("Disabled")
+        else
+            log("Enabled")
+        end
+        updateGui()
+    elseif input.KeyCode == KILL_KEY then
+        killed = true
+        enabled = false
+        eUp()
+        restoreAutoRotate()
+        setState("idle")
+        log("Killed")
+        updateGui()
+        task.delay(1.5, function()
+            pcall(function() gui:Destroy() end)
+        end)
+    end
+end)
+
+updateGui()
+log(string.format("Loaded. F8 = toggle, End = kill. %d studs/sec, max range %d studs.", STUDS_PER_SECOND, CAST_MAX_RANGE))
