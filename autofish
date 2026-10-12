@@ -1,5 +1,6 @@
--- Auto Fisher v20 | calibrated cast + line-based landing check + real unload on End
--- Measured: landing distance = 30 studs per second of hold (linear), max range 75 studs (2.5s).
+-- Auto Fisher v20 + inventory-safe auto-sell (merged, tested)
+-- Cast calibration and landing logic preserved from v20.
+-- Sell logic uses firesignal-first clicking, prefers SELL ALL, falls back to SELL.
 -- F8 = toggle (OFF by default), End = kill (unloads everything).
 
 local Players              = game:GetService("Players")
@@ -12,7 +13,6 @@ local lp        = Players.LocalPlayer
 local playerGui = lp:WaitForChild("PlayerGui")
 local camera    = workspace.CurrentCamera
 
--- Kill any previous copy of this script before we start
 if getgenv then
     local g = getgenv()
     if g.AutoFisher and g.AutoFisher.stop then
@@ -20,6 +20,50 @@ if getgenv then
     end
     g.AutoFisher = {}
 end
+
+-- ============ ALLOWED SELL ITEMS (txt file) ============
+local SELL_ITEMS_FILE = "auto_fisher_sell_items.txt"
+local DEFAULT_SELL_ITEMS = {
+    "Old Boot", "Grey Fish", "Blue Fish",
+    "Brown Starfish", "Blue Starfish", "Dark Key",
+}
+
+local function loadSellItems()
+    if not (writefile and readfile and isfile) then
+        print("[Fisher] File API unavailable; using built-in list (" .. #DEFAULT_SELL_ITEMS .. " items)")
+        return DEFAULT_SELL_ITEMS
+    end
+    local exists = false
+    pcall(function() exists = isfile(SELL_ITEMS_FILE) end)
+    if not exists then
+        pcall(function()
+            local header = "# Auto Fisher - Allowed Sell Items\n"
+                .. "# One item name per line. Lines starting with # are ignored.\n"
+                .. "# The script will ONLY sell items listed here. Everything else is protected.\n"
+                .. "# Delete this file to regenerate with defaults.\n\n"
+            writefile(SELL_ITEMS_FILE, header .. table.concat(DEFAULT_SELL_ITEMS, "\n") .. "\n")
+        end)
+        print("[Fisher] Created " .. SELL_ITEMS_FILE .. " with " .. #DEFAULT_SELL_ITEMS .. " default items")
+        return DEFAULT_SELL_ITEMS
+    end
+    local content = ""
+    pcall(function() content = readfile(SELL_ITEMS_FILE) end)
+    local items = {}
+    for line in content:gmatch("[^\r\n]+") do
+        local trimmed = line:gsub("^%s+", ""):gsub("%s+$", "")
+        if trimmed ~= "" and not trimmed:match("^#") then
+            items[#items + 1] = trimmed
+        end
+    end
+    if #items == 0 then
+        print("[Fisher] " .. SELL_ITEMS_FILE .. " is empty; using built-in defaults")
+        return DEFAULT_SELL_ITEMS
+    end
+    print("[Fisher] Loaded " .. #items .. " allowed sell items from " .. SELL_ITEMS_FILE)
+    return items
+end
+
+local SELL_ITEMS = loadSellItems()
 
 -- CONFIG
 local TOGGLE_KEY = Enum.KeyCode.F8
@@ -56,6 +100,19 @@ local AUTO_CAST           = true
 local START_ENABLED       = false
 local PRINT_EVENTS        = true
 
+-- Inventory safety sale
+local STASH_SELL_AT       = 49
+local STASH_CAPACITY      = 50
+local SELLER_STAND_POS    = Vector3.new(3189.8, 185.9, -71.4)
+local SELLER_FACE_POS     = Vector3.new(3181.6, 185.9, -71.8)
+local SELLER_OPEN_WAIT    = 1.0
+local PANEL_RENDER_WAIT   = 1.2
+local SELLER_GUI_TIMEOUT  = 8.0
+local SELL_MAX_PASSES     = 6
+local SELL_SELECT_WAIT    = 1.5
+local SELL_CLICK_WAIT     = 1.2
+local LEAVE_MENU_WAIT     = 0.5
+
 local USE_FIXED_CLICK = true
 local FIXED_CLICK_X   = nil
 local FIXED_CLICK_Y   = nil
@@ -85,7 +142,6 @@ local lastCircleName = ""
 local lastLanding  = ""
 local holdTrim     = 0
 local savedAutoRotate = nil
-
 local cachedRipple, cachedFill = nil, nil
 local fillConn = nil
 local lastRatingInst = nil
@@ -93,8 +149,10 @@ local currentCircle = nil
 local lastTargetCircle = nil
 local lastStandPos = nil
 local noTeleport = false
+local inventorySelling = false
+local sellThresholdLatched = false
+local lastStashText = "--/50"
 
--- Connection tracking for real unload
 local conns = {}
 local function track(conn)
     conns[#conns + 1] = conn
@@ -104,6 +162,8 @@ end
 local function log(msg) if PRINT_EVENTS then print("[Fisher] " .. msg) end end
 local function eDown() VirtualInputManager:SendKeyEvent(true,  Enum.KeyCode.E, false, game) end
 local function eUp()   VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game) end
+local function qDown() VirtualInputManager:SendKeyEvent(true,  Enum.KeyCode.Q, false, game) end
+local function qUp()   VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Q, false, game) end
 
 local function getRoot()
     local c = lp.Character
@@ -567,7 +627,7 @@ end)
 if not gui.Parent then gui.Parent = playerGui end
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.new(0, 240, 0, 172)
+frame.Size = UDim2.new(0, 260, 0, 190)
 frame.Position = UDim2.new(0, 20, 0, 100)
 frame.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
 frame.BorderSizePixel = 0
@@ -635,9 +695,29 @@ landLabel.Font = Enum.Font.Code
 landLabel.TextSize = 12
 landLabel.Parent = frame
 
+local itemsLabel = Instance.new("TextLabel")
+itemsLabel.Size = UDim2.new(1, 0, 0, 18)
+itemsLabel.Position = UDim2.new(0, 0, 0, 124)
+itemsLabel.BackgroundTransparency = 1
+itemsLabel.Text = "allowed: " .. #SELL_ITEMS .. " items"
+itemsLabel.TextColor3 = Color3.fromRGB(200, 180, 130)
+itemsLabel.Font = Enum.Font.Code
+itemsLabel.TextSize = 11
+itemsLabel.Parent = frame
+
+local stashLabel = Instance.new("TextLabel")
+stashLabel.Size = UDim2.new(1, 0, 0, 18)
+stashLabel.Position = UDim2.new(0, 0, 0, 142)
+stashLabel.BackgroundTransparency = 1
+stashLabel.Text = "stash: --/50"
+stashLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+stashLabel.Font = Enum.Font.Code
+stashLabel.TextSize = 11
+stashLabel.Parent = frame
+
 local hint = Instance.new("TextLabel")
 hint.Size = UDim2.new(1, 0, 0, 18)
-hint.Position = UDim2.new(0, 0, 0, 134)
+hint.Position = UDim2.new(0, 0, 0, 164)
 hint.BackgroundTransparency = 1
 hint.Text = "F8 toggle · End kill · drag title"
 hint.TextColor3 = Color3.fromRGB(130, 130, 130)
@@ -692,6 +772,7 @@ local function updateGui()
     circleLabel.Text = "circle: " .. (lastCircleName ~= "" and lastCircleName or "(none)") .. suffix
     ratingLabel.Text = "last: " .. (lastRating ~= "" and lastRating or "(none)")
     landLabel.Text   = "land: " .. (lastLanding ~= "" and lastLanding or "(none)")
+    stashLabel.Text  = "stash: " .. lastStashText
 end
 
 -- ============ STATE ============
@@ -710,8 +791,421 @@ local function restoreAutoRotate()
     end
 end
 
+-- ============ INVENTORY / ERICA SELLER ============
+local function normalizeUiText(value)
+    return string.upper((value or ""):gsub("%s+", ""):gsub("[^%w]", ""))
+end
+
+local function isStashLabel(d)
+    local full = d:GetFullName()
+    return string.find(full, "fishing_stash", 1, true) ~= nil
+        or string.find(full, "FishingStash", 1, true) ~= nil
+end
+
+local function getStashCount()
+    for _, d in ipairs(playerGui:GetDescendants()) do
+        if (d:IsA("TextLabel") or d:IsA("TextButton")) and guiVisible(d) and isStashLabel(d) then
+            local raw = d.Text or ""
+            local stripped = raw:gsub("%s+", "")
+            local cur, cap = stripped:match("(%d+)[/⁄](%d+)")
+            if cap and tonumber(cap) == STASH_CAPACITY then
+                return tonumber(cur)
+            end
+        end
+    end
+    return nil
+end
+
+local function visibleTextContains(fragment)
+    local wanted = normalizeUiText(fragment)
+    for _, d in ipairs(playerGui:GetDescendants()) do
+        if (d:IsA("TextLabel") or d:IsA("TextButton")) and guiVisible(d) then
+            if string.find(normalizeUiText(d.Text), wanted, 1, true) then
+                return d
+            end
+        end
+    end
+    return nil
+end
+
+local function findBagCard(itemName)
+    local wanted = normalizeUiText(itemName)
+    local vp = camera and camera.ViewportSize or Vector2.new(1920, 1080)
+    local bagYMin = vp.Y * 0.78
+    local best, bestY = nil, -math.huge
+    for _, d in ipairs(playerGui:GetDescendants()) do
+        if (d:IsA("TextLabel") or d:IsA("TextButton")) and guiVisible(d)
+            and normalizeUiText(d.Text) == wanted then
+            local pos = d.AbsolutePosition
+            if pos.Y >= bagYMin and pos.Y > bestY then
+                best, bestY = d, pos.Y
+            end
+        end
+    end
+    return best
+end
+
+local function climbToButton(g)
+    local p = g
+    while p and p ~= playerGui do
+        if p:IsA("GuiButton") then return p end
+        p = p.Parent
+    end
+    return g
+end
+
+local function findSellAllButton()
+    for _, d in ipairs(playerGui:GetDescendants()) do
+        if (d:IsA("TextLabel") or d:IsA("TextButton")) and guiVisible(d) then
+            local txt = (d.Text or ""):gsub("%s+", " ")
+            if string.upper(txt):sub(1, 8) == "SELL ALL" then
+                local btn = climbToButton(d)
+                if btn and btn:IsA("GuiButton") then
+                    return btn, txt
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function findSellButton()
+    for _, d in ipairs(playerGui:GetDescendants()) do
+        if d:IsA("TextLabel") and guiVisible(d) and d.Name == "word" then
+            local txt = (d.Text or ""):gsub("%s+", "")
+            if string.upper(txt) == "SELL" then
+                local btn = climbToButton(d)
+                if btn and btn:IsA("GuiButton") then
+                    return btn, d.Text
+                end
+            end
+        end
+    end
+    for _, d in ipairs(playerGui:GetDescendants()) do
+        if (d:IsA("TextLabel") or d:IsA("TextButton")) and guiVisible(d) then
+            local txt = (d.Text or ""):gsub("%s+", "")
+            if string.upper(txt) == "SELL" then
+                local btn = climbToButton(d)
+                if btn and btn:IsA("GuiButton") then
+                    return btn, d.Text
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function findSellerPanelRoot()
+    local title = visibleTextContains("SELL YOUR CATCH")
+    if not title then return nil end
+    local vp = camera and camera.ViewportSize or Vector2.new(1920, 1080)
+    local p = title.Parent
+    while p and p ~= playerGui do
+        if p:IsA("Frame") or p:IsA("CanvasGroup") or p:IsA("ScrollingFrame") then
+            local s = p.AbsoluteSize
+            if s.X >= vp.X * 0.20 and s.Y >= vp.Y * 0.25 then return p end
+        end
+        p = p.Parent
+    end
+    return nil
+end
+
+local function getPanelItemName()
+    local panel = findSellerPanelRoot()
+    if not panel then return nil end
+    for _, d in ipairs(panel:GetDescendants()) do
+        if d:IsA("TextLabel") and guiVisible(d) and d.Name == "name" and d.Text and d.Text ~= "" then
+            return d.Text
+        end
+    end
+    return nil
+end
+
+local function sellerConfirmsSelectedItem(itemName)
+    local shown = getPanelItemName()
+    if not shown then return false end
+    return normalizeUiText(shown) == normalizeUiText(itemName)
+end
+
+local function sellerGuiIsOpen()
+    return visibleTextContains("SELL YOUR CATCH") ~= nil
+end
+
+local function waitForSellerGui(timeout)
+    local deadline = os.clock() + timeout
+    while os.clock() < deadline do
+        if sellerGuiIsOpen() then return true end
+        if killed or not enabled then return false end
+        task.wait(0.1)
+    end
+    return sellerGuiIsOpen()
+end
+
+-- ===== CLICK METHODS (firesignal first) =====
+local function clickFiresignal(btn)
+    pcall(function()
+        if not firesignal then return end
+        if btn.MouseButton1Down then firesignal(btn.MouseButton1Down) end
+        if btn.MouseButton1Up then firesignal(btn.MouseButton1Up) end
+        if btn.MouseButton1Click then firesignal(btn.MouseButton1Click) end
+        if btn.Activated then firesignal(btn.Activated) end
+    end)
+end
+local function clickFireSignal(btn)
+    pcall(function() if btn.MouseButton1Down then btn.MouseButton1Down:Fire() end end)
+    pcall(function() if btn.MouseButton1Up then btn.MouseButton1Up:Fire() end end)
+    pcall(function() if btn.MouseButton1Click then btn.MouseButton1Click:Fire() end end)
+    pcall(function() if btn.Activated then btn.Activated:Fire() end end)
+end
+local function clickVIM(btn)
+    local c = btn.AbsolutePosition + btn.AbsoluteSize / 2
+    VirtualInputManager:SendMouseButtonEvent(c.X, c.Y, 0, true, game, 1)
+    task.wait(0.05)
+    VirtualInputManager:SendMouseButtonEvent(c.X, c.Y, 0, false, game, 1)
+end
+local function clickConnections(btn)
+    pcall(function()
+        if getconnections and btn.MouseButton1Click then
+            for _, c in ipairs(getconnections(btn.MouseButton1Click)) do
+                if c.Function then pcall(c.Function) end
+            end
+        end
+    end)
+    pcall(function()
+        if getconnections and btn.Activated then
+            for _, c in ipairs(getconnections(btn.Activated)) do
+                if c.Function then pcall(c.Function) end
+            end
+        end
+    end)
+end
+local function clickMouse1(btn)
+    local c = btn.AbsolutePosition + btn.AbsoluteSize / 2
+    pcall(function()
+        if mousemoverel then
+            local delta = Vector2.new(c.X, c.Y) - UserInputService:GetMouseLocation()
+            mousemoverel(delta.X, delta.Y)
+            task.wait(0.1)
+        end
+    end)
+    pcall(function()
+        if mouse1press and mouse1release then
+            mouse1press(); task.wait(0.05); mouse1release()
+        end
+    end)
+end
+
+local CLICK_METHODS = {
+    { name = "firesignal",  fn = clickFiresignal },
+    { name = "fireSignal",  fn = clickFireSignal },
+    { name = "connections", fn = clickConnections },
+    { name = "vim",         fn = clickVIM },
+    { name = "mouse1",      fn = clickMouse1 },
+}
+
+-- ===== LEAVE MENU (two Q presses) =====
+local function closeSellerGui()
+    for i = 1, 2 do
+        log("  Q press " .. i)
+        qDown(); task.wait(0.05); qUp()
+        if i < 2 then task.wait(LEAVE_MENU_WAIT) end
+    end
+    task.wait(0.3)
+end
+
+-- ===== SELECT / SELL =====
+local function selectCard(itemName)
+    local card = findBagCard(itemName)
+    if not card then return false, "no-card" end
+    local btn = climbToButton(card)
+
+    for _, m in ipairs(CLICK_METHODS) do
+        if killed or not enabled then return false, "killed" end
+        pcall(m.fn, btn)
+        local deadline = os.clock() + SELL_SELECT_WAIT
+        while os.clock() < deadline and not sellerConfirmsSelectedItem(itemName) do
+            task.wait(0.05)
+        end
+        if sellerConfirmsSelectedItem(itemName) then
+            return true, m.name
+        end
+    end
+    return false, "all-methods-failed"
+end
+
+local function sellSelectedItem(itemName)
+    local sellAllBtn, sellAllText = findSellAllButton()
+    local sellBtn, sellText = findSellButton()
+
+    local order = {}
+    if sellAllBtn then
+        order[#order+1] = { btn = sellAllBtn, label = "SELL ALL", text = sellAllText }
+    end
+    if sellBtn then
+        order[#order+1] = { btn = sellBtn, label = "SELL", text = sellText }
+    end
+
+    if #order == 0 then return false, "no-button" end
+
+    for _, entry in ipairs(order) do
+        for _, m in ipairs(CLICK_METHODS) do
+            if killed or not enabled then return false, "killed" end
+            local wasPresent = findBagCard(itemName) ~= nil
+            pcall(m.fn, entry.btn)
+            task.wait(SELL_CLICK_WAIT)
+            local nowPresent = findBagCard(itemName) ~= nil
+            if wasPresent and not nowPresent then
+                return true, entry.label .. " via " .. m.name
+            end
+            local panelName = getPanelItemName()
+            if panelName and normalizeUiText(panelName) ~= normalizeUiText(itemName) then
+                return true, entry.label .. " via " .. m.name
+            end
+        end
+    end
+    return false, "no-click-worked"
+end
+
+local function sellStashAtErica()
+    if inventorySelling or killed or not enabled or state ~= "idle" then return end
+    local root = getRoot()
+    if not root then return end
+
+    inventorySelling = true
+    local returnCFrame = root.CFrame
+    local openedSeller = false
+
+    local saleOk, saleErr = pcall(function()
+        setState("selling")
+        log("going to Erica")
+
+        local characterRoot = getRoot()
+        if not characterRoot then error("character root missing") end
+        characterRoot.CFrame = CFrame.lookAt(SELLER_STAND_POS, SELLER_FACE_POS)
+        characterRoot.AssemblyLinearVelocity = Vector3.zero
+        task.wait(SELLER_OPEN_WAIT)
+        if killed or not enabled then return end
+
+        eDown(); task.wait(0.12); eUp()
+
+        if not waitForSellerGui(SELLER_GUI_TIMEOUT) then
+            log("seller GUI did not open")
+            return
+        end
+        openedSeller = true
+        task.wait(PANEL_RENDER_WAIT)
+        log("panel shows: " .. tostring(getPanelItemName()))
+
+        for pass = 1, SELL_MAX_PASSES do
+            if killed or not enabled then break end
+
+            local present = {}
+            for _, itemName in ipairs(SELL_ITEMS) do
+                if findBagCard(itemName) then present[#present+1] = itemName end
+            end
+            log(string.format("pass %d: %d items present", pass, #present))
+            if #present == 0 then break end
+
+            local soldAny = false
+            for _, itemName in ipairs(present) do
+                if killed or not enabled then break end
+                local ok1, m1 = selectCard(itemName)
+                if ok1 then
+                    local ok2, m2 = sellSelectedItem(itemName)
+                    if ok2 then
+                        log("SOLD " .. itemName .. " (" .. m2 .. ")")
+                        soldAny = true
+                    else
+                        log("sell failed for " .. itemName .. " (" .. m2 .. ")")
+                    end
+                    task.wait(0.3)
+                else
+                    log("could not select " .. itemName .. " (" .. tostring(m1) .. ")")
+                end
+            end
+
+            if not soldAny then
+                log("pass " .. pass .. ": nothing sold, stopping")
+                break
+            end
+        end
+
+        task.wait(0.3)
+    end)
+
+    eUp()
+    if openedSeller and sellerGuiIsOpen() then
+        log("closing panel (Q twice)")
+        pcall(closeSellerGui)
+    end
+
+    local currentRoot = getRoot()
+    if currentRoot and returnCFrame then
+        currentRoot.CFrame = returnCFrame
+        currentRoot.AssemblyLinearVelocity = Vector3.zero
+    end
+
+    inventorySelling = false
+    if not killed then setState("idle") end
+    if not saleOk then log("seller error: " .. tostring(saleErr)) end
+
+    if enabled and not killed then
+        task.wait(0.5)
+        local remaining = getStashCount()
+        if remaining and remaining >= STASH_SELL_AT then
+            enabled = false
+            sellThresholdLatched = true
+            setState("idle")
+            log("stash still " .. remaining .. "/" .. STASH_CAPACITY .. " after allowed-item sale; AutoFish paused")
+            updateGui()
+        end
+    end
+end
+
+local function checkStashAndMaybeSell(reason)
+    if killed or not enabled or inventorySelling then return end
+
+    local count = getStashCount()
+    if count then
+        lastStashText = tostring(count) .. "/" .. STASH_CAPACITY
+    else
+        lastStashText = "--/" .. STASH_CAPACITY
+    end
+    updateGui()
+
+    if not count then return end
+    if count < STASH_SELL_AT then
+        sellThresholdLatched = false
+        return
+    end
+
+    if sellThresholdLatched then
+        if enabled then
+            enabled = false
+            eUp()
+            restoreAutoRotate()
+            setState("idle")
+            log("stash remains at/above threshold; AutoFish paused")
+            updateGui()
+        end
+        return
+    end
+
+    if not enabled then return end
+    if state ~= "idle" then return end
+    if findVisibleGui("Ripple") or findVisibleGui("Reel") then return end
+
+    sellThresholdLatched = true
+    if count >= STASH_CAPACITY then
+        log("stash full at " .. count .. "/" .. STASH_CAPACITY .. " (" .. reason .. "); selling")
+    else
+        log("stash at " .. count .. "/" .. STASH_CAPACITY .. " (" .. reason .. "); selling")
+    end
+    task.spawn(sellStashAtErica)
+end
+
 track(RunService.Heartbeat:Connect(function()
-    if killed or not enabled then return end
+    if killed or not enabled or inventorySelling then return end
     local now = os.clock()
 
     local ripple = findVisibleGui("Ripple")
@@ -759,6 +1253,9 @@ track(RunService.Heartbeat:Connect(function()
     elseif state == "reeling" then
         log("reel disappeared -> cast complete")
         setState("idle")
+        task.spawn(function()
+            checkStashAndMaybeSell("after cycle")
+        end)
     elseif state == "waiting" then
         if now - lastQteTime > NO_QTE_TIMEOUT then
             log("no QTE for " .. NO_QTE_TIMEOUT .. "s, re-casting")
@@ -771,11 +1268,20 @@ track(RunService.Heartbeat:Connect(function()
     end
 end))
 
+-- Periodic fallback check
+task.spawn(function()
+    while not killed do
+        task.wait(0.35)
+        checkStashAndMaybeSell("periodic")
+    end
+end)
+
 -- ============ HUNT / AIM LOOP ============
 task.spawn(function()
     while not killed do
         task.wait(0.1)
         if not enabled then continue end
+        if inventorySelling then continue end
 
         if state == "hunting" then
             local circle, dist, luck, stand = findBestCircleWithStand()
@@ -834,7 +1340,6 @@ task.spawn(function()
                     attempt = attempt + 1
                     local status, info, origin = castOnce(circle)
                     if status ~= "released" then break end
-
                     if not VERIFY_LANDING then break end
 
                     if not info.landing then
@@ -892,9 +1397,7 @@ task.spawn(function()
             log(string.format("reel: tapping E %d times", REEL_TAP_COUNT))
             for i = 1, REEL_TAP_COUNT do
                 if killed or not enabled or state ~= "reeling" then break end
-                eDown()
-                task.wait(0.025)
-                eUp()
+                eDown(); task.wait(0.025); eUp()
                 if i < REEL_TAP_COUNT then
                     task.wait(REEL_TAP_INTERVAL - 0.025)
                 end
@@ -970,7 +1473,10 @@ track(UserInputService.InputBegan:Connect(function(input)
             setState("idle")
             log("Disabled")
         else
+            if state ~= "idle" then setState("idle") end
+            idleSince = os.clock()
             log("Enabled")
+            checkStashAndMaybeSell("on enable")
         end
         updateGui()
     elseif input.KeyCode == KILL_KEY then
@@ -979,4 +1485,5 @@ track(UserInputService.InputBegan:Connect(function(input)
 end))
 
 updateGui()
-log(string.format("Loaded. F8 = toggle, End = kill. %d studs/sec, max range %d studs.", STUDS_PER_SECOND, CAST_MAX_RANGE))
+log(string.format("Loaded. F8 = toggle, End = kill. Allowed items: %d. Stash triggers at %d/%d.",
+    #SELL_ITEMS, STASH_SELL_AT, STASH_CAPACITY))
