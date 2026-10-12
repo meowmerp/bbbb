@@ -51,24 +51,28 @@ local PROP_BLACKLIST = {
     "morvik_intro_human",
 }
 
--- LAYOUT (all in pixels)
+-- LAYOUT (pixels)
 local PANEL_W   = 340
 local FREEZE_H  = 220
 local LOG_H     = 220
 local GAP       = 0
 local CONTAINER_H = FREEZE_H + GAP + LOG_H
 
--- COLORS (solid, no transparency anywhere)
-local BLACK     = Color3.fromRGB(0, 0, 0)
-local WHITE     = Color3.fromRGB(255, 255, 255)
-local GREY_DIM  = Color3.fromRGB(200, 200, 200)
-local GREY_CODE = Color3.fromRGB(240, 240, 240)
-local DOT_IDLE  = Color3.fromRGB(140, 140, 140)
-local DOT_ON    = Color3.fromRGB(80, 230, 110)
-local DOT_OFF   = Color3.fromRGB(240, 80, 80)
-local STATE_INFO = Color3.fromRGB(140, 200, 255)
-local STATE_WARN = Color3.fromRGB(255, 200, 90)
-local STATE_DIM  = Color3.fromRGB(180, 180, 180)
+-- COLORS (pure black backgrounds, toned text)
+local BLACK          = Color3.fromRGB(0, 0, 0)         -- panels + container
+local LOG_BOX_BG     = Color3.fromRGB(10, 10, 10)      -- slightly off-black inset
+
+local TEXT_TITLE     = Color3.fromRGB(235, 235, 235)   -- panel title (near white)
+local TEXT_MAIN      = Color3.fromRGB(230, 230, 230)   -- "ON" / "OFF" line
+local TEXT_DIM       = Color3.fromRGB(150, 150, 150)   -- Pos / Falls / Auto-recover
+local TEXT_CODE      = Color3.fromRGB(170, 170, 170)   -- log lines
+
+local DOT_IDLE       = Color3.fromRGB(110, 110, 110)
+local DOT_ON         = Color3.fromRGB(90, 210, 110)
+local DOT_OFF        = Color3.fromRGB(220, 80, 80)
+local STATE_INFO     = Color3.fromRGB(130, 180, 230)   -- "watching"
+local STATE_WARN     = Color3.fromRGB(230, 190, 110)   -- "FROZEN"
+local STATE_DIM      = Color3.fromRGB(150, 150, 150)   -- "paused"
 
 -- STATE
 local killed = false
@@ -122,7 +126,6 @@ if not parent then
 end
 gui.Parent = parent or lp:WaitForChild("PlayerGui")
 
--- Container: solid black background so no gaps ever show the game through.
 local container = Instance.new("Frame")
 container.Name = "FarmAssistContainer"
 container.Size = UDim2.fromOffset(PANEL_W, CONTAINER_H)
@@ -154,7 +157,7 @@ local function makeTitle(frame, text)
     t.BackgroundTransparency = 1
     t.Font = Enum.Font.GothamBold
     t.TextSize = 14
-    t.TextColor3 = WHITE
+    t.TextColor3 = TEXT_TITLE
     t.Text = text
     t.Active = true
     t.Parent = frame
@@ -191,22 +194,22 @@ local frame = makePanel(container, 0, FREEZE_H)
 local titleBar = makeTitle(frame, "Fall Freeze")
 local dot = makeDot(frame, 36)
 
-local mainLabel = makeLabel(frame, 33, 15, WHITE,
+local mainLabel = makeLabel(frame, 33, 15, TEXT_MAIN,
     Enum.Font.GothamBold, "Fall Freeze: starting...", 32, -44)
 local stateLabel = makeLabel(frame, 58, 13, STATE_INFO, nil, "State: starting")
-local posLabel   = makeLabel(frame, 78, 12, GREY_DIM, nil, "Pos: --")
-local statLabel  = makeLabel(frame, 96, 12, GREY_DIM, nil,
+local posLabel   = makeLabel(frame, 78, 12, TEXT_DIM, nil, "Pos: --")
+local statLabel  = makeLabel(frame, 96, 12, TEXT_DIM, nil,
     "Falls caught: 0   Floor placements: 0")
 
 local logBox = Instance.new("TextLabel")
 logBox.Size = UDim2.new(1, -24, 0, 82)
 logBox.Position = UDim2.new(0, 12, 0, 120)
-logBox.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
+logBox.BackgroundColor3 = LOG_BOX_BG
 logBox.BackgroundTransparency = 0
 logBox.BorderSizePixel = 0
 logBox.Font = Enum.Font.Code
 logBox.TextSize = 12
-logBox.TextColor3 = GREY_CODE
+logBox.TextColor3 = TEXT_CODE
 logBox.TextXAlignment = Enum.TextXAlignment.Left
 logBox.TextYAlignment = Enum.TextYAlignment.Top
 logBox.TextWrapped = true
@@ -214,7 +217,7 @@ logBox.Text = ""
 logBox.Parent = frame
 Instance.new("UICorner", logBox).CornerRadius = UDim.new(0, 6)
 
-local hint = makeLabel(frame, FREEZE_H - 22, 11, GREY_DIM, nil,
+local hint = makeLabel(frame, FREEZE_H - 22, 11, TEXT_DIM, nil,
     "F7 toggle  ·  = kill  ·  drag title", 0, 0)
 hint.Size = UDim2.new(1, 0, 0, 16)
 hint.TextXAlignment = Enum.TextXAlignment.Center
@@ -223,9 +226,9 @@ hint.TextXAlignment = Enum.TextXAlignment.Center
 local wframe = makePanel(container, FREEZE_H + GAP, LOG_H)
 local wTitleBar = makeTitle(wframe, "Activity Log")
 local wDot  = makeDot(wframe, 36)
-local wMain = makeLabel(wframe, 33, 14, WHITE,
+local wMain = makeLabel(wframe, 33, 14, TEXT_MAIN,
     Enum.Font.GothamBold, "Activity Log: RUNNING", 32, -44)
-local wRecover = makeLabel(wframe, 58, 12, GREY_DIM,
+local wRecover = makeLabel(wframe, 58, 12, TEXT_DIM,
     nil, "Auto-recover: 0", 12, -24)
 
 local wLast = Instance.new("TextLabel")
@@ -234,14 +237,14 @@ wLast.Position = UDim2.new(0, 12, 0, 78)
 wLast.BackgroundTransparency = 1
 wLast.Font = Enum.Font.Code
 wLast.TextSize = 12
-wLast.TextColor3 = GREY_CODE
+wLast.TextColor3 = TEXT_CODE
 wLast.TextXAlignment = Enum.TextXAlignment.Left
 wLast.TextYAlignment = Enum.TextYAlignment.Top
 wLast.TextWrapped = true
 wLast.Text = "(no output yet)"
 wLast.Parent = wframe
 
--- Drag handlers
+-- Drag
 local dragStart, startPos
 local function beginDrag(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1
@@ -291,7 +294,7 @@ local function isBlacklisted(model)
     return false
 end
 
--- FALL FREEZE (original)
+-- FALL FREEZE
 local function release(r)
     if r then r.Anchored = false end
     anchored = false
@@ -625,7 +628,6 @@ local function refreshLogGui()
     end
     wRecover.Text = string.format("Auto-recover: %d   (range %d studs)", autoRecovers, STUCK_TELEPORT_RANGE)
 
-    -- Show last few lines, wraps within the panel because ClipsDescendants is on
     local tail = {}
     local startIdx = math.max(1, #logBuffer - 2)
     for i = startIdx, #logBuffer do tail[#tail + 1] = logBuffer[i] end
