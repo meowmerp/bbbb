@@ -24,41 +24,81 @@ end
 -- ============ ALLOWED SELL ITEMS (txt file) ============
 local SELL_ITEMS_FILE = "auto_fisher_sell_items.txt"
 local DEFAULT_SELL_ITEMS = {
-    "Old Boot", "Grey Fish", "Blue Fish",
+    "Old Boot", "Grey Fish", "Blue Fish", "Cyan Fish",
     "Brown Starfish", "Blue Starfish", "Dark Key",
+    "Golden Tooth",
 }
 
+-- used for dedupe/merge at load time (mirrors normalizeUiText, which is defined later)
+local function normalizeSellItem(value)
+    return string.upper((value or ""):gsub("%s+", ""):gsub("[^%w]", ""))
+end
+
 local function loadSellItems()
+    local builtin = {}
+    for _, item in ipairs(DEFAULT_SELL_ITEMS) do builtin[#builtin + 1] = item end
+
     if not (writefile and readfile and isfile) then
-        print("[Fisher] File API unavailable; using built-in list (" .. #DEFAULT_SELL_ITEMS .. " items)")
-        return DEFAULT_SELL_ITEMS
+        print("[Fisher] File API unavailable; using built-in list (" .. #builtin .. " items)")
+        return builtin
     end
-    local exists = false
+
+    local content, exists = nil, false
     pcall(function() exists = isfile(SELL_ITEMS_FILE) end)
-    if not exists then
-        pcall(function()
-            local header = "# Auto Fisher - Allowed Sell Items\n"
-                .. "# One item name per line. Lines starting with # are ignored.\n"
-                .. "# The script will ONLY sell items listed here. Everything else is protected.\n"
-                .. "# Delete this file to regenerate with defaults.\n\n"
-            writefile(SELL_ITEMS_FILE, header .. table.concat(DEFAULT_SELL_ITEMS, "\n") .. "\n")
-        end)
-        print("[Fisher] Created " .. SELL_ITEMS_FILE .. " with " .. #DEFAULT_SELL_ITEMS .. " default items")
-        return DEFAULT_SELL_ITEMS
+    if exists then
+        pcall(function() content = readfile(SELL_ITEMS_FILE) end)
     end
-    local content = ""
-    pcall(function() content = readfile(SELL_ITEMS_FILE) end)
-    local items = {}
+
+    -- first time: seed the file from the built-in list
+    if content == nil then
+        local header = "# Auto Fisher - Allowed Sell Items\n"
+            .. "# One item name per line. Lines starting with # are ignored.\n"
+            .. "# The script will ONLY sell items listed here. Everything else is protected.\n"
+            .. "# New built-in defaults are appended automatically on load; your own lines are never removed.\n\n"
+        pcall(function()
+            writefile(SELL_ITEMS_FILE, header .. table.concat(builtin, "\n") .. "\n")
+        end)
+        print("[Fisher] Created " .. SELL_ITEMS_FILE .. " with " .. #builtin .. " default items")
+        return builtin
+    end
+
+    -- parse the existing file
+    local items, seen = {}, {}
     for line in content:gmatch("[^\r\n]+") do
         local trimmed = line:gsub("^%s+", ""):gsub("%s+$", "")
         if trimmed ~= "" and not trimmed:match("^#") then
-            items[#items + 1] = trimmed
+            local key = normalizeSellItem(trimmed)
+            if key ~= "" and not seen[key] then
+                seen[key] = true
+                items[#items + 1] = trimmed
+            end
         end
     end
-    if #items == 0 then
-        print("[Fisher] " .. SELL_ITEMS_FILE .. " is empty; using built-in defaults")
-        return DEFAULT_SELL_ITEMS
+
+    -- merge: append built-ins the file does not already have
+    local appended = {}
+    for _, item in ipairs(builtin) do
+        local key = normalizeSellItem(item)
+        if key ~= "" and not seen[key] then
+            seen[key] = true
+            items[#items + 1] = item
+            appended[#appended + 1] = item
+        end
     end
+
+    if #appended > 0 then
+        local lines = {}
+        for _, item in ipairs(items) do lines[#lines + 1] = item end
+        local body = table.concat(lines, "\n") .. "\n"
+        local ok = pcall(function() writefile(SELL_ITEMS_FILE, body) end)
+        if ok then
+            print("[Fisher] Added " .. #appended .. " item(s) to " .. SELL_ITEMS_FILE .. ": "
+                .. table.concat(appended, ", "))
+        else
+            print("[Fisher] Could not write " .. SELL_ITEMS_FILE .. "; additions are active for this session only")
+        end
+    end
+
     print("[Fisher] Loaded " .. #items .. " allowed sell items from " .. SELL_ITEMS_FILE)
     return items
 end
