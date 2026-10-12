@@ -52,27 +52,28 @@ local PROP_BLACKLIST = {
 }
 
 -- LAYOUT (pixels)
-local PANEL_W   = 340
-local FREEZE_H  = 220
-local LOG_H     = 220
-local GAP       = 0
+local PANEL_W     = 340
+local FREEZE_H    = 226
+local LOG_H       = 226
+local GAP         = 0
 local CONTAINER_H = FREEZE_H + GAP + LOG_H
 
--- COLORS (pure black backgrounds, toned text)
-local BLACK          = Color3.fromRGB(0, 0, 0)         -- panels + container
-local LOG_BOX_BG     = Color3.fromRGB(10, 10, 10)      -- slightly off-black inset
+-- COLORS
+local BLACK          = Color3.fromRGB(0, 0, 0)        -- panel background
+local BOX_BG         = Color3.fromRGB(38, 38, 42)     -- strip behind each text line
+local LOGBOX_BG      = Color3.fromRGB(22, 22, 25)     -- log content area (darker)
 
-local TEXT_TITLE     = Color3.fromRGB(235, 235, 235)   -- panel title (near white)
-local TEXT_MAIN      = Color3.fromRGB(230, 230, 230)   -- "ON" / "OFF" line
-local TEXT_DIM       = Color3.fromRGB(150, 150, 150)   -- Pos / Falls / Auto-recover
-local TEXT_CODE      = Color3.fromRGB(170, 170, 170)   -- log lines
+local TEXT_TITLE     = Color3.fromRGB(235, 235, 235)
+local TEXT_MAIN      = Color3.fromRGB(235, 235, 235)
+local TEXT_DIM       = Color3.fromRGB(180, 180, 185)
+local TEXT_CODE      = Color3.fromRGB(200, 200, 205)
 
-local DOT_IDLE       = Color3.fromRGB(110, 110, 110)
-local DOT_ON         = Color3.fromRGB(90, 210, 110)
-local DOT_OFF        = Color3.fromRGB(220, 80, 80)
-local STATE_INFO     = Color3.fromRGB(130, 180, 230)   -- "watching"
-local STATE_WARN     = Color3.fromRGB(230, 190, 110)   -- "FROZEN"
-local STATE_DIM      = Color3.fromRGB(150, 150, 150)   -- "paused"
+local DOT_IDLE       = Color3.fromRGB(120, 120, 128)
+local DOT_ON         = Color3.fromRGB(110, 210, 130)
+local DOT_OFF        = Color3.fromRGB(220, 100, 100)
+local STATE_INFO     = Color3.fromRGB(150, 190, 235)
+local STATE_WARN     = Color3.fromRGB(230, 190, 110)
+local STATE_DIM      = Color3.fromRGB(170, 170, 175)
 
 -- STATE
 local killed = false
@@ -164,49 +165,79 @@ local function makeTitle(frame, text)
     return t
 end
 
-local function makeDot(frame, y)
-    local d = Instance.new("Frame")
-    d.Size = UDim2.fromOffset(12, 12)
-    d.Position = UDim2.new(0, 12, 0, y)
-    d.BackgroundColor3 = DOT_IDLE
-    d.BorderSizePixel = 0
-    d.Parent = frame
-    Instance.new("UICorner", d).CornerRadius = UDim.new(1, 0)
-    return d
+-- A gray strip that holds one line of text (or a dot + text, if you add one)
+local function makeStrip(parent, y, h, xOffset, widthOffset)
+    local box = Instance.new("Frame")
+    box.Size = UDim2.new(1, widthOffset or -24, 0, h)
+    box.Position = UDim2.fromOffset(xOffset or 12, y)
+    box.BackgroundColor3 = BOX_BG
+    box.BackgroundTransparency = 0
+    box.BorderSizePixel = 0
+    box.ClipsDescendants = true
+    box.Parent = parent
+    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 4)
+    return box
 end
 
-local function makeLabel(frame, y, size, color, font, text, xOffset, widthOffset)
+local function makeStripLabel(parent, y, h, size, color, font, text, xOffset)
+    local box = makeStrip(parent, y, h, xOffset)
     local l = Instance.new("TextLabel")
-    l.Size = UDim2.new(1, widthOffset or -24, 0, 18)
-    l.Position = UDim2.new(0, xOffset or 12, 0, y)
+    l.Size = UDim2.new(1, -16, 1, 0)
+    l.Position = UDim2.fromOffset(8, 0)
     l.BackgroundTransparency = 1
     l.Font = font or Enum.Font.Gotham
     l.TextSize = size
     l.TextXAlignment = Enum.TextXAlignment.Left
     l.TextColor3 = color
     l.Text = text or ""
-    l.Parent = frame
+    l.Parent = box
     return l
+end
+
+-- Status row with a dot and bold text (used for ON/OFF and RUNNING/PAUSED)
+local function makeStatusRow(parent, y)
+    local box = makeStrip(parent, y, 26)
+    local dot = Instance.new("Frame")
+    dot.Size = UDim2.fromOffset(12, 12)
+    dot.Position = UDim2.new(0, 10, 0.5, -6)
+    dot.BackgroundColor3 = DOT_IDLE
+    dot.BorderSizePixel = 0
+    dot.Parent = box
+    Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -34, 1, 0)
+    lbl.Position = UDim2.fromOffset(30, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Font = Enum.Font.GothamBold
+    lbl.TextSize = 14
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.TextColor3 = TEXT_MAIN
+    lbl.Text = ""
+    lbl.Parent = box
+    return dot, lbl
 end
 
 -- Fall Freeze panel
 local frame = makePanel(container, 0, FREEZE_H)
 local titleBar = makeTitle(frame, "Fall Freeze")
-local dot = makeDot(frame, 36)
 
-local mainLabel = makeLabel(frame, 33, 15, TEXT_MAIN,
-    Enum.Font.GothamBold, "Fall Freeze: starting...", 32, -44)
-local stateLabel = makeLabel(frame, 58, 13, STATE_INFO, nil, "State: starting")
-local posLabel   = makeLabel(frame, 78, 12, TEXT_DIM, nil, "Pos: --")
-local statLabel  = makeLabel(frame, 96, 12, TEXT_DIM, nil,
+-- status row (dot + "Fall Freeze: ON")
+local dot, mainLabel = makeStatusRow(frame, 33)
+
+-- info rows, each on its own gray strip
+local stateLabel = makeStripLabel(frame, 63, 22, 13, STATE_INFO, nil, "State: starting")
+local posLabel   = makeStripLabel(frame, 89, 22, 12, TEXT_DIM,   nil, "Pos: --")
+local statLabel  = makeStripLabel(frame, 115, 22, 12, TEXT_DIM,  nil,
     "Falls caught: 0   Floor placements: 0")
 
+-- log content box (darker inset to look like a readout)
+local logBoxWrap = makeStrip(frame, 141, 62)
+logBoxWrap.BackgroundColor3 = LOGBOX_BG
 local logBox = Instance.new("TextLabel")
-logBox.Size = UDim2.new(1, -24, 0, 82)
-logBox.Position = UDim2.new(0, 12, 0, 120)
-logBox.BackgroundColor3 = LOG_BOX_BG
-logBox.BackgroundTransparency = 0
-logBox.BorderSizePixel = 0
+logBox.Size = UDim2.new(1, -16, 1, 0)
+logBox.Position = UDim2.fromOffset(8, 0)
+logBox.BackgroundTransparency = 1
 logBox.Font = Enum.Font.Code
 logBox.TextSize = 12
 logBox.TextColor3 = TEXT_CODE
@@ -214,26 +245,29 @@ logBox.TextXAlignment = Enum.TextXAlignment.Left
 logBox.TextYAlignment = Enum.TextYAlignment.Top
 logBox.TextWrapped = true
 logBox.Text = ""
-logBox.Parent = frame
-Instance.new("UICorner", logBox).CornerRadius = UDim.new(0, 6)
+logBox.Parent = logBoxWrap
 
-local hint = makeLabel(frame, FREEZE_H - 22, 11, TEXT_DIM, nil,
-    "F7 toggle  ·  = kill  ·  drag title", 0, 0)
-hint.Size = UDim2.new(1, 0, 0, 16)
+-- hint strip
+local hint = makeStripLabel(frame, 207, 16, 11, TEXT_DIM, nil,
+    "F7 toggle  ·  = kill  ·  drag title")
 hint.TextXAlignment = Enum.TextXAlignment.Center
+hint.Position = UDim2.fromOffset(0, 0)
+hint.Size = UDim2.new(1, 0, 1, 0)
 
 -- Activity Log panel
 local wframe = makePanel(container, FREEZE_H + GAP, LOG_H)
 local wTitleBar = makeTitle(wframe, "Activity Log")
-local wDot  = makeDot(wframe, 36)
-local wMain = makeLabel(wframe, 33, 14, TEXT_MAIN,
-    Enum.Font.GothamBold, "Activity Log: RUNNING", 32, -44)
-local wRecover = makeLabel(wframe, 58, 12, TEXT_DIM,
-    nil, "Auto-recover: 0", 12, -24)
 
+local wDot, wMain = makeStatusRow(wframe, 33)
+local wRecover = makeStripLabel(wframe, 63, 22, 12, TEXT_DIM,
+    nil, "Auto-recover: 0")
+
+-- last-lines readout, its own box
+local wLastWrap = makeStrip(wframe, 89, 130)
+wLastWrap.BackgroundColor3 = LOGBOX_BG
 local wLast = Instance.new("TextLabel")
-wLast.Size = UDim2.new(1, -24, 0, 130)
-wLast.Position = UDim2.new(0, 12, 0, 78)
+wLast.Size = UDim2.new(1, -16, 1, 0)
+wLast.Position = UDim2.fromOffset(8, 0)
 wLast.BackgroundTransparency = 1
 wLast.Font = Enum.Font.Code
 wLast.TextSize = 12
@@ -242,7 +276,7 @@ wLast.TextXAlignment = Enum.TextXAlignment.Left
 wLast.TextYAlignment = Enum.TextYAlignment.Top
 wLast.TextWrapped = true
 wLast.Text = "(no output yet)"
-wLast.Parent = wframe
+wLast.Parent = wLastWrap
 
 -- Drag
 local dragStart, startPos
@@ -294,7 +328,7 @@ local function isBlacklisted(model)
     return false
 end
 
--- FALL FREEZE
+-- FALL FREEZE (original v2)
 local function release(r)
     if r then r.Anchored = false end
     anchored = false
@@ -629,7 +663,7 @@ local function refreshLogGui()
     wRecover.Text = string.format("Auto-recover: %d   (range %d studs)", autoRecovers, STUCK_TELEPORT_RANGE)
 
     local tail = {}
-    local startIdx = math.max(1, #logBuffer - 2)
+    local startIdx = math.max(1, #logBuffer - 3)
     for i = startIdx, #logBuffer do tail[#tail + 1] = logBuffer[i] end
     wLast.Text = #tail > 0 and table.concat(tail, "\n") or "(no output yet)"
 end
