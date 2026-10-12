@@ -32,7 +32,7 @@ local FREEZE_LOG_LINES = 5
 local TELEPORT_DIST = 12
 local STUCK_SECONDS = 10
 local STUCK_MOVE    = 1
-local LOG_BUFFER_MAX = 1000    -- memory cap; older lines get trimmed
+local LOG_BUFFER_MAX = 1000
 local IGNORE = {
     "render_class_body_particles",
     "Stack Begin",
@@ -53,6 +53,20 @@ local PROP_BLACKLIST = {
     "morvik_intro_human",
 }
 
+-- COLORS (solid, no transparency)
+local COL_PANEL_BG = Color3.fromRGB(0, 0, 0)
+local COL_LOGBOX_BG = Color3.fromRGB(0, 0, 0)
+local COL_TEXT_MAIN = Color3.fromRGB(255, 255, 255)
+local COL_TEXT_TITLE = Color3.fromRGB(255, 255, 255)
+local COL_TEXT_DIM = Color3.fromRGB(210, 210, 210)
+local COL_TEXT_CODE = Color3.fromRGB(230, 230, 230)
+local COL_DOT_IDLE = Color3.fromRGB(150, 150, 150)
+local COL_DOT_ON = Color3.fromRGB(70, 220, 100)
+local COL_DOT_OFF = Color3.fromRGB(230, 70, 70)
+local COL_STATE_INFO = Color3.fromRGB(120, 190, 255)
+local COL_STATE_WARN = Color3.fromRGB(255, 190, 80)
+local COL_STATE_DIM = Color3.fromRGB(180, 180, 180)
+
 -- STATE
 local killed = false
 
@@ -66,8 +80,8 @@ local logBuffer      = {}
 local logT0          = os.clock()
 local logLineCount   = 0
 local lastLogLine    = ""
-local logTotalLines  = 0     -- monotonic count of every line ever logged
-local logWrittenLines = 0    -- how many of those have been flushed to disk
+local logTotalLines  = 0
+local logWrittenLines = 0
 
 local lastAutoRecover  = 0
 local autoRecovers     = 0
@@ -75,7 +89,6 @@ local lastGoodPos      = nil
 local lastGoodTime     = 0
 local lastActivityTime = os.clock()
 
--- log-position trackers (declared here so the F7 toggle handler can reset them)
 local wLastPos, wLastMoveCheckPos, wLastMoveTime = nil, nil, os.clock()
 local wLastStuckLog = 0
 
@@ -105,11 +118,11 @@ if not parent then
 end
 gui.Parent = parent or lp:WaitForChild("PlayerGui")
 
--- Single draggable container holds both panels.
+-- Single draggable container. Sized to fit freeze panel (214) + gap (8) + log panel (170).
 local container = Instance.new("Frame")
 container.Name = "FarmAssistContainer"
-container.Size = UDim2.fromOffset(270, 322)   -- 214 (freeze) + 8 gap + 100 (log)
-container.Position = UDim2.new(1, -290, 0, 100)
+container.Size = UDim2.fromOffset(280, 392)
+container.Position = UDim2.new(1, -300, 0, 100)
 container.BackgroundTransparency = 1
 container.BorderSizePixel = 0
 container.Active = false
@@ -117,10 +130,10 @@ container.Parent = gui
 
 local function makePanel(parent, y, h)
     local f = Instance.new("Frame")
-    f.Size = UDim2.fromOffset(270, h)
+    f.Size = UDim2.fromOffset(280, h)
     f.Position = UDim2.fromOffset(0, y)
-    f.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
-    f.BackgroundTransparency = 0.12
+    f.BackgroundColor3 = COL_PANEL_BG
+    f.BackgroundTransparency = 0
     f.BorderSizePixel = 0
     f.Active = true
     f.Parent = parent
@@ -134,7 +147,7 @@ local function makeTitle(frame, text)
     t.BackgroundTransparency = 1
     t.Font = Enum.Font.GothamBold
     t.TextSize = 13
-    t.TextColor3 = Color3.fromRGB(200, 200, 200)
+    t.TextColor3 = COL_TEXT_TITLE
     t.Text = text
     t.Active = true
     t.Parent = frame
@@ -145,7 +158,7 @@ local function makeDot(frame, y)
     local d = Instance.new("Frame")
     d.Size = UDim2.fromOffset(12, 12)
     d.Position = UDim2.new(0, 12, 0, y)
-    d.BackgroundColor3 = Color3.fromRGB(150, 150, 150)
+    d.BackgroundColor3 = COL_DOT_IDLE
     d.BorderSizePixel = 0
     d.Parent = frame
     Instance.new("UICorner", d).CornerRadius = UDim.new(1, 0)
@@ -166,27 +179,27 @@ local function makeLabel(frame, y, size, color, font, text, xOffset, widthOffset
     return l
 end
 
--- Fall Freeze panel (top)
+-- Fall Freeze panel (top, height 214)
 local frame = makePanel(container, 0, 214)
 local titleBar = makeTitle(frame, "Fall Freeze")
 local dot = makeDot(frame, 35)
 
-local mainLabel = makeLabel(frame, 32, 14, Color3.new(1, 1, 1),
+local mainLabel = makeLabel(frame, 32, 14, COL_TEXT_MAIN,
     Enum.Font.GothamBold, "Fall Freeze: starting...", 32, -44)
-local stateLabel = makeLabel(frame, 56, 13, Color3.fromRGB(120, 190, 255), nil, "State: starting")
-local posLabel   = makeLabel(frame, 76, 12, Color3.fromRGB(190, 190, 190), nil, "Pos: --")
-local statLabel  = makeLabel(frame, 94, 12, Color3.fromRGB(190, 190, 190), nil,
+local stateLabel = makeLabel(frame, 56, 13, COL_STATE_INFO, nil, "State: starting")
+local posLabel   = makeLabel(frame, 76, 12, COL_TEXT_DIM, nil, "Pos: --")
+local statLabel  = makeLabel(frame, 94, 12, COL_TEXT_DIM, nil,
     "Falls caught: 0   Floor placements: 0")
 
 local logBox = Instance.new("TextLabel")
 logBox.Size = UDim2.new(1, -24, 0, 76)
 logBox.Position = UDim2.new(0, 12, 0, 118)
-logBox.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
-logBox.BackgroundTransparency = 0.3
+logBox.BackgroundColor3 = COL_LOGBOX_BG
+logBox.BackgroundTransparency = 0
 logBox.BorderSizePixel = 0
 logBox.Font = Enum.Font.Code
 logBox.TextSize = 11
-logBox.TextColor3 = Color3.fromRGB(170, 170, 170)
+logBox.TextColor3 = COL_TEXT_CODE
 logBox.TextXAlignment = Enum.TextXAlignment.Left
 logBox.TextYAlignment = Enum.TextYAlignment.Top
 logBox.TextWrapped = true
@@ -194,21 +207,32 @@ logBox.Text = ""
 logBox.Parent = frame
 Instance.new("UICorner", logBox).CornerRadius = UDim.new(0, 6)
 
-local hint = makeLabel(frame, 197, 11, Color3.fromRGB(140, 140, 140), nil,
+local hint = makeLabel(frame, 197, 11, COL_TEXT_DIM, nil,
     "F7 toggle  ·  = kill  ·  drag title", 0, 0)
 hint.Size = UDim2.new(1, 0, 0, 16)
 hint.TextXAlignment = Enum.TextXAlignment.Center
 
--- Activity Log panel (bottom)
-local wframe = makePanel(container, 222, 100)
+-- Activity Log panel (bottom, height 170, taller so last-line can wrap)
+local wframe = makePanel(container, 222, 170)
 local wTitleBar = makeTitle(wframe, "Activity Log")
 local wDot  = makeDot(wframe, 33)
-local wMain = makeLabel(wframe, 31, 13, Color3.new(1, 1, 1),
+local wMain = makeLabel(wframe, 31, 13, COL_TEXT_MAIN,
     Enum.Font.GothamBold, "Activity Log: RUNNING", 32, -44)
-local wRecover = makeLabel(wframe, 50, 11, Color3.fromRGB(190, 190, 190),
+local wRecover = makeLabel(wframe, 50, 11, COL_TEXT_DIM,
     nil, "Auto-recover: 0", 12, -24)
-local wLast = makeLabel(wframe, 68, 11, Color3.fromRGB(170, 170, 170),
-    Enum.Font.Code, "(no output yet)", 12, -24)
+
+local wLast = Instance.new("TextLabel")
+wLast.Size = UDim2.new(1, -24, 0, 100)
+wLast.Position = UDim2.new(0, 12, 0, 68)
+wLast.BackgroundTransparency = 1
+wLast.Font = Enum.Font.Code
+wLast.TextSize = 11
+wLast.TextColor3 = COL_TEXT_CODE
+wLast.TextXAlignment = Enum.TextXAlignment.Left
+wLast.TextYAlignment = Enum.TextYAlignment.Top
+wLast.TextWrapped = true
+wLast.Text = "(no output yet)"
+wLast.Parent = wframe
 
 -- Drag: both title bars move the shared container.
 local dragStart, startPos
@@ -339,15 +363,12 @@ local function logLine(tag, msg)
     end
 end
 
--- Flush to disk. If appendfile is available, only write the lines we haven't
--- written yet; otherwise rewrite the capped buffer.
 local function flushLog()
     pcall(function()
         if appendfile and logTotalLines > logWrittenLines then
-            -- buffer holds total lines (logTotalLines - #logBuffer + 1) .. logTotalLines
             local firstInBuffer = logTotalLines - #logBuffer + 1
             local fromIdx = (logWrittenLines + 1) - firstInBuffer + 1
-            if fromIdx < 1 then fromIdx = 1 end  -- very old lines already culled
+            if fromIdx < 1 then fromIdx = 1 end
             if fromIdx <= #logBuffer then
                 local chunk = {}
                 for i = fromIdx, #logBuffer do
@@ -556,7 +577,6 @@ conns[#conns + 1] = lp.CharacterAdded:Connect(function(c)
     task.spawn(watchChar, c)
 end)
 
--- Periodic flush (memory-safe; appendfile used when available)
 task.spawn(function()
     while not killed do
         task.wait(5)
@@ -569,28 +589,28 @@ end)
 local function refreshFreezeGui()
     local r = getRoot()
     if freezeEnabled then
-        dot.BackgroundColor3 = Color3.fromRGB(70, 220, 100)
+        dot.BackgroundColor3 = COL_DOT_ON
         mainLabel.Text = "Fall Freeze: ON"
     else
-        dot.BackgroundColor3 = Color3.fromRGB(230, 70, 70)
+        dot.BackgroundColor3 = COL_DOT_OFF
         mainLabel.Text = "Fall Freeze: OFF"
     end
 
     if not r then
         stateLabel.Text = "State: no character"
-        stateLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
+        stateLabel.TextColor3 = COL_STATE_DIM
         posLabel.Text = "Y: --"
     else
         if anchored then
             local left = math.max(0, SETTLE_AFTER - (os.clock() - frozenAt))
             stateLabel.Text = string.format("State: FROZEN (floor check in %.1fs)", left)
-            stateLabel.TextColor3 = Color3.fromRGB(255, 190, 80)
+            stateLabel.TextColor3 = COL_STATE_WARN
         elseif freezeEnabled then
             stateLabel.Text = "State: watching"
-            stateLabel.TextColor3 = Color3.fromRGB(120, 190, 255)
+            stateLabel.TextColor3 = COL_STATE_INFO
         else
             stateLabel.Text = "State: paused"
-            stateLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
+            stateLabel.TextColor3 = COL_STATE_DIM
         end
         local p, v = r.Position, r.AssemblyLinearVelocity
         posLabel.Text = string.format("Pos: %.0f, %.1f, %.0f   fall speed: %.0f",
@@ -601,14 +621,20 @@ end
 
 local function refreshLogGui()
     if logRunning then
-        wDot.BackgroundColor3 = Color3.fromRGB(70, 220, 100)
+        wDot.BackgroundColor3 = COL_DOT_ON
         wMain.Text = string.format("Activity Log: RUNNING  (%d lines)", logLineCount)
     else
-        wDot.BackgroundColor3 = Color3.fromRGB(230, 70, 70)
+        wDot.BackgroundColor3 = COL_DOT_OFF
         wMain.Text = string.format("Activity Log: PAUSED  (%d lines)", logLineCount)
     end
     wRecover.Text = string.format("Auto-recover: %d   (range %d studs)", autoRecovers, STUCK_TELEPORT_RANGE)
-    wLast.Text = lastLogLine ~= "" and lastLogLine:sub(1, 58) or "(no output yet)"
+    -- Show the last few log lines so you can actually read them.
+    local tail = {}
+    local startIdx = math.max(1, #logBuffer - 2)
+    for i = startIdx, #logBuffer do
+        tail[#tail + 1] = logBuffer[i]
+    end
+    wLast.Text = #tail > 0 and table.concat(tail, "\n") or "(no output yet)"
 end
 
 task.spawn(function()
@@ -630,9 +656,9 @@ local function kill()
     for _, c in ipairs(conns) do c:Disconnect() end
     table.clear(conns)
     flushLog()
-    dot.BackgroundColor3 = Color3.fromRGB(150, 150, 150)
+    dot.BackgroundColor3 = COL_DOT_IDLE
     mainLabel.Text = "Killed"
-    wDot.BackgroundColor3 = Color3.fromRGB(150, 150, 150)
+    wDot.BackgroundColor3 = COL_DOT_IDLE
     wMain.Text = "Activity Log: STOPPED"
     task.delay(1.2, function() gui:Destroy() end)
     print("[FarmAssist] Killed. Log saved to activity_log.txt (if supported).")
@@ -645,15 +671,14 @@ end
 conns[#conns + 1] = UserInputService.InputBegan:Connect(function(input)
     if killed or UserInputService:GetFocusedTextBox() then return end
     if input.KeyCode == TOGGLE_KEY then
-        -- F7 toggles both freeze and log together
         local newState = not (freezeEnabled and logRunning)
         freezeEnabled = newState
         logRunning    = newState
         if newState then
             lastActivityTime  = os.clock()
             wLastMoveCheckPos = nil
-            wLastPos          = nil   -- don't log a phantom TELEPORT on resume
-            wLastStuckLog     = 0     -- clear stale stuck cooldown
+            wLastPos          = nil
+            wLastStuckLog     = 0
             pushFreezeLog("enabled (freeze + log)")
         else
             release(getRoot())
