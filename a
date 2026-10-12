@@ -277,7 +277,7 @@ local hint = makeLabel(frame, 197, 11, Color3.fromRGB(140, 140, 140), nil,
 hint.Size = UDim2.new(1, 0, 0, 16)
 hint.TextXAlignment = Enum.TextXAlignment.Center
 
--- Activity Log panel (bottom) — no File status line, just these three rows
+-- Activity Log panel (bottom)
 local wframe = makePanel(container, 222, 200)
 local wTitleBar = makeTitle(wframe, "Activity Log")
 local wDot  = makeDot(wframe, 33)
@@ -506,7 +506,7 @@ conns[#conns + 1] = LogService.MessageOut:Connect(function(msg, mtype)
     logLine(mtype == Enum.MessageType.MessageError and "ERROR" or "WARN", msg)
 end)
 
--- Remote hook: remotes are NOT logged at all. But they still count as
+-- Remote hook: remotes are NOT logged at all. They still count as
 -- "farm is alive" so stuck detection doesn't false-fire on a boss.
 pcall(function()
     local old
