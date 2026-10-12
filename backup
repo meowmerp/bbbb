@@ -1,0 +1,670 @@
+-- FarmAssist: Fall Freeze (catches falls, drops you on the floor) +
+-- Activity Log (logs farm activity, auto-recovers you when stuck).
+-- F7 = toggle both. "=" (equals) = kill.
+-- Drag either title bar to move both panels together.
+
+if not game:IsLoaded() then game.Loaded:Wait() end
+
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local LogService       = game:GetService("LogService")
+
+while not Players.LocalPlayer do task.wait() end
+local lp = Players.LocalPlayer
+lp:WaitForChild("PlayerGui")
+task.wait(1)
+
+-- CONFIG
+local TOGGLE_KEY = Enum.KeyCode.F7
+local KILL_KEY   = Enum.KeyCode.Equals
+
+-- Fall Freeze (original v2 values, unchanged)
+local FALL_SPEED   = -40
+local MOVE_RELEASE = 6
+local SETTLE_AFTER = 2.5
+local RETRY_AFTER  = 5
+local RAY_UP       = 80
+local RAY_DOWN     = 400
+local FREEZE_LOG_LINES = 5
+
+-- Activity Log
+local TELEPORT_DIST = 12
+local STUCK_SECONDS = 10
+local STUCK_MOVE    = 1
+local LOG_BUFFER_MAX = 1000    -- memory cap; older lines get trimmed
+local IGNORE = {
+    "render_class_body_particles",
+    "Stack Begin",
+    "Stack End",
+    "will be suppressed",
+}
+
+-- Auto-recover
+local AUTO_RECOVER            = true
+local STUCK_TELEPORT_RANGE    = 50
+local STUCK_TELEPORT_MAXDIST  = 2000
+local STUCK_TELEPORT_COOLDOWN = 15
+local STARTUP_GRACE           = 30
+local RECOVER_LOG_SILENCE     = 6
+local GOODPOS_MIN_DIST        = 100
+local GOODPOS_MAX_AGE         = 120
+local PROP_BLACKLIST = {
+    "morvik_intro_human",
+}
+
+-- STATE
+local killed = false
+
+local freezeEnabled = true
+local anchored, lastPos, frozenAt = false, nil, 0
+local catches, settles = 0, 0
+local freezeLines = {}
+
+local logRunning     = true
+local logBuffer      = {}
+local logT0          = os.clock()
+local logLineCount   = 0
+local lastLogLine    = ""
+local logTotalLines  = 0     -- monotonic count of every line ever logged
+local logWrittenLines = 0    -- how many of those have been flushed to disk
+
+local lastAutoRecover  = 0
+local autoRecovers     = 0
+local lastGoodPos      = nil
+local lastGoodTime     = 0
+local lastActivityTime = os.clock()
+
+-- log-position trackers (declared here so the F7 toggle handler can reset them)
+local wLastPos, wLastMoveCheckPos, wLastMoveTime = nil, nil, os.clock()
+local wLastStuckLog = 0
+
+local conns = {}
+
+if getgenv then
+    local g = getgenv()
+    if g.FallFreeze and g.FallFreeze.kill then pcall(g.FallFreeze.kill) end
+    if g.ActivityLog and g.ActivityLog.stop then pcall(g.ActivityLog.stop) end
+    if g.OuroWatcher and g.OuroWatcher.stop then pcall(g.OuroWatcher.stop) end  -- legacy cleanup
+    g.FallFreeze = {}
+    g.ActivityLog = {}
+end
+
+-- GUI
+local gui = Instance.new("ScreenGui")
+gui.Name = "FarmAssist"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 999
+pcall(function() if syn and syn.protect_gui then syn.protect_gui(gui) end end)
+local parent
+pcall(function() parent = gethui and gethui() end)
+if not parent then
+    local ok = pcall(function() gui.Parent = game:GetService("CoreGui") end)
+    if ok then parent = gui.Parent end
+end
+gui.Parent = parent or lp:WaitForChild("PlayerGui")
+
+-- Single draggable container holds both panels.
+local container = Instance.new("Frame")
+container.Name = "FarmAssistContainer"
+container.Size = UDim2.fromOffset(270, 322)   -- 214 (freeze) + 8 gap + 100 (log)
+container.Position = UDim2.new(1, -290, 0, 100)
+container.BackgroundTransparency = 1
+container.BorderSizePixel = 0
+container.Active = false
+container.Parent = gui
+
+local function makePanel(parent, y, h)
+    local f = Instance.new("Frame")
+    f.Size = UDim2.fromOffset(270, h)
+    f.Position = UDim2.fromOffset(0, y)
+    f.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+    f.BackgroundTransparency = 0.12
+    f.BorderSizePixel = 0
+    f.Active = true
+    f.Parent = parent
+    Instance.new("UICorner", f).CornerRadius = UDim.new(0, 8)
+    return f
+end
+
+local function makeTitle(frame, text)
+    local t = Instance.new("TextLabel")
+    t.Size = UDim2.new(1, 0, 0, 26)
+    t.BackgroundTransparency = 1
+    t.Font = Enum.Font.GothamBold
+    t.TextSize = 13
+    t.TextColor3 = Color3.fromRGB(200, 200, 200)
+    t.Text = text
+    t.Active = true
+    t.Parent = frame
+    return t
+end
+
+local function makeDot(frame, y)
+    local d = Instance.new("Frame")
+    d.Size = UDim2.fromOffset(12, 12)
+    d.Position = UDim2.new(0, 12, 0, y)
+    d.BackgroundColor3 = Color3.fromRGB(150, 150, 150)
+    d.BorderSizePixel = 0
+    d.Parent = frame
+    Instance.new("UICorner", d).CornerRadius = UDim.new(1, 0)
+    return d
+end
+
+local function makeLabel(frame, y, size, color, font, text, xOffset, widthOffset)
+    local l = Instance.new("TextLabel")
+    l.Size = UDim2.new(1, widthOffset or -24, 0, 18)
+    l.Position = UDim2.new(0, xOffset or 12, 0, y)
+    l.BackgroundTransparency = 1
+    l.Font = font or Enum.Font.Gotham
+    l.TextSize = size
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.TextColor3 = color
+    l.Text = text or ""
+    l.Parent = frame
+    return l
+end
+
+-- Fall Freeze panel (top)
+local frame = makePanel(container, 0, 214)
+local titleBar = makeTitle(frame, "Fall Freeze")
+local dot = makeDot(frame, 35)
+
+local mainLabel = makeLabel(frame, 32, 14, Color3.new(1, 1, 1),
+    Enum.Font.GothamBold, "Fall Freeze: starting...", 32, -44)
+local stateLabel = makeLabel(frame, 56, 13, Color3.fromRGB(120, 190, 255), nil, "State: starting")
+local posLabel   = makeLabel(frame, 76, 12, Color3.fromRGB(190, 190, 190), nil, "Pos: --")
+local statLabel  = makeLabel(frame, 94, 12, Color3.fromRGB(190, 190, 190), nil,
+    "Falls caught: 0   Floor placements: 0")
+
+local logBox = Instance.new("TextLabel")
+logBox.Size = UDim2.new(1, -24, 0, 76)
+logBox.Position = UDim2.new(0, 12, 0, 118)
+logBox.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
+logBox.BackgroundTransparency = 0.3
+logBox.BorderSizePixel = 0
+logBox.Font = Enum.Font.Code
+logBox.TextSize = 11
+logBox.TextColor3 = Color3.fromRGB(170, 170, 170)
+logBox.TextXAlignment = Enum.TextXAlignment.Left
+logBox.TextYAlignment = Enum.TextYAlignment.Top
+logBox.TextWrapped = true
+logBox.Text = ""
+logBox.Parent = frame
+Instance.new("UICorner", logBox).CornerRadius = UDim.new(0, 6)
+
+local hint = makeLabel(frame, 197, 11, Color3.fromRGB(140, 140, 140), nil,
+    "F7 toggle  ·  = kill  ·  drag title", 0, 0)
+hint.Size = UDim2.new(1, 0, 0, 16)
+hint.TextXAlignment = Enum.TextXAlignment.Center
+
+-- Activity Log panel (bottom)
+local wframe = makePanel(container, 222, 100)
+local wTitleBar = makeTitle(wframe, "Activity Log")
+local wDot  = makeDot(wframe, 33)
+local wMain = makeLabel(wframe, 31, 13, Color3.new(1, 1, 1),
+    Enum.Font.GothamBold, "Activity Log: RUNNING", 32, -44)
+local wRecover = makeLabel(wframe, 50, 11, Color3.fromRGB(190, 190, 190),
+    nil, "Auto-recover: 0", 12, -24)
+local wLast = makeLabel(wframe, 68, 11, Color3.fromRGB(170, 170, 170),
+    Enum.Font.Code, "(no output yet)", 12, -24)
+
+-- Drag: both title bars move the shared container.
+local dragStart, startPos
+local function beginDrag(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragStart, startPos = input.Position, container.Position
+    end
+end
+titleBar.InputBegan:Connect(beginDrag)
+wTitleBar.InputBegan:Connect(beginDrag)
+
+conns[#conns + 1] = UserInputService.InputChanged:Connect(function(input)
+    if dragStart and (input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch) then
+        local d = input.Position - dragStart
+        container.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
+            startPos.Y.Scale, startPos.Y.Offset + d.Y)
+    end
+end)
+conns[#conns + 1] = UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragStart = nil
+    end
+end)
+
+-- SHARED HELPERS
+local function getRoot()
+    local c = lp.Character
+    return c and c:FindFirstChild("HumanoidRootPart"), c and c:FindFirstChildOfClass("Humanoid")
+end
+
+local function fmtV(v)
+    return string.format("(%.1f, %.1f, %.1f)", v.X, v.Y, v.Z)
+end
+
+local function pushFreezeLog(msg)
+    freezeLines[#freezeLines + 1] = string.format("%s %s", os.date("%H:%M:%S"), msg)
+    while #freezeLines > FREEZE_LOG_LINES do table.remove(freezeLines, 1) end
+    logBox.Text = table.concat(freezeLines, "\n")
+end
+
+local function isBlacklisted(model)
+    if not model then return true end
+    for _, n in ipairs(PROP_BLACKLIST) do
+        if model.Name == n then return true end
+    end
+    return false
+end
+
+-- FALL FREEZE LOGIC (original v2, unchanged)
+local function release(r)
+    if r then r.Anchored = false end
+    anchored = false
+end
+
+local function settleOnFloor(r)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { lp.Character }
+    local origin = r.Position + Vector3.new(0, RAY_UP, 0)
+    local hit = workspace:Raycast(origin, Vector3.new(0, -(RAY_UP + RAY_DOWN), 0), params)
+    if hit then
+        r.CFrame = CFrame.new(hit.Position + Vector3.new(0, 3.2, 0)) * (r.CFrame - r.CFrame.Position)
+        r.AssemblyLinearVelocity = Vector3.zero
+        settles = settles + 1
+        pushFreezeLog(string.format("floor: %s y=%.1f", hit.Instance.Name, hit.Position.Y))
+        return true
+    end
+    pushFreezeLog("no floor under you, staying frozen")
+    return false
+end
+
+conns[#conns + 1] = RunService.Heartbeat:Connect(function()
+    if killed or not freezeEnabled then return end
+    local r = getRoot()
+    if not r then
+        anchored, lastPos = false, nil
+        return
+    end
+
+    local pos = r.Position
+    if anchored then
+        if lastPos and (pos - lastPos).Magnitude > MOVE_RELEASE then
+            release(r)
+            pushFreezeLog("released (farm moved you)")
+        elseif os.clock() - frozenAt >= SETTLE_AFTER then
+            if settleOnFloor(r) then
+                release(r)
+            else
+                frozenAt = os.clock() + RETRY_AFTER
+            end
+        end
+    elseif r.AssemblyLinearVelocity.Y < FALL_SPEED then
+        r.AssemblyLinearVelocity = Vector3.zero
+        r.Anchored = true
+        anchored = true
+        frozenAt = os.clock()
+        catches = catches + 1
+        pushFreezeLog(string.format("caught fall #%d at y=%.1f", catches, pos.Y))
+    end
+    lastPos = r.Position
+end)
+
+conns[#conns + 1] = lp.CharacterAdded:Connect(function()
+    anchored, lastPos = false, nil
+    pushFreezeLog("character respawned")
+end)
+
+-- ACTIVITY LOG LOGIC
+local NON_ACTIVITY_TAGS = { ["STUCK?"] = true, ["RECOVER"] = true, ["INFO"] = true }
+
+local function logLine(tag, msg)
+    local line = string.format("[%7.2f] [%s] %s", os.clock() - logT0, tag, msg)
+    print(line)
+
+    logTotalLines = logTotalLines + 1
+    logBuffer[#logBuffer + 1] = line
+    while #logBuffer > LOG_BUFFER_MAX do
+        table.remove(logBuffer, 1)
+    end
+
+    logLineCount = logLineCount + 1
+    lastLogLine  = line
+    if not NON_ACTIVITY_TAGS[tag] then
+        lastActivityTime = os.clock()
+    end
+end
+
+-- Flush to disk. If appendfile is available, only write the lines we haven't
+-- written yet; otherwise rewrite the capped buffer.
+local function flushLog()
+    pcall(function()
+        if appendfile and logTotalLines > logWrittenLines then
+            -- buffer holds total lines (logTotalLines - #logBuffer + 1) .. logTotalLines
+            local firstInBuffer = logTotalLines - #logBuffer + 1
+            local fromIdx = (logWrittenLines + 1) - firstInBuffer + 1
+            if fromIdx < 1 then fromIdx = 1 end  -- very old lines already culled
+            if fromIdx <= #logBuffer then
+                local chunk = {}
+                for i = fromIdx, #logBuffer do
+                    chunk[#chunk + 1] = logBuffer[i]
+                end
+                appendfile("activity_log.txt", table.concat(chunk, "\n") .. "\n")
+            end
+            logWrittenLines = logTotalLines
+        elseif writefile then
+            writefile("activity_log.txt", table.concat(logBuffer, "\n"))
+        end
+    end)
+end
+
+local enemyCache, lastScan = {}, 0
+local function scanEnemies()
+    if os.clock() - lastScan < 1.5 then return enemyCache end
+    lastScan = os.clock()
+    local list = {}
+    for _, d in ipairs(workspace:GetDescendants()) do
+        if d:IsA("Humanoid") and d.Health > 0 then
+            local model = d.Parent
+            if model and model ~= lp.Character
+                and not Players:GetPlayerFromCharacter(model) then
+                local root = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+                if root then list[#list + 1] = { model = model, hum = d, root = root } end
+            end
+        end
+    end
+    enemyCache = list
+    return list
+end
+
+local function nearestEnemy(pos)
+    local best, bestD
+    for _, e in ipairs(scanEnemies()) do
+        if e.root and e.root.Parent then
+            local d = (e.root.Position - pos).Magnitude
+            if not bestD or d < bestD then best, bestD = e, d end
+        end
+    end
+    return best, bestD
+end
+
+local function nearestValidMob(pos)
+    local best, bestD
+    for _, e in ipairs(scanEnemies()) do
+        if e.root and e.root.Parent and not isBlacklisted(e.model) then
+            local d = (e.root.Position - pos).Magnitude
+            if not bestD or d < bestD then best, bestD = e, d end
+        end
+    end
+    return best, bestD
+end
+
+conns[#conns + 1] = LogService.MessageOut:Connect(function(msg, mtype)
+    if killed or not logRunning then return end
+    if mtype == Enum.MessageType.MessageOutput
+        or mtype == Enum.MessageType.MessageInfo then return end
+    for _, s in ipairs(IGNORE) do
+        if msg:find(s, 1, true) then return end
+    end
+    logLine(mtype == Enum.MessageType.MessageError and "ERROR" or "WARN", msg)
+end)
+
+local remoteCounts = {}
+pcall(function()
+    local old
+    old = hookmetamethod(game, "__namecall", function(self, ...)
+        local method = getnamecallmethod()
+        if not killed and logRunning
+            and (method == "FireServer" or method == "InvokeServer") then
+            local name = self.Name
+            local now  = os.clock()
+            local rec  = remoteCounts[name] or { n = 0, t = now }
+            remoteCounts[name] = rec
+            rec.n = rec.n + 1
+            if now - rec.t >= 1 then
+                local args  = table.pack(...)
+                local parts = {}
+                for i = 1, math.min(args.n, 4) do
+                    parts[i] = string.sub(tostring(args[i]), 1, 40)
+                end
+                logLine("REMOTE", string.format("%s:%s x%d/s  args: %s  [%s]",
+                    name, method, rec.n, table.concat(parts, ", "),
+                    checkcaller() and "executor" or "game"))
+                rec.n, rec.t = 0, now
+            end
+        end
+        return old(self, ...)
+    end)
+end)
+
+conns[#conns + 1] = RunService.Heartbeat:Connect(function()
+    if killed or not logRunning then return end
+    local root, hum = getRoot()
+    if not root then wLastPos = nil return end
+
+    local pos = root.Position
+
+    if wLastPos and (pos - wLastPos).Magnitude >= TELEPORT_DIST then
+        local e, d = nearestEnemy(pos)
+        logLine("TELEPORT", string.format("%s -> %s (%.0f studs) | nearest enemy: %s (%.1f away)",
+            fmtV(wLastPos), fmtV(pos), (pos - wLastPos).Magnitude,
+            e and e.model.Name or "none", d or 0))
+    end
+    wLastPos = pos
+
+    local gm, gd = nearestValidMob(pos)
+    if gm and gd < GOODPOS_MIN_DIST then
+        lastGoodPos  = pos
+        lastGoodTime = os.clock()
+    end
+
+    if not wLastMoveCheckPos or (pos - wLastMoveCheckPos).Magnitude > STUCK_MOVE then
+        wLastMoveCheckPos, wLastMoveTime = pos, os.clock()
+    elseif os.clock() - wLastMoveTime >= STUCK_SECONDS
+        and os.clock() - wLastStuckLog > 5
+        and os.clock() - lastActivityTime >= RECOVER_LOG_SILENCE then
+        wLastStuckLog = os.clock()
+
+        local e, d = nearestEnemy(pos)
+        local info = string.format(
+            "not moving for %ds | pos %s | state %s | anchored %s | WalkSpeed %s | health %s",
+            STUCK_SECONDS, fmtV(pos),
+            hum and tostring(hum:GetState()) or "?",
+            tostring(root.Anchored),
+            hum and tostring(hum.WalkSpeed) or "?",
+            hum and string.format("%.0f/%.0f", hum.Health, hum.MaxHealth) or "?")
+        if e then
+            info = info .. string.format(" | nearest enemy %s %.1f studs away, hp %.0f, parent %s",
+                e.model.Name, d, e.hum.Health,
+                e.model.Parent and e.model.Parent.Name or "nil")
+        else
+            info = info .. " | NO living enemies found in workspace"
+        end
+        logLine("STUCK?", info)
+
+        if AUTO_RECOVER then
+            local sinceStart = os.clock() - logT0
+            local sinceLast  = os.clock() - lastAutoRecover
+
+            if sinceStart < STARTUP_GRACE then
+                logLine("RECOVER", string.format(
+                    "skipped (startup grace, %.1fs left)", STARTUP_GRACE - sinceStart))
+            elseif sinceLast < STUCK_TELEPORT_COOLDOWN then
+                logLine("RECOVER", string.format(
+                    "skipped (cooldown, %.1fs left)", STUCK_TELEPORT_COOLDOWN - sinceLast))
+            else
+                local mob, mobDist = nearestValidMob(pos)
+                if not mob then
+                    if lastGoodPos and (os.clock() - lastGoodTime) < GOODPOS_MAX_AGE then
+                        root.CFrame = CFrame.new(lastGoodPos + Vector3.new(0, 3, 0))
+                        root.AssemblyLinearVelocity = Vector3.zero
+                        lastAutoRecover = os.clock()
+                        autoRecovers = autoRecovers + 1
+                        logLine("RECOVER", string.format(
+                            "no mobs nearby -> returned to last good spot %s (%.0fs ago) | attempt #%d",
+                            fmtV(lastGoodPos), os.clock() - lastGoodTime, autoRecovers))
+                    else
+                        logLine("RECOVER", "no valid mob and no recent good position")
+                    end
+                elseif mobDist > STUCK_TELEPORT_MAXDIST then
+                    logLine("RECOVER", string.format(
+                        "skipped (nearest valid mob %s too far: %.0f > %d)",
+                        mob.model.Name, mobDist, STUCK_TELEPORT_MAXDIST))
+                else
+                    local mobPos = mob.root.Position
+                    local dir = Vector3.new(pos.X - mobPos.X, 0, pos.Z - mobPos.Z)
+                    if dir.Magnitude < 0.1 then
+                        dir = Vector3.new(1, 0, 0)
+                    else
+                        dir = dir.Unit
+                    end
+                    local targetPos = Vector3.new(
+                        mobPos.X + dir.X * STUCK_TELEPORT_RANGE,
+                        mobPos.Y + 3,
+                        mobPos.Z + dir.Z * STUCK_TELEPORT_RANGE)
+                    root.CFrame = CFrame.new(targetPos)
+                    root.AssemblyLinearVelocity = Vector3.zero
+                    lastAutoRecover = os.clock()
+                    autoRecovers = autoRecovers + 1
+                    logLine("RECOVER", string.format(
+                        "teleported to %s from %s (%.0f studs, target %s) | attempt #%d",
+                        fmtV(targetPos), mob.model.Name, mobDist,
+                        mob.model.Name, autoRecovers))
+                end
+            end
+        end
+    end
+end)
+
+local function watchChar(char)
+    local hum = char:WaitForChild("Humanoid", 5)
+    if not hum then return end
+    conns[#conns + 1] = hum.StateChanged:Connect(function(_, new)
+        if not killed and logRunning then logLine("STATE", tostring(new)) end
+    end)
+    conns[#conns + 1] = hum.Died:Connect(function()
+        if not killed and logRunning then logLine("EVENT", "You died") end
+    end)
+end
+if lp.Character then task.spawn(watchChar, lp.Character) end
+conns[#conns + 1] = lp.CharacterAdded:Connect(function(c)
+    if logRunning then logLine("EVENT", "Character respawned") end
+    task.spawn(watchChar, c)
+end)
+
+-- Periodic flush (memory-safe; appendfile used when available)
+task.spawn(function()
+    while not killed do
+        task.wait(5)
+        if killed then break end
+        flushLog()
+    end
+end)
+
+-- GUI REFRESH
+local function refreshFreezeGui()
+    local r = getRoot()
+    if freezeEnabled then
+        dot.BackgroundColor3 = Color3.fromRGB(70, 220, 100)
+        mainLabel.Text = "Fall Freeze: ON"
+    else
+        dot.BackgroundColor3 = Color3.fromRGB(230, 70, 70)
+        mainLabel.Text = "Fall Freeze: OFF"
+    end
+
+    if not r then
+        stateLabel.Text = "State: no character"
+        stateLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
+        posLabel.Text = "Y: --"
+    else
+        if anchored then
+            local left = math.max(0, SETTLE_AFTER - (os.clock() - frozenAt))
+            stateLabel.Text = string.format("State: FROZEN (floor check in %.1fs)", left)
+            stateLabel.TextColor3 = Color3.fromRGB(255, 190, 80)
+        elseif freezeEnabled then
+            stateLabel.Text = "State: watching"
+            stateLabel.TextColor3 = Color3.fromRGB(120, 190, 255)
+        else
+            stateLabel.Text = "State: paused"
+            stateLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
+        end
+        local p, v = r.Position, r.AssemblyLinearVelocity
+        posLabel.Text = string.format("Pos: %.0f, %.1f, %.0f   fall speed: %.0f",
+            p.X, p.Y, p.Z, v.Y)
+    end
+    statLabel.Text = string.format("Falls caught: %d   Floor placements: %d", catches, settles)
+end
+
+local function refreshLogGui()
+    if logRunning then
+        wDot.BackgroundColor3 = Color3.fromRGB(70, 220, 100)
+        wMain.Text = string.format("Activity Log: RUNNING  (%d lines)", logLineCount)
+    else
+        wDot.BackgroundColor3 = Color3.fromRGB(230, 70, 70)
+        wMain.Text = string.format("Activity Log: PAUSED  (%d lines)", logLineCount)
+    end
+    wRecover.Text = string.format("Auto-recover: %d   (range %d studs)", autoRecovers, STUCK_TELEPORT_RANGE)
+    wLast.Text = lastLogLine ~= "" and lastLogLine:sub(1, 58) or "(no output yet)"
+end
+
+task.spawn(function()
+    while not killed do
+        task.wait(0.1)
+        if killed then break end
+        pcall(refreshFreezeGui)
+        pcall(refreshLogGui)
+    end
+end)
+
+-- KILL
+local function kill()
+    if killed then return end
+    killed = true
+    logRunning    = false
+    freezeEnabled = false
+    release(getRoot())
+    for _, c in ipairs(conns) do c:Disconnect() end
+    table.clear(conns)
+    flushLog()
+    dot.BackgroundColor3 = Color3.fromRGB(150, 150, 150)
+    mainLabel.Text = "Killed"
+    wDot.BackgroundColor3 = Color3.fromRGB(150, 150, 150)
+    wMain.Text = "Activity Log: STOPPED"
+    task.delay(1.2, function() gui:Destroy() end)
+    print("[FarmAssist] Killed. Log saved to activity_log.txt (if supported).")
+end
+if getgenv then
+    getgenv().FallFreeze.kill   = kill
+    getgenv().ActivityLog.stop  = kill
+end
+
+conns[#conns + 1] = UserInputService.InputBegan:Connect(function(input)
+    if killed or UserInputService:GetFocusedTextBox() then return end
+    if input.KeyCode == TOGGLE_KEY then
+        -- F7 toggles both freeze and log together
+        local newState = not (freezeEnabled and logRunning)
+        freezeEnabled = newState
+        logRunning    = newState
+        if newState then
+            lastActivityTime  = os.clock()
+            wLastMoveCheckPos = nil
+            wLastPos          = nil   -- don't log a phantom TELEPORT on resume
+            wLastStuckLog     = 0     -- clear stale stuck cooldown
+            pushFreezeLog("enabled (freeze + log)")
+        else
+            release(getRoot())
+            pushFreezeLog("paused (freeze + log)")
+        end
+    elseif input.KeyCode == KILL_KEY then
+        kill()
+    end
+end)
+
+pushFreezeLog("loaded")
+logLine("INFO", string.format(
+    "FarmAssist loaded. F7 = toggle both. = = kill. Auto-recover = %s.",
+    AUTO_RECOVER and "on" or "off"))
