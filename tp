@@ -20,13 +20,15 @@ task.wait(1)
 local TOGGLE_KEY = Enum.KeyCode.F7
 local KILL_KEY   = Enum.KeyCode.Equals
 
--- Fall Freeze (original v2 values, unchanged)
+-- Fall Freeze
 local FALL_SPEED   = -40
 local MOVE_RELEASE = 6
 local SETTLE_AFTER = 2.5
 local RETRY_AFTER  = 5
-local RAY_UP       = 80
+local RAY_UP       = 80    -- retained for search depth (RAY_UP + RAY_DOWN)
 local RAY_DOWN     = 400
+local RAY_START    = 5     -- NEW: how far above the HRP the ray begins
+local FLOOR_NORMAL_MIN = 0.5  -- NEW: reject surfaces facing sideways/down
 local FREEZE_LOG_LINES = 5
 
 -- Activity Log
@@ -352,26 +354,45 @@ local function isBlacklisted(model)
     return false
 end
 
--- FALL FREEZE LOGIC (original v2, unchanged)
+-- FALL FREEZE LOGIC
 local function release(r)
     if r then r.Anchored = false end
     anchored = false
 end
 
+-- Find a real floor under the character. Only accepts hits that are:
+--   (a) actually below the character's current Y, and
+--   (b) roughly horizontal (surface normal points up).
+-- This prevents the freeze from teleporting onto an invisible ceiling
+-- or wall directly above the player, which is what RAY_UP = 80 caused.
 local function settleOnFloor(r)
     local params = RaycastParams.new()
     params.FilterType = Enum.RaycastFilterType.Exclude
     params.FilterDescendantsInstances = { lp.Character }
-    local origin = r.Position + Vector3.new(0, RAY_UP, 0)
-    local hit = workspace:Raycast(origin, Vector3.new(0, -(RAY_UP + RAY_DOWN), 0), params)
-    if hit then
+
+    local origin = r.Position + Vector3.new(0, RAY_START, 0)
+    local dir    = Vector3.new(0, -(RAY_UP + RAY_DOWN), 0)
+    local hit    = workspace:Raycast(origin, dir, params)
+
+    local belowBy = hit and (r.Position.Y - hit.Position.Y) or 0
+
+    if hit and hit.Position.Y < r.Position.Y - 0.5
+        and hit.Normal.Y >= FLOOR_NORMAL_MIN then
         r.CFrame = CFrame.new(hit.Position + Vector3.new(0, 3.2, 0)) * (r.CFrame - r.CFrame.Position)
         r.AssemblyLinearVelocity = Vector3.zero
         settles = settles + 1
-        pushFreezeLog(string.format("floor: %s y=%.1f", hit.Instance.Name, hit.Position.Y))
+        pushFreezeLog(string.format("floor: %s y=%.1f (%.1f below)",
+            hit.Instance.Name, hit.Position.Y, belowBy))
         return true
     end
-    pushFreezeLog("no floor under you, staying frozen")
+
+    if hit then
+        -- Something was hit but it's not a usable floor. Log it so we can see why.
+        pushFreezeLog(string.format("rejected surface: %s y=%.1f (%.1f above, normal %.2f)",
+            hit.Instance.Name, hit.Position.Y, -belowBy, hit.Normal.Y))
+    else
+        pushFreezeLog("no floor under you, staying frozen")
+    end
     return false
 end
 
