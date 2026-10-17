@@ -1666,8 +1666,8 @@ xpcall(function()
     local function runBossEncounter(boss, areaKey)
         local bossName = boss and boss.Name or Game.areaBossName or "Boss"
         Game.status = "Boss: 10 studs away (front/head-level)"
-        notify("Boss encounter started: " .. tostring(bossName) .. "; selecting slot 5 and hovering 10 studs in front at head level.")
-        warn("[TheForest] Boss hover position set 10 studs in front at head level.")
+        notify("Boss encounter started: " .. tostring(bossName) .. "; selecting slot 5 and following 10 studs in front at head level.")
+        warn("[TheForest] Boss hover tracking enabled: following 10 studs in front at head level without falling.")
 
         local lastMissingTargetWarning = 0
         local bossMissingSince = nil
@@ -1753,40 +1753,18 @@ xpcall(function()
                         else
                             -- Hold fire only while both the live bar and the
                             -- corresponding model are present in the current scan.
-                            -- Keep the character anchored aloft every tick, so a
-                            -- replication/state change cannot let gravity drop it.
-                            pcall(function()
-                                root.Anchored = true
-                                root.AssemblyLinearVelocity = Vector3.zero
-                                root.AssemblyAngularVelocity = Vector3.zero
-                            end)
+                            -- placeAtBossWeakpoint records the original Anchored
+                            -- state before it anchors the root, then follows the
+                            -- boss on every pass to prevent falling.
                             Game.setAttackMouseDown(true)
-                            local bossDisplacement = Game.bossLockedBossPosition
-                                and (targetRoot.Position - Game.bossLockedBossPosition).Magnitude
-                                or math.huge
-                            if not Game.bossLockedBossPosition
-                                or (bossDisplacement >= 5 and os.clock() >= (Game.bossNextRepositionAt or 0)) then
-                                Game.placeAtBossWeakpoint(boss, false)
-                            else
-                                local currentBoxCf, currentBoxSize
-                                pcall(function()
-                                    currentBoxCf, currentBoxSize = boss:GetBoundingBox()
-                                end)
-                                local currentAimPoint = Game.getBossHeadPosition(
-                                    boss, currentBoxCf, currentBoxSize, targetRoot
-                                )
-                                -- Keep hover height in line with the head if the
-                                -- boss animates vertically, without constantly
-                                -- teleporting the player around its sides.
-                                local playerHeadOffset = Game.getPlayerHeadOffset(root)
-                                local estimatedPlayerHeadY = root.Position.Y + playerHeadOffset
-                                if math.abs(estimatedPlayerHeadY - currentAimPoint.Y) > 1.5
-                                    and os.clock() >= (Game.bossNextRepositionAt or 0) then
-                                    Game.placeAtBossWeakpoint(boss, false)
-                                end
-                                Game.bossAimPoint = currentAimPoint
-                                Game.aimCameraAt(currentAimPoint)
-                            end
+                            -- Follow the boss continuously instead of only
+                            -- repositioning after it has moved several studs.
+                            -- placeAtBossWeakpoint recalculates the boss's current
+                            -- bounding-box position and head height on every pass,
+                            -- then keeps the player's root anchored and zeros its
+                            -- velocity. The approach direction stays stable, so the
+                            -- player follows the boss without orbiting chaotically.
+                            Game.placeAtBossWeakpoint(boss, false)
                             task.wait(0.08)
                         end
                     end
