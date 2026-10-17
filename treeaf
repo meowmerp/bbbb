@@ -106,6 +106,10 @@ xpcall(function()
         -- Keep the completed-area boss phase latched after a knockdown until
         -- a live boss is reacquired and Axe attacks resume.
         bossRecoveryActive = false,
+        bossMeleeHeld = false,
+        bossRecoveryAttackRunning = false,
+        bossMeleeInputMode = nil,
+        bossMeleePoint = nil,
     }
 
     --=============================================================================
@@ -387,6 +391,7 @@ xpcall(function()
     -- Forward-declare so the respawn monitor can re-equip the Axe as soon as
     -- the character wakes and is teleported back to the encounter area.
     local equipAxe
+    local isAxeTool -- forward declaration for the recovery watcher below
 
     -- Run independently of CharacterAdded because waking at the cabin can reuse
     -- the same character. Wait until the countdown HUD goes away and a live root
@@ -454,11 +459,63 @@ xpcall(function()
                                     if equipOk then axe = equipped end
                                 end
                                 if axe then
-                                    Game.status = "Returned to boss area; Axe equipped; searching for boss"
-                                    notify("Returned to the boss area and re-equipped the Axe. Waiting for the boss to respawn.")
+                                    Game.status = "Returned to boss area; Axe equipped; melee hold restarting"
+                                    -- The old input hold is released when the knockdown is detected.
+                                    -- Force a fresh MouseButton1-down after teleport/equip, then keep
+                                    -- it held while the game brings the boss bar/model back.
+                                    if Game.setBossMeleeHeld then
+                                        pcall(Game.setBossMeleeHeld, false)
+                                        task.wait(0.06)
+                                        local holdOk, holdResult = pcall(Game.setBossMeleeHeld, true)
+                                        if holdOk and holdResult == true then
+                                            notify("Returned to the boss area; Axe equipped and melee button held again.")
+                                            warn("[TheForest] Recovery: restarted continuous Axe melee hold after teleport.")
+                                        else
+                                            warn("[TheForest] Recovery: could not start the melee hold yet; retrying while waiting for the boss.")
+                                        end
+                                    end
                                 else
                                     Game.status = "Returned to boss area; retrying Axe equip"
-                                    warn("[TheForest] Returned to the boss area, but the Axe could not yet be confirmed as equipped. The boss loop will retry slot 2 and Axe equip before attacking.")
+                                    warn("[TheForest] Returned to the boss area, but the Axe could not yet be confirmed as equipped. The recovery attack watcher will keep retrying slot 2, equip, and melee input.")
+                                end
+
+                                -- Keep retrying even if the Axe could not be verified on the first
+                                -- attempt. Hold MouseButton1 and activate the Axe while waiting for
+                                -- the boss HUD/model to respawn. Stop when the regular boss loop
+                                -- resumes or another knockdown begins.
+                                if not Game.bossRecoveryAttackRunning then
+                                    Game.bossRecoveryAttackRunning = true
+                                    task.spawn(function()
+                                        local nextRecoveryActivate = 0
+                                        while not unloaded and not Game.bossRespawnTeleportPending
+                                            and not Game.bossPlayerDied
+                                            and not (Game.bossEncounterActive and not Game.bossRecoveryActive) do
+                                            if isKnockedDownScreenVisible() then break end
+                                            local recoveryCharacter = LocalPlayer.Character
+                                            local recoveryHumanoid = recoveryCharacter and recoveryCharacter:FindFirstChildOfClass("Humanoid")
+                                            if recoveryHumanoid and recoveryHumanoid.Health > 0 then
+                                                local recoveryAxe = nil
+                                                if equipAxe then
+                                                    local equipOk, equipped = pcall(equipAxe)
+                                                    if equipOk then recoveryAxe = equipped end
+                                                end
+                                                if isAxeTool(recoveryAxe) then
+                                                    if not Game.bossMeleeHeld and Game.setBossMeleeHeld then
+                                                        pcall(Game.setBossMeleeHeld, true)
+                                                    end
+                                                    if os.clock() >= nextRecoveryActivate then
+                                                        pcall(function() recoveryAxe:Activate() end)
+                                                        nextRecoveryActivate = os.clock() + 0.24
+                                                    end
+                                                else
+                                                    if Game.setBossMeleeHeld then pcall(Game.setBossMeleeHeld, false) end
+                                                    if Game.pressWeaponSlot then pcall(Game.pressWeaponSlot, 2) end
+                                                end
+                                            end
+                                            task.wait(0.12)
+                                        end
+                                        Game.bossRecoveryAttackRunning = false
+                                    end)
                                 end
                                 break
                             end
@@ -477,6 +534,10 @@ xpcall(function()
     end
 
     local function markBossPlayerDowned(reason)
+        -- Release the simulated melee hold immediately while the player is down.
+        if Game.setBossMeleeHeld then
+            pcall(Game.setBossMeleeHeld, false)
+        end
         -- Keep the last live boss-side position. If the main positioning loop
         -- hasn't recorded one yet, fall back to the last locked boss root.
         if not Game.bossReturnPosition and Game.bossLockedBossPosition then
@@ -1640,7 +1701,7 @@ xpcall(function()
         end
     end
 
-    local function isAxeTool(tool)
+    isAxeTool = function(tool)
         if not tool or not tool:IsA("Tool") then return false end
         local candidates = { tool.Name, tool.ToolTip }
         for _, attributeName in ipairs({ "DisplayName", "ItemName", "ToolName", "WeaponName" }) do
@@ -1704,6 +1765,89 @@ xpcall(function()
             local cameraPosition = camera.CFrame.Position
             camera.CFrame = CFrame.lookAt(cameraPosition, targetPosition)
         end)
+    end
+
+    -- Hold MouseButton1 continuously during boss melee. Unlike clickAttack(),
+    -- this keeps the input down across frames, including after the respawn loop
+    -- re-equips the Axe. The boss loop still pulses Tool:Activate() to support
+    -- tools whose attack handler listens to Activated rather than held input.
+    Game.setBossMeleeHeld = function(shouldHold)
+        local camera = workspace.CurrentCamera
+        local viewport = camera and camera.ViewportSize or Vector2.new(1600, 900)
+        local point = Game.bossMeleePoint or Vector2.new(
+            math.floor(viewport.X * 0.5), math.floor(viewport.Y * 0.5)
+        )
+
+        if shouldHold then
+            local character = LocalPlayer.Character
+            local heldTool = character and character:FindFirstChildOfClass("Tool")
+            if not isAxeTool(heldTool) or isKnockedDownScreenVisible()
+                or Game.bossRespawnTeleportPending or Game.bossPlayerDied then
+                return false
+            end
+            if Game.bossMeleeHeld then return true end
+
+            -- Prefer executor-native mouse holds when available. VirtualInputManager
+            -- can return successfully without maintaining a real held click in some
+            -- executor/game combinations, especially after character respawn.
+            if type(mouse1press) == "function" then
+                local executorOk = pcall(mouse1press)
+                if executorOk then
+                    Game.bossMeleeHeld = true
+                    Game.bossMeleeInputMode = "ExecutorMouse"
+                    Game.bossMeleePoint = point
+                    return true
+                end
+            end
+
+            local inputOk = pcall(function()
+                local virtualInput = game:GetService("VirtualInputManager")
+                virtualInput:SendMouseButtonEvent(point.X, point.Y, 0, true, game, 0)
+            end)
+            if inputOk then
+                Game.bossMeleeHeld = true
+                Game.bossMeleeInputMode = "VirtualInputManager"
+                Game.bossMeleePoint = point
+                return true
+            end
+
+            local userOk = pcall(function()
+                VirtualUser:CaptureController()
+                VirtualUser:Button1Down(point, camera and camera.CFrame)
+            end)
+            if userOk then
+                Game.bossMeleeHeld = true
+                Game.bossMeleeInputMode = "VirtualUser"
+                Game.bossMeleePoint = point
+                return true
+            end
+            return false
+        end
+
+        if not Game.bossMeleeHeld then
+            Game.bossMeleeInputMode = nil
+            Game.bossMeleePoint = nil
+            return true
+        end
+
+        local releasePoint = Game.bossMeleePoint or point
+        local releaseOk = false
+        if Game.bossMeleeInputMode == "ExecutorMouse" and type(mouse1release) == "function" then
+            releaseOk = pcall(mouse1release)
+        elseif Game.bossMeleeInputMode == "VirtualUser" then
+            releaseOk = pcall(function()
+                VirtualUser:Button1Up(releasePoint, camera and camera.CFrame)
+            end)
+        else
+            releaseOk = pcall(function()
+                local virtualInput = game:GetService("VirtualInputManager")
+                virtualInput:SendMouseButtonEvent(releasePoint.X, releasePoint.Y, 0, false, game, 0)
+            end)
+        end
+        Game.bossMeleeHeld = false
+        Game.bossMeleeInputMode = nil
+        Game.bossMeleePoint = nil
+        return releaseOk
     end
 
     Game.clickAttack = function()
@@ -1871,6 +2015,11 @@ xpcall(function()
     end
 
     local function runBossEncounter(boss, areaKey)
+        -- If the return monitor has already restarted MouseButton1 after a
+        -- knockdown, preserve that hold instead of releasing it at encounter entry.
+        if Game.setBossMeleeHeld and not Game.bossRecoveryActive and not Game.bossRecoveryAttackRunning then
+            pcall(Game.setBossMeleeHeld, false)
+        end
         local bossName = boss and boss.Name or Game.areaBossName or "Boss"
         Game.status = "Boss: Axe attack (melee range, front/head-level)"
         notify("Boss encounter started: " .. tostring(bossName) .. "; selecting Axe in slot 2 and staying in melee range at head level.")
@@ -1935,6 +2084,7 @@ xpcall(function()
                 -- whenever it disappears; don't keep swinging/teleporting at a
                 -- stale model, nameplate, stump, or building.
                 if not currentState.bossBarPresent or not currentState.bossName then
+                    if Game.setBossMeleeHeld then pcall(Game.setBossMeleeHeld, false) end
                     bossBarMissingSince = bossBarMissingSince or os.clock()
                     if os.clock() - bossBarMissingSince >= 1.8 then
                         local stillTracked = findActiveBoss(Game.areaBossName or bossName)
@@ -1957,6 +2107,7 @@ xpcall(function()
 
                     local liveBoss = findActiveBoss(currentState.bossName)
                     if not liveBoss then
+                        if Game.setBossMeleeHeld then pcall(Game.setBossMeleeHeld, false) end
                         bossMissingSince = bossMissingSince or os.clock()
                         if os.clock() - bossMissingSince >= 1.8 then
                             outcome = "boss-target-missing"
@@ -1975,6 +2126,7 @@ xpcall(function()
                         local _, root = getRoot()
                         local targetRoot = modelRootPart(boss)
                         if not root or not targetRoot then
+                            if Game.setBossMeleeHeld then pcall(Game.setBossMeleeHeld, false) end
                             if os.clock() - lastMissingTargetWarning > 3 then
                                 lastMissingTargetWarning = os.clock()
                                 warn("[TheForest] Boss bar is visible, but its matching world model/root could not be found. Axe attacks are paused to avoid attacking unrelated objects.")
@@ -1988,15 +2140,24 @@ xpcall(function()
                             Game.placeAtBossWeakpoint(boss, false)
                             local axe = equipAxe()
                             if isAxeTool(axe) then
+                                -- Re-establish a continuous MouseButton1 hold after a
+                                -- wake-up/teleport, then pulse Activate as well so the
+                                -- Axe keeps swinging in games that use Tool.Activated.
+                                local held = Game.setBossMeleeHeld(true)
                                 if os.clock() >= nextAxeAttackAt then
-                                    local attackSent = Game.clickAttack()
-                                    if attackSent and Game.bossRecoveryActive then
+                                    local activated = pcall(function() axe:Activate() end)
+                                    if (held or activated) and Game.bossRecoveryActive then
                                         Game.bossRecoveryActive = false
-                                        notify("Axe attacks resumed after returning to the boss area.")
+                                        notify("Axe melee hold resumed after returning to the boss area.")
+                                        warn("[TheForest] Axe melee input is held again after recovery.")
                                     end
                                     nextAxeAttackAt = os.clock() + 0.22
                                 end
+                                if not held then
+                                    Game.status = "Boss: retrying Axe melee input"
+                                end
                             else
+                                if Game.setBossMeleeHeld then pcall(Game.setBossMeleeHeld, false) end
                                 Game.status = "Boss: waiting for Axe in slot 2"
                                 Game.pressWeaponSlot(2)
                             end
@@ -2007,6 +2168,9 @@ xpcall(function()
             end
         end)
 
+        if Game.setBossMeleeHeld then
+            pcall(Game.setBossMeleeHeld, false)
+        end
         if Game.bossAnchoredRoot and Game.bossAnchoredRoot.Parent then
             pcall(function()
                 Game.bossAnchoredRoot.AssemblyLinearVelocity = Vector3.zero
