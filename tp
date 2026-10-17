@@ -20,18 +20,20 @@ task.wait(1)
 local TOGGLE_KEY = Enum.KeyCode.F7
 local KILL_KEY   = Enum.KeyCode.Equals
 
--- Fall Freeze (original v2 values, unchanged)
+-- Fall Freeze
 local FALL_SPEED   = -40
 local MOVE_RELEASE = 6
 local SETTLE_AFTER = 2.5
 local RETRY_AFTER  = 5
-local RAY_UP       = 80
-local RAY_DOWN     = 400
+local RAY_START    = 5     -- how far above the HRP the ray begins (was 80)
+local RAY_DOWN     = 400   -- how far below the HRP to search
+local FLOOR_NORMAL_MIN = 0.5   -- reject ceilings/walls
+local FLOOR_MAX_HOPS   = 6     -- max surfaces to skip past
 local FREEZE_LOG_LINES = 5
 -- Fallback: if settleOnFloor fails this many times in a row, teleport
 -- to the last mob we saw (exact position, no offset).
 local FALLBACK_AFTER_TRIES = 5
-local FALLBACK_MAX_AGE     = 60   -- seconds; last mob older than this is ignored
+local FALLBACK_MAX_AGE     = 60
 
 -- Activity Log
 local TELEPORT_DIST = 12
@@ -368,18 +370,54 @@ local function release(r)
     failedSettleTries = 0
 end
 
-local function settleOnFloor(r)
+-- Walk down the column from +RAY_START, skipping any surface that isn't
+-- a real floor (ceilings, walls, geometry above the player).
+local function findFloorBelow(r)
     local params = RaycastParams.new()
     params.FilterType = Enum.RaycastFilterType.Exclude
     params.FilterDescendantsInstances = { lp.Character }
-    local origin = r.Position + Vector3.new(0, RAY_UP, 0)
-    local hit = workspace:Raycast(origin, Vector3.new(0, -(RAY_UP + RAY_DOWN), 0), params)
+
+    local myY   = r.Position.Y
+    local stopY = myY - RAY_DOWN
+    local x, z  = r.Position.X, r.Position.Z
+    local originY = myY + RAY_START
+
+    for hop = 1, FLOOR_MAX_HOPS do
+        local remaining = originY - stopY
+        if remaining <= 0.1 then break end
+
+        local origin = Vector3.new(x, originY, z)
+        local hit = workspace:Raycast(origin, Vector3.new(0, -remaining, 0), params)
+        if not hit then
+            break
+        end
+
+        local isBelow = hit.Position.Y < myY - 0.5
+        local isFloor = hit.Normal.Y >= FLOOR_NORMAL_MIN
+
+        if isBelow and isFloor then
+            return hit
+        end
+
+        pushFreezeLog(string.format("skipped: %s y=%.1f (normal %.2f)",
+            hit.Instance.Name, hit.Position.Y, hit.Normal.Y))
+        originY = hit.Position.Y - 0.5
+
+        if originY <= stopY then break end
+    end
+
+    return nil
+end
+
+local function settleOnFloor(r)
+    local hit = findFloorBelow(r)
     if hit then
         r.CFrame = CFrame.new(hit.Position + Vector3.new(0, 3.2, 0)) * (r.CFrame - r.CFrame.Position)
         r.AssemblyLinearVelocity = Vector3.zero
         settles = settles + 1
         failedSettleTries = 0
-        pushFreezeLog(string.format("floor: %s y=%.1f", hit.Instance.Name, hit.Position.Y))
+        pushFreezeLog(string.format("floor: %s y=%.1f (%.1f below)",
+            hit.Instance.Name, hit.Position.Y, r.Position.Y - hit.Position.Y))
         return true
     end
 
