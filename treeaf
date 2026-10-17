@@ -1,798 +1,3255 @@
--- FarmAssist: Fall Freeze (catches falls, drops you on the floor) +
--- Activity Log (logs farm activity, auto-recovers you when stuck,
--- and records unique mob names to mob_list.txt).
--- F7 = toggle both. "=" (equals) = kill.
--- Drag either title bar to move both panels together.
+--!nonstrict
+--=============================================================================
+-- Standalone The Forest Automation Script + GUI
+-- v3.0 (Config persistence, area progress gate, automated boss phase)
+--=============================================================================
 
-if not game:IsLoaded() then game.Loaded:Wait() end
+local Players            = game:GetService("Players")
+local RunService         = game:GetService("RunService")
+local UserInputService   = game:GetService("UserInputService")
+local VirtualUser        = game:GetService("VirtualUser")
+local TeleportService    = game:GetService("TeleportService")
+local TweenService       = game:GetService("TweenService")
+local ReplicatedStorage  = game:GetService("ReplicatedStorage")
+local CollectionService  = game:GetService("CollectionService")
+local HttpService        = game:GetService("HttpService")
+local GuiService         = game:GetService("GuiService")
+local Lighting           = game:GetService("Lighting")
+local StarterGui         = game:GetService("StarterGui")
 
-local Players          = game:GetService("Players")
-local RunService       = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
-local LogService       = game:GetService("LogService")
-
-while not Players.LocalPlayer do task.wait() end
-local lp = Players.LocalPlayer
-lp:WaitForChild("PlayerGui")
-task.wait(1)
-
--- CONFIG
-local TOGGLE_KEY = Enum.KeyCode.F7
-local KILL_KEY   = Enum.KeyCode.Equals
-
--- Fall Freeze (original v2 values, unchanged)
-local FALL_SPEED   = -40
-local MOVE_RELEASE = 6
-local SETTLE_AFTER = 2.5
-local RETRY_AFTER  = 5
-local RAY_UP       = 80
-local RAY_DOWN     = 400
-local FREEZE_LOG_LINES = 5
--- Fallback: if settleOnFloor fails this many times in a row, teleport
--- to the last mob we saw (exact position, no offset).
-local FALLBACK_AFTER_TRIES = 5
-local FALLBACK_MAX_AGE     = 60   -- seconds; last mob older than this is ignored
-
--- Activity Log
-local TELEPORT_DIST = 12
-local STUCK_SECONDS = 10
-local STUCK_MOVE    = 1
-local LOG_BUFFER_MAX = 1000
-local MOB_FILE       = "mob_list.txt"
-local IGNORE = {
-    "render_class_body_particles",
-    "Stack Begin",
-    "Stack End",
-    "will be suppressed",
-}
-
--- Auto-recover
-local AUTO_RECOVER            = true
-local STUCK_TELEPORT_RANGE    = 50
-local STUCK_TELEPORT_MAXDIST  = 2000
-local STUCK_TELEPORT_COOLDOWN = 15
-local STARTUP_GRACE           = 30
-local RECOVER_LOG_SILENCE     = 6
-local GOODPOS_MIN_DIST        = 100
-local GOODPOS_MAX_AGE         = 120
-local PROP_BLACKLIST = {
-    "morvik_intro_human",
-}
-
--- File I/O capability check
-local HAS_READ   = (type(readfile) == "function") and (type(isfile) == "function")
-local HAS_WRITE  = (type(writefile) == "function")
-local HAS_APPEND = (type(appendfile) == "function")
-
--- STATE
-local killed = false
-
-local freezeEnabled = true
-local anchored, lastPos, frozenAt = false, nil, 0
-local catches, settles = 0, 0
-local freezeLines = {}
-local failedSettleTries = 0
-
-local logRunning     = true
-local logBuffer      = {}
-local logT0          = os.clock()
-local logLineCount   = 0
-local lastLogLine    = ""
-local logTotalLines  = 0
-local logWrittenLines = 0
-
-local knownMobs      = {}
-local knownMobsCount = 0
-local lastMobSeen    = ""
-
-local lastAutoRecover  = 0
-local autoRecovers     = 0
-local lastGoodPos      = nil
-local lastGoodTime     = 0
-local lastActivityTime = os.clock()
-
--- Last mob we were near, used as a fallback if settleOnFloor keeps failing.
-local lastMobPos  = nil
-local lastMobTime = 0
-
-local wLastPos, wLastMoveCheckPos, wLastMoveTime = nil, nil, os.clock()
-local wLastStuckLog = 0
-
-local conns = {}
-
-if getgenv then
-    local g = getgenv()
-    if g.FallFreeze and g.FallFreeze.kill then pcall(g.FallFreeze.kill) end
-    if g.ActivityLog and g.ActivityLog.stop then pcall(g.ActivityLog.stop) end
-    if g.OuroWatcher and g.OuroWatcher.stop then pcall(g.OuroWatcher.stop) end
-    g.FallFreeze = {}
-    g.ActivityLog = {}
+local LocalPlayer = Players.LocalPlayer
+if not game:IsLoaded() then 
+    game.Loaded:Wait() 
 end
 
-if not HAS_WRITE then
-    warn("[FarmAssist] Executor has no writefile — mob_list.txt cannot be saved.")
-end
+local SCRIPT_VERSION = "v3.0-area-boss"
+local GAME_NAME      = "The Forest"
+local CONFIG_FILE    = "ForestConfig.json"
 
--- Load existing mob list
-if HAS_READ and HAS_WRITE and isfile(MOB_FILE) then
-    local ok, data = pcall(readfile, MOB_FILE)
-    if ok and type(data) == "string" then
-        for line in data:gmatch("[^\r\n]+") do
-            if line ~= "" then
-                knownMobs[line] = true
-                knownMobsCount = knownMobsCount + 1
+xpcall(function()
+
+    --=============================================================================
+    -- Shared state
+    --=============================================================================
+
+    local unloaded = false
+    local workers = {}
+    local connections = {}
+
+    local function bind(signal, fn)
+        local c = signal:Connect(fn)
+        table.insert(connections, c)
+        return c
+    end
+
+    -- Defaults are only a first-run/missing-key fallback. Existing config values
+    -- are loaded first and remain authoritative across launches.
+    local DEFAULT_FLAGS = {
+        AutoChop = false, Zone = "OakWood", ChopDelay = 0.4,
+        SmartWeapons = false,
+        AutoPickup = false, AutoSell = false, SellAt = 5, AutoCoins = false,
+        AutoTools = false, BuyTools = {},
+        AutoUpgrades = false, BuyUpgrades = {},
+        AutoDynamite = false, AutoCars = false, BuyCars = {},
+        AutoBackpack = false,
+        AutoJoin = false, Difficulty = "NORMAL", PartySize = 1, SavedRun = nil,
+        AutoDaily = false,
+        AutoClasses = false, BuyClasses = {},
+        AutoGemPerks = false, BuyGemPerks = {},
+        WalkSpeedEnabled = false, WalkSpeed = 32,
+        InfJump = false, NoClip = false, InstantProximityPrompt = false,
+        Fly = false, FlySpeed = 60,
+        AntiGameplayPause = true, AutoReconnect = false,
+        Disable3DRendering = false, FpsBoost = false,
+        NoCustomCursor = false, FreeCursorMenu = true,
+        AntiAfk = true,
+    }
+    local Flags = {}
+
+    local Game = {
+        trees = 0, sells = 0, bought = 0,
+        status = "Idle", busy = false, hitSeq = 0,
+        badTrees = {}, badLogs = {}, carBuys = {},
+        lastFlameUse = 0,
+        lastBossNotice = nil,
+        currentAreaKey = nil,
+        areaCompleteKey = nil,
+        areaCompletedAt = nil,
+        areaBossName = nil,
+        bossDefeatedKey = nil,
+        lastBossScanAt = 0,
+        cachedBoss = nil,
+        lastProgressReport = nil,
+    }
+
+    --=============================================================================
+    -- Config Save / Load
+    --=============================================================================
+    
+    local saveVersion = 0
+
+    local function configValuesEqual(a, b)
+        if type(a) ~= type(b) then
+            return false
+        end
+        if type(a) ~= "table" then
+            return a == b
+        end
+        for k, v in pairs(a) do
+            if not configValuesEqual(v, b[k]) then
+                return false
             end
         end
-        print(string.format("[FarmAssist] Loaded %d mobs from %s", knownMobsCount, MOB_FILE))
-    end
-end
-
-local function isBlacklistedName(name)
-    for _, n in ipairs(PROP_BLACKLIST) do
-        if name == n then return true end
-    end
-    return false
-end
-
-local function saveMobName(name)
-    if not name or name == "" or name == "none" then return end
-    if isBlacklistedName(name) then return end
-    if knownMobs[name] then return end
-
-    knownMobs[name] = true
-    knownMobsCount = knownMobsCount + 1
-    lastMobSeen = name
-
-    if not HAS_WRITE then
-        print("[MOB SAVED-INTERNAL] " .. name .. " (executor cannot write files)")
-        return
-    end
-
-    local wroteOk = false
-
-    if HAS_APPEND and HAS_READ and isfile(MOB_FILE) then
-        wroteOk = pcall(appendfile, MOB_FILE, name .. "\n")
-    end
-
-    if not wroteOk then
-        wroteOk = pcall(function()
-            local names = {}
-            for m in pairs(knownMobs) do names[#names + 1] = m end
-            table.sort(names)
-            writefile(MOB_FILE, table.concat(names, "\n") .. "\n")
-        end)
-    end
-
-    if wroteOk then
-        print("[MOB SAVED] " .. name)
-    else
-        warn("[MOB SAVED-INTERNAL] " .. name .. " (file write failed)")
-    end
-end
-
-local function extractMobName(line)
-    local name = line:match("nearest enemy:%s*([%w_%-]+)")
-    if not name then
-        name = line:match("nearest enemy%s+([%w_%-]+)")
-    end
-    return name
-end
-
--- GUI
-local gui = Instance.new("ScreenGui")
-gui.Name = "FarmAssist"
-gui.ResetOnSpawn = false
-gui.IgnoreGuiInset = true
-gui.DisplayOrder = 999
-pcall(function() if syn and syn.protect_gui then syn.protect_gui(gui) end end)
-local parent
-pcall(function() parent = gethui and gethui() end)
-if not parent then
-    local ok = pcall(function() gui.Parent = game:GetService("CoreGui") end)
-    if ok then parent = gui.Parent end
-end
-gui.Parent = parent or lp:WaitForChild("PlayerGui")
-
-local container = Instance.new("Frame")
-container.Name = "FarmAssistContainer"
-container.Size = UDim2.fromOffset(270, 422)
-container.Position = UDim2.new(1, -290, 0, 100)
-container.BackgroundTransparency = 1
-container.BorderSizePixel = 0
-container.Active = false
-container.Parent = gui
-
-local function makePanel(parent, y, h)
-    local f = Instance.new("Frame")
-    f.Size = UDim2.fromOffset(270, h)
-    f.Position = UDim2.fromOffset(0, y)
-    f.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
-    f.BackgroundTransparency = 0.12
-    f.BorderSizePixel = 0
-    f.Active = true
-    f.Parent = parent
-    Instance.new("UICorner", f).CornerRadius = UDim.new(0, 8)
-    return f
-end
-
-local function makeTitle(frame, text)
-    local t = Instance.new("TextLabel")
-    t.Size = UDim2.new(1, 0, 0, 26)
-    t.BackgroundTransparency = 1
-    t.Font = Enum.Font.GothamBold
-    t.TextSize = 13
-    t.TextColor3 = Color3.fromRGB(200, 200, 200)
-    t.Text = text
-    t.Active = true
-    t.Parent = frame
-    return t
-end
-
-local function makeDot(frame, y)
-    local d = Instance.new("Frame")
-    d.Size = UDim2.fromOffset(12, 12)
-    d.Position = UDim2.new(0, 12, 0, y)
-    d.BackgroundColor3 = Color3.fromRGB(150, 150, 150)
-    d.BorderSizePixel = 0
-    d.Parent = frame
-    Instance.new("UICorner", d).CornerRadius = UDim.new(1, 0)
-    return d
-end
-
-local function makeLabel(frame, y, size, color, font, text, xOffset, widthOffset)
-    local l = Instance.new("TextLabel")
-    l.Size = UDim2.new(1, widthOffset or -24, 0, 18)
-    l.Position = UDim2.new(0, xOffset or 12, 0, y)
-    l.BackgroundTransparency = 1
-    l.Font = font or Enum.Font.Gotham
-    l.TextSize = size
-    l.TextXAlignment = Enum.TextXAlignment.Left
-    l.TextColor3 = color
-    l.Text = text or ""
-    l.Parent = frame
-    return l
-end
-
--- Fall Freeze panel (top)
-local frame = makePanel(container, 0, 214)
-local titleBar = makeTitle(frame, "Fall Freeze")
-local dot = makeDot(frame, 35)
-
-local mainLabel = makeLabel(frame, 32, 14, Color3.new(1, 1, 1),
-    Enum.Font.GothamBold, "Fall Freeze: starting...", 32, -44)
-local stateLabel = makeLabel(frame, 56, 13, Color3.fromRGB(120, 190, 255), nil, "State: starting")
-local posLabel   = makeLabel(frame, 76, 12, Color3.fromRGB(190, 190, 190), nil, "Pos: --")
-local statLabel  = makeLabel(frame, 94, 12, Color3.fromRGB(190, 190, 190), nil,
-    "Falls caught: 0   Floor placements: 0")
-
-local logBox = Instance.new("TextLabel")
-logBox.Size = UDim2.new(1, -24, 0, 76)
-logBox.Position = UDim2.new(0, 12, 0, 118)
-logBox.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
-logBox.BackgroundTransparency = 0.3
-logBox.BorderSizePixel = 0
-logBox.Font = Enum.Font.Code
-logBox.TextSize = 11
-logBox.TextColor3 = Color3.fromRGB(170, 170, 170)
-logBox.TextXAlignment = Enum.TextXAlignment.Left
-logBox.TextYAlignment = Enum.TextYAlignment.Top
-logBox.TextWrapped = true
-logBox.Text = ""
-logBox.Parent = frame
-Instance.new("UICorner", logBox).CornerRadius = UDim.new(0, 6)
-
-local hint = makeLabel(frame, 197, 11, Color3.fromRGB(140, 140, 140), nil,
-    "F7 toggle  ·  = kill  ·  drag title", 0, 0)
-hint.Size = UDim2.new(1, 0, 0, 16)
-hint.TextXAlignment = Enum.TextXAlignment.Center
-
--- Activity Log panel (bottom)
-local wframe = makePanel(container, 222, 200)
-local wTitleBar = makeTitle(wframe, "Activity Log")
-local wDot  = makeDot(wframe, 33)
-local wMain = makeLabel(wframe, 31, 13, Color3.new(1, 1, 1),
-    Enum.Font.GothamBold, "Activity Log: RUNNING", 32, -44)
-local wRecover = makeLabel(wframe, 50, 11, Color3.fromRGB(190, 190, 190),
-    nil, "Auto-recover: 0", 12, -24)
-
-local wLast = Instance.new("TextLabel")
-wLast.Size = UDim2.new(1, -24, 0, 100)
-wLast.Position = UDim2.new(0, 12, 0, 68)
-wLast.BackgroundTransparency = 1
-wLast.Font = Enum.Font.Code
-wLast.TextSize = 11
-wLast.TextColor3 = Color3.fromRGB(170, 170, 170)
-wLast.TextXAlignment = Enum.TextXAlignment.Left
-wLast.TextYAlignment = Enum.TextYAlignment.Top
-wLast.TextWrapped = true
-wLast.Text = "(no output yet)"
-wLast.Parent = wframe
-
-local wMobs = makeLabel(wframe, 176, 11, Color3.fromRGB(150, 200, 150),
-    Enum.Font.Code, "Mobs known: 0", 12, -24)
-
--- Drag: both title bars move the shared container.
-local dragStart, startPos
-local function beginDrag(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then
-        dragStart, startPos = input.Position, container.Position
-    end
-end
-titleBar.InputBegan:Connect(beginDrag)
-wTitleBar.InputBegan:Connect(beginDrag)
-
-conns[#conns + 1] = UserInputService.InputChanged:Connect(function(input)
-    if dragStart and (input.UserInputType == Enum.UserInputType.MouseMovement
-        or input.UserInputType == Enum.UserInputType.Touch) then
-        local d = input.Position - dragStart
-        container.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
-            startPos.Y.Scale, startPos.Y.Offset + d.Y)
-    end
-end)
-conns[#conns + 1] = UserInputService.InputEnded:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then
-        dragStart = nil
-    end
-end)
-
--- SHARED HELPERS
-local function getRoot()
-    local c = lp.Character
-    return c and c:FindFirstChild("HumanoidRootPart"), c and c:FindFirstChildOfClass("Humanoid")
-end
-
-local function fmtV(v)
-    return string.format("(%.1f, %.1f, %.1f)", v.X, v.Y, v.Z)
-end
-
-local function pushFreezeLog(msg)
-    freezeLines[#freezeLines + 1] = string.format("%s %s", os.date("%H:%M:%S"), msg)
-    while #freezeLines > FREEZE_LOG_LINES do table.remove(freezeLines, 1) end
-    logBox.Text = table.concat(freezeLines, "\n")
-end
-
-local function isBlacklisted(model)
-    if not model then return true end
-    for _, n in ipairs(PROP_BLACKLIST) do
-        if model.Name == n then return true end
-    end
-    return false
-end
-
--- FALL FREEZE LOGIC
-local function release(r)
-    if r then r.Anchored = false end
-    anchored = false
-    failedSettleTries = 0
-end
-
-local function settleOnFloor(r)
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Exclude
-    params.FilterDescendantsInstances = { lp.Character }
-    local origin = r.Position + Vector3.new(0, RAY_UP, 0)
-    local hit = workspace:Raycast(origin, Vector3.new(0, -(RAY_UP + RAY_DOWN), 0), params)
-    if hit then
-        r.CFrame = CFrame.new(hit.Position + Vector3.new(0, 3.2, 0)) * (r.CFrame - r.CFrame.Position)
-        r.AssemblyLinearVelocity = Vector3.zero
-        settles = settles + 1
-        failedSettleTries = 0
-        pushFreezeLog(string.format("floor: %s y=%.1f", hit.Instance.Name, hit.Position.Y))
+        for k in pairs(b) do
+            if a[k] == nil then
+                return false
+            end
+        end
         return true
     end
 
-    failedSettleTries = failedSettleTries + 1
+    local function writeConfigNow()
+        if type(writefile) ~= "function" then
+            return false, "executor does not provide writefile()"
+        end
 
-    if failedSettleTries >= FALLBACK_AFTER_TRIES then
-        if lastMobPos and (os.clock() - lastMobTime) < FALLBACK_MAX_AGE then
-            r.CFrame = CFrame.new(lastMobPos)
-            r.AssemblyLinearVelocity = Vector3.zero
-            settles = settles + 1
-            failedSettleTries = 0
-            pushFreezeLog(string.format(
-                "no floor after %d tries -> teleported to last mob %s (%.0fs ago)",
-                FALLBACK_AFTER_TRIES, fmtV(lastMobPos), os.clock() - lastMobTime))
-            return true
+        local encodeOk, data = pcall(function()
+            return HttpService:JSONEncode(Flags)
+        end)
+        if not encodeOk or type(data) ~= "string" then
+            return false, "could not encode settings as JSON: " .. tostring(data)
+        end
+
+        local writeOk, writeErr = pcall(function()
+            writefile(CONFIG_FILE, data)
+        end)
+        if not writeOk then
+            return false, "writefile failed: " .. tostring(writeErr)
+        end
+
+        -- Verify that the exact file just written can be read back. This catches
+        -- cases where the executor reports no error but the file was not updated.
+        if type(readfile) == "function" then
+            local readOk, savedText = pcall(function()
+                return readfile(CONFIG_FILE)
+            end)
+            if not readOk or type(savedText) ~= "string" then
+                return false, "write returned but readfile could not verify " .. CONFIG_FILE
+            end
+            local decodeOk, savedFlags = pcall(function()
+                return HttpService:JSONDecode(savedText)
+            end)
+            if not decodeOk or type(savedFlags) ~= "table" then
+                return false, "saved file is not valid JSON"
+            end
+            if not configValuesEqual(Flags, savedFlags) then
+                return false, "file read-back does not match the current settings"
+            end
+        end
+
+        return true
+    end
+
+    -- Debounce background saves, but never drop the newest change. Explicit saves
+    -- (toggle clicks and the Save Config Now button) are synchronous and verified.
+    local function saveConfig(force)
+        saveVersion += 1
+        local version = saveVersion
+
+        if force then
+            return writeConfigNow()
+        end
+
+        task.delay(1, function()
+            -- Cleanup routines can call saveConfig() while unloading. Never let
+            -- a delayed write overwrite the user's saved preferences afterward.
+            if unloaded or version ~= saveVersion then
+                return
+            end
+            local ok, err = writeConfigNow()
+            if not ok then
+                warn("[TheForest] Config autosave failed: " .. tostring(err))
+            end
+        end)
+        return true
+    end
+
+    local function loadConfig()
+        local loaded = false
+        local fileExists = false
+
+        -- isfile() can be missing or unreliable in some executor environments,
+        -- so probe the known config path with readfile() as well.
+        if type(isfile) == "function" then
+            local existsOk, existsResult = pcall(function()
+                return isfile(CONFIG_FILE)
+            end)
+            fileExists = existsOk and existsResult == true
+        end
+
+        if type(readfile) == "function" then
+            local readOk, rawData = pcall(function()
+                return readfile(CONFIG_FILE)
+            end)
+            if readOk and type(rawData) == "string" and #rawData > 0 then
+                fileExists = true
+                local decodeOk, data = pcall(function()
+                    return HttpService:JSONDecode(rawData)
+                end)
+                if decodeOk and type(data) == "table" then
+                    for k, v in pairs(data) do
+                        if DEFAULT_FLAGS[k] ~= nil and v ~= nil then
+                            if type(v) == "table" then
+                                local copy = {}
+                                for subK, subV in pairs(v) do
+                                    copy[subK] = subV
+                                end
+                                Flags[k] = copy
+                            else
+                                Flags[k] = v
+                            end
+                        end
+                    end
+                    loaded = true
+                    print("[TheForest] Loaded " .. CONFIG_FILE .. " (FreeCursorMenu=" .. tostring(Flags.FreeCursorMenu) .. ")")
+                elseif fileExists then
+                    warn("[TheForest] " .. CONFIG_FILE .. " exists but is not valid JSON; preserving it rather than overwriting it with defaults.")
+                end
+            end
+        end
+
+        -- Only fill missing keys. Values already present in the file, including
+        -- false toggles, are retained exactly as saved.
+        for k, v in pairs(DEFAULT_FLAGS) do
+            if Flags[k] == nil then
+                if type(v) == "table" then
+                    local copy = {}
+                    for subK, subV in pairs(v) do
+                        copy[subK] = subV
+                    end
+                    Flags[k] = copy
+                else
+                    Flags[k] = v
+                end
+            end
+        end
+
+        -- Create the file on first launch, but never replace a file that could not
+        -- be parsed; that file may contain the user's existing settings.
+        if not loaded and not fileExists then
+            local saved, err = saveConfig(true)
+            if not saved then
+                warn("[TheForest] Could not create " .. CONFIG_FILE .. ": " .. tostring(err))
+            else
+                print("[TheForest] Created initial config at " .. CONFIG_FILE)
+            end
+        end
+    end
+    loadConfig()
+
+    --=============================================================================
+    -- Game modules
+    --=============================================================================
+
+    local Remotes, Config
+    pcall(function()
+        Remotes = require(ReplicatedStorage:WaitForChild("Shared", 15):WaitForChild("Services", 15):WaitForChild("ChopRemotes", 15))
+    end)
+    pcall(function()
+        Config = require(ReplicatedStorage.Shared:WaitForChild("Configs", 15):WaitForChild("Chopping", 15))
+    end)
+
+    local LobbyRemotes = ReplicatedStorage:FindFirstChild("Lobby") and ReplicatedStorage.Lobby:FindFirstChild("Remotes")
+    local LobbyConfig
+    pcall(function() 
+        LobbyConfig = require(ReplicatedStorage.Lobby.LobbyConfig) 
+    end)
+
+    local TOOL_STATIONS = {
+        Axe = "Station_Axe", Vacuum = "Station_Vacuum",
+        Chainsaw = "Station_TrialChainsaw", Flamethrower = "Station_Flamethrower",
+    }
+
+    --=============================================================================
+    -- Utility
+    --=============================================================================
+
+    local function notify(content)
+        print(("[%s] %s"):format(GAME_NAME, tostring(content)))
+    end
+
+    local function short(n)
+        n = tonumber(n) or 0
+        local units = { {1e15,"Qa"}, {1e12,"T"}, {1e9,"B"}, {1e6,"M"}, {1e3,"K"} }
+        for _, u in ipairs(units) do
+            if math.abs(n) >= u[1] then 
+                return string.format("%.2f%s", n / u[1], u[2]) 
+            end
+        end
+        return tostring(math.floor(n))
+    end
+
+    local function getRoot()
+        local character = LocalPlayer.Character
+        if not character then 
+            return nil, nil 
+        end
+        local humanoid = character:FindFirstChildOfClass("Humanoid")
+        local root = character:FindFirstChild("HumanoidRootPart")
+        if humanoid and humanoid.Health > 0 and root and root:IsA("BasePart") then
+            return humanoid, root
+        end
+        return nil, nil
+    end
+
+    local function teleport(position)
+        local _, root = getRoot()
+        if not root then 
+            return false 
+        end
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.CFrame = CFrame.new(position)
+        return true
+    end
+
+    local function partPosition(inst)
+        if not inst then 
+            return nil 
+        end
+        if inst:IsA("BasePart") then 
+            return inst.Position 
+        end
+        if inst:IsA("Model") then 
+            return inst:GetPivot().Position 
+        end
+        return nil
+    end
+
+    local function startWorker(key, interval, step)
+        if workers[key] then 
+            return 
+        end
+        workers[key] = true
+        task.spawn(function()
+            while workers[key] and not unloaded do
+                local ok, err = pcall(step)
+                if not ok then 
+                    warn(("[%s] %s: %s"):format(GAME_NAME, key, tostring(err))) 
+                end
+                task.wait(interval)
+            end
+            workers[key] = nil
+        end)
+    end
+
+    local function stopWorker(key) 
+        workers[key] = false 
+    end
+
+    local function setWorker(key, enabled, interval, step)
+        if enabled then 
+            startWorker(key, interval, step) 
+        else 
+            stopWorker(key) 
+        end
+    end
+
+    local function cashValue()
+        local ls = LocalPlayer:FindFirstChild("leaderstats")
+        local cash = ls and ls:FindFirstChild("Cash")
+        return (cash and cash.Value) or 0
+    end
+
+    local function gemsValue() 
+        return tonumber(LocalPlayer:GetAttribute("Gems")) or 0 
+    end
+
+    local function carried() 
+        return tonumber(LocalPlayer:GetAttribute("CarriedLogs")) or 0 
+    end
+
+    local function backpackLevel() 
+        return math.floor(tonumber(LocalPlayer:GetAttribute("Up_GearBackpack")) or 0) 
+    end
+
+    local function toolOwned(name) 
+        return LocalPlayer:GetAttribute("Owns" .. name) == true 
+    end
+
+    --=============================================================================
+    -- Config helpers
+    --=============================================================================
+
+    local function upgradeDef(id)
+        if not Config or not Config.Upgrades then 
+            return nil 
+        end
+        for _, section in ipairs(Config.Upgrades.Sections) do
+            for _, item in ipairs(section.Items) do
+                if item.Id == id then 
+                    return item, section 
+                end
+            end
+        end
+        return nil
+    end
+
+    local function nextUpgradePrice(id)
+        local item = upgradeDef(id)
+        if not item then 
+            return nil 
+        end
+        local level = math.floor(tonumber(LocalPlayer:GetAttribute("Up_" .. id)) or 0)
+        return item.Prices[level + 1], item
+    end
+
+    local function capacity()
+        local item = upgradeDef("GearBackpack")
+        local level = backpackLevel()
+        local bag = (item and item.Capacity and level > 0) and item.Capacity[math.min(level, #item.Capacity)] or 0
+        local total = bag + 5
+        
+        if LocalPlayer:GetAttribute("InfiniteBackpack") or LocalPlayer:GetAttribute("InfBackpack") or LocalPlayer:GetAttribute("HasInfiniteBackpack") then
+            return 999999
+        end
+        
+        if carried() > total and total <= 5 then
+            return 999999
+        end
+        
+        return total
+    end
+
+    local function sellThreshold()
+        if Flags.AutoSell then 
+            return math.clamp(math.floor(tonumber(Flags.SellAt) or 5), 1, 155) 
+        end
+        return capacity()
+    end
+
+    local ZONE_LABEL_FALLBACK = {
+        OakWood="Oak Wood", BirchGrove="Birch Grove", PineWood="Pine Wood", Evergreens="Evergreens",
+        CherryGrove="Cherry Grove", AutumnWood="Autumn Wood", FirGiants="Fir Giants", GoldenAspens="Golden Aspens",
+    }
+
+    local function zoneOrder() 
+        return (Config and Config.Forest and Config.Forest.Areas and Config.Forest.Areas.Order) or {} 
+    end
+
+    local function zoneIndex(key) 
+        for i, k in ipairs(zoneOrder()) do 
+            if k == key then 
+                return i 
+            end 
+        end 
+        return nil 
+    end
+
+    local function zoneLabel(key)
+        local biome = Config and Config.Forest and Config.Forest.Biomes and Config.Forest.Biomes[key]
+        if biome and biome.Label then 
+            return biome.Label 
+        end
+        return ZONE_LABEL_FALLBACK[key] or key
+    end
+
+    local function zoneUnlocked(key)
+        local index = zoneIndex(key)
+        local unlocked = tonumber(workspace:GetAttribute("AreasUnlocked")) or 1
+        return index ~= nil and index <= unlocked
+    end
+
+    local function vehicleDef(id)
+        for _, v in ipairs((Config and Config.Vehicles and Config.Vehicles.List) or {}) do
+            if v.Id == id then 
+                return v 
+            end
+        end
+        return nil
+    end
+
+    --=============================================================================
+    -- World queries
+    --=============================================================================
+
+    local function treesFolder()
+        local map = workspace:FindFirstChild("Map")
+        return map and map:FindFirstChild("Trees")
+    end
+
+    local function nearestTree()
+        local folder = treesFolder()
+        local _, root = getRoot()
+        if not folder or not root then 
+            return nil 
+        end
+        local best, bestDist
+        for _, tree in ipairs(folder:GetChildren()) do
+            local base = tree:FindFirstChild("TrunkBase")
+            if base and base:IsA("BasePart")
+                and tree:GetAttribute("Biome") == Flags.Zone
+                and (tonumber(tree:GetAttribute("HP")) or 0) > 0
+                and not Game.badTrees[tree] then
+                local dist = (base.Position - root.Position).Magnitude
+                if not bestDist or dist < bestDist then 
+                    best, bestDist = tree, dist 
+                end
+            end
+        end
+        return best
+    end
+
+    -- Read the game's actual area HUD so the same logic works across area labels
+    -- and progress values instead of hardcoding Oak Wood or a particular percent.
+    local function readAreaHudState()
+        local state = {
+            percent = nil,
+            marker = nil,
+            bossName = nil,
+            areaName = zoneLabel(Flags.Zone),
+        }
+        local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        if playerGui then
+            for _, inst in ipairs(playerGui:GetDescendants()) do
+                if inst:IsA("TextLabel") or inst:IsA("TextButton") then
+                    local textValue = inst.Text
+                    if type(textValue) == "string" and textValue ~= "" then
+                        local lower = string.lower(textValue)
+                        local pct = string.match(lower, "([%d%.]+)%%%s*cleared")
+                        if pct then
+                            local parsed = tonumber(pct)
+                            if parsed ~= nil then
+                                state.percent = parsed
+                            end
+                        end
+
+                        local areaNum, areaTotal = string.match(lower, "area%s*(%d+)%s*/%s*(%d+)")
+                        if areaNum and areaTotal then
+                            state.marker = areaNum .. "/" .. areaTotal
+                        end
+
+                        -- Example HUD copy: "Clear it all to wake Old Barkback".
+                        local expected = string.match(textValue, "[Ww]ake%s+([%w%s%-']+)")
+                        if expected then
+                            expected = string.match(expected, "^%s*(.-)%s*$")
+                            if expected and expected ~= "" then
+                                state.bossName = expected
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        -- The HUD's AREA n/total marker distinguishes consecutive areas even
+        -- when the selected biome/zone dropdown remains unchanged.
+        state.key = tostring(Flags.Zone) .. "|" .. tostring(state.marker or "")
+        return state
+    end
+
+    local function normalizedName(value)
+        return string.gsub(string.lower(tostring(value or "")), "[^%w]", "")
+    end
+
+    local function modelHealth(model)
+        if not model or not model.Parent then
+            return 0
+        end
+        local humanoid = model:FindFirstChildOfClass("Humanoid")
+        if humanoid then
+            return humanoid.Health
+        end
+        local hp = tonumber(model:GetAttribute("HP"))
+        if hp == nil then hp = tonumber(model:GetAttribute("Health")) end
+        if hp == nil then
+            local hpValue = model:FindFirstChild("HP") or model:FindFirstChild("Health")
+            if hpValue and (hpValue:IsA("NumberValue") or hpValue:IsA("IntValue")) then
+                hp = hpValue.Value
+            end
+        end
+        return hp
+    end
+
+    local function modelRootPart(model)
+        if not model then return nil end
+        local root = model:FindFirstChild("HumanoidRootPart")
+            or model.PrimaryPart
+            or model:FindFirstChild("RootPart")
+            or model:FindFirstChild("UpperTorso")
+            or model:FindFirstChild("Torso")
+        if root and root:IsA("BasePart") then
+            return root
+        end
+        for _, child in ipairs(model:GetDescendants()) do
+            if child:IsA("BasePart") then
+                return child
+            end
+        end
+        return nil
+    end
+
+    -- The game calls at least one boss "Old Barkback", so matching only names
+    -- that literally contain the word "boss" misses it. Prefer the boss name
+    -- advertised in the HUD, with generic boss-name fallbacks for other areas.
+    local function findActiveBoss(preferredName)
+        preferredName = preferredName or Game.areaBossName
+        local preferred = normalizedName(preferredName)
+        for _, inst in ipairs(workspace:GetDescendants()) do
+            if inst:IsA("Model") and inst ~= LocalPlayer.Character then
+                local candidate = normalizedName(inst.Name)
+                local namedMatch = preferred ~= "" and candidate ~= ""
+                    and (candidate == preferred
+                        or string.find(candidate, preferred, 1, true) ~= nil
+                        or string.find(preferred, candidate, 1, true) ~= nil)
+                local genericMatch = string.find(candidate, "boss", 1, true) ~= nil
+                    or string.find(candidate, "barkback", 1, true) ~= nil
+                if namedMatch or (preferred == "" and genericMatch) then
+                    local hp = modelHealth(inst)
+                    local hasRoot = modelRootPart(inst) ~= nil
+                    if (hp == nil or hp > 0) and hasRoot then
+                        return inst
+                    end
+                end
+            end
+        end
+        return nil
+    end
+
+    local function groundLogs()
+        local folder = workspace:FindFirstChild("Logs")
+        local out = {}
+        if not folder then 
+            return out 
+        end
+        local _, root = getRoot()
+        if not root then 
+            return out 
+        end
+        local dist = {}
+        for _, log in ipairs(folder:GetChildren()) do
+            local wood = log:FindFirstChild("Wood")
+            if wood and wood:IsA("BasePart") and log:GetAttribute("ThrownBy") == nil and (Game.badLogs[log] or 0) < 2 then
+                local d = (wood.Position - root.Position).Magnitude
+                if d <= 250 then 
+                    dist[log] = d 
+                    table.insert(out, log) 
+                end
+            end
+        end
+        table.sort(out, function(a, b) 
+            return dist[a] < dist[b] 
+        end)
+        return out
+    end
+
+    local function sellSpots()
+        local out = {}
+        local tagged = CollectionService:GetTagged("SellOutpost")
+        if #tagged > 0 then
+            for _, inst in ipairs(tagged) do 
+                table.insert(out, inst) 
+            end
         else
-            pushFreezeLog(string.format(
-                "no floor after %d tries, but no recent mob to fall back to",
-                failedSettleTries))
+            local huts = workspace:FindFirstChild("ForestHuts")
+            if huts then
+                for _, d in ipairs(huts:GetDescendants()) do
+                    if d.Name == "SellOutpost" then 
+                        table.insert(out, d) 
+                    end
+                end
+            end
+        end
+        local map = workspace:FindFirstChild("Map")
+        local main = map and map:FindFirstChild("SellSpot")
+        if main then 
+            table.insert(out, main) 
+        end
+        return out
+    end
+
+    local function nearestPad()
+        local _, root = getRoot()
+        if not root then 
+            return nil 
+        end
+        local best, bestDist
+        for _, spot in ipairs(sellSpots()) do
+            local pad = spot:FindFirstChild("DepositPad")
+            if pad and pad:IsA("BasePart") then
+                local dist = (pad.Position - root.Position).Magnitude
+                if not bestDist or dist < bestDist then 
+                    best, bestDist = pad, dist 
+                end
+            end
+        end
+        return best
+    end
+
+    local function stationPosition(name)
+        local map = workspace:FindFirstChild("Map")
+        local cabin = map and map:FindFirstChild("LogCabin")
+        local shop = cabin and cabin:FindFirstChild("Shop")
+        local stations = shop and shop:FindFirstChild("Stations")
+        local station = stations and stations:FindFirstChild(name)
+        local anchor = station and station:FindFirstChild("PromptAnchor")
+        return partPosition(anchor) or partPosition(station)
+    end
+
+    --=============================================================================
+    -- Gameplay
+    --=============================================================================
+
+    local function farmActive() 
+        return Flags.AutoChop or Flags.AutoPickup or Flags.AutoSell 
+    end
+
+    local function equipTool(name)
+        local humanoid, root = getRoot()
+        local character = LocalPlayer.Character
+        if not character or not humanoid or not root then
+            return nil
+        end
+
+        local tool = character:FindFirstChild(name)
+        if tool and tool:IsA("Tool") then
+            return tool
+        end
+
+        local backpack = LocalPlayer:FindFirstChild("Backpack")
+        tool = backpack and backpack:FindFirstChild(name)
+        if tool and tool:IsA("Tool") then
+            local equipped = pcall(function()
+                humanoid:EquipTool(tool)
+            end)
+            if not equipped then
+                return nil
+            end
+            task.wait(0.3)
+            local current = character:FindFirstChild(name)
+            return current and current:IsA("Tool") and current or nil
+        end
+        return nil
+    end
+
+    local function sellLogs()
+        if carried() <= 0 or not Remotes then 
+            return false 
+        end
+        local pad = nearestPad()
+        if not pad then 
+            return false 
+        end
+        Game.status = "Selling"
+        teleport(pad.Position + Vector3.new(0, 3, 0))
+        task.wait(0.4)
+        if unloaded then 
+            return false 
+        end
+        Remotes.DepositLogs:FireServer(false)
+        Game.sells += 1
+        task.wait(0.6)
+        return true
+    end
+
+    local function pickupLogs()
+        local limit = sellThreshold()
+        local picked = false
+        for _, log in ipairs(groundLogs()) do
+            if unloaded or not Flags.AutoPickup or carried() >= limit then 
+                break 
+            end
+            local wood = log:FindFirstChild("Wood")
+            if wood and wood:IsA("BasePart") and log.Parent then
+                Game.status = "Picking Up Logs"
+                local before = carried()
+                teleport(wood.Position + Vector3.new(0, 3, 0))
+                task.wait(0.15)
+                if not Remotes then 
+                    return picked 
+                end
+                Remotes.PickUpLog:FireServer(log)
+                task.wait(0.2)
+                if carried() > before or not log.Parent then 
+                    picked = true 
+                else 
+                    Game.badLogs[log] = (Game.badLogs[log] or 0) + 1 
+                end
+            end
+        end
+        for log in pairs(Game.badLogs) do 
+            if not log.Parent then 
+                Game.badLogs[log] = nil 
+            end 
+        end
+        return picked
+    end
+
+    local function chopTree(tree)
+        local base = tree:FindFirstChild("TrunkBase")
+        local _, root = getRoot()
+        if not base or not base:IsA("BasePart") or not root then 
+            return 
+        end
+        
+        local standAt = base.Position + Vector3.new(3, 2, 0)
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.CFrame = CFrame.lookAt(standAt, Vector3.new(base.Position.X, standAt.Y, base.Position.Z))
+        task.wait(0.2)
+        if not Remotes then 
+            return 
+        end
+
+        local lastHp = tonumber(tree:GetAttribute("HP")) or 0
+        local stuck = 0
+        local started = os.clock()
+
+        while not unloaded and Flags.AutoChop and tree.Parent == treesFolder() and (tonumber(tree:GetAttribute("HP")) or 0) > 0 do
+            if os.clock() - started > 60 then 
+                Game.badTrees[tree] = true 
+                return 
+            end
+            
+            local _, r = getRoot()
+            if not r then 
+                return 
+            end
+            if (r.Position - standAt).Magnitude > 6 then
+                r.CFrame = CFrame.lookAt(standAt, Vector3.new(base.Position.X, standAt.Y, base.Position.Z))
+            end
+
+            local usedFlame = false
+            if Flags.SmartWeapons then
+                if os.clock() - Game.lastFlameUse >= 12 then
+                    local flame = equipTool("Flamethrower")
+                    if flame then
+                        Game.status = "Flaming " .. tostring(tree:GetAttribute("TreeType") or "Tree")
+                        VirtualUser:CaptureController()
+                        VirtualUser:ClickButton1(Vector2.new(800, 400))
+                        Game.lastFlameUse = os.clock()
+                        task.wait(1.5)
+                        usedFlame = true
+                    end
+                end
+            end
+
+            if not usedFlame then
+                if Flags.SmartWeapons then
+                    equipTool("Axe")
+                    Game.status = "Chopping " .. tostring(tree:GetAttribute("TreeType") or "Tree")
+                else
+                    Game.status = "Chopping " .. tostring(tree:GetAttribute("TreeType") or "Tree")
+                end
+                
+                Game.hitSeq += 1
+                Remotes.Chop:FireServer(tree, base.Position + Vector3.new(1, 1, 0), 1, Game.hitSeq)
+                task.wait(math.max(0.1, Flags.ChopDelay))
+            end
+
+            local hp = tonumber(tree:GetAttribute("HP")) or 0
+            if hp < lastHp then
+                lastHp = hp
+                stuck = 0
+            else
+                stuck += 1
+                if stuck >= 15 then 
+                    Game.badTrees[tree] = true 
+                    return 
+                end
+            end
+        end
+        if (tonumber(tree:GetAttribute("HP")) or 0) <= 0 then
+            Game.trees += 1
+            task.wait(1)
+        end
+    end
+
+    local function equipAxe()
+        local humanoid, root = getRoot()
+        local character = LocalPlayer.Character
+        if not character or not humanoid or not root then
+            return nil
+        end
+        local backpack = LocalPlayer:FindFirstChild("Backpack")
+        local candidates = { character, backpack }
+        for _, container in ipairs(candidates) do
+            if container then
+                local exact = container:FindFirstChild("Axe")
+                if exact and exact:IsA("Tool") then
+                    if exact.Parent ~= character then
+                        local ok = pcall(function() humanoid:EquipTool(exact) end)
+                        if not ok then return nil end
+                        task.wait(0.1)
+                    end
+                    local equipped = character:FindFirstChild("Axe")
+                    return equipped and equipped:IsA("Tool") and equipped or nil
+                end
+            end
+        end
+        for _, container in ipairs(candidates) do
+            if container then
+                for _, item in ipairs(container:GetChildren()) do
+                    if item:IsA("Tool") and string.find(string.lower(item.Name), "axe", 1, true) then
+                        if item.Parent ~= character then
+                            local ok = pcall(function() humanoid:EquipTool(item) end)
+                            if not ok then return nil end
+                            task.wait(0.1)
+                        end
+                        local equipped = character:FindFirstChild(item.Name)
+                        return equipped and equipped:IsA("Tool") and equipped or nil
+                    end
+                end
+            end
+        end
+        return nil
+    end
+
+    local function placeAboveBehindBoss(boss)
+        local _, root = getRoot()
+        local targetRoot = modelRootPart(boss)
+        if not root or not targetRoot then
             return false
         end
-    end
-
-    pushFreezeLog(string.format("no floor under you, staying frozen (try %d/%d)",
-        failedSettleTries, FALLBACK_AFTER_TRIES))
-    return false
-end
-
-conns[#conns + 1] = RunService.Heartbeat:Connect(function()
-    if killed or not freezeEnabled then return end
-    local r = getRoot()
-    if not r then
-        anchored, lastPos = false, nil
-        return
-    end
-
-    local pos = r.Position
-    if anchored then
-        if lastPos and (pos - lastPos).Magnitude > MOVE_RELEASE then
-            release(r)
-            pushFreezeLog("released (farm moved you)")
-        elseif os.clock() - frozenAt >= SETTLE_AFTER then
-            if settleOnFloor(r) then
-                release(r)
-            else
-                frozenAt = os.clock() + RETRY_AFTER
-            end
+        local boxCf, boxSize
+        local ok = pcall(function()
+            boxCf, boxSize = boss:GetBoundingBox()
+        end)
+        if not ok or not boxCf or not boxSize then
+            boxCf = targetRoot.CFrame
+            boxSize = targetRoot.Size
         end
-    elseif r.AssemblyLinearVelocity.Y < FALL_SPEED then
-        r.AssemblyLinearVelocity = Vector3.zero
-        r.Anchored = true
-        anchored = true
-        frozenAt = os.clock()
-        failedSettleTries = 0
-        catches = catches + 1
-        pushFreezeLog(string.format("caught fall #%d at y=%.1f", catches, pos.Y))
-    end
-    lastPos = r.Position
-end)
-
-conns[#conns + 1] = lp.CharacterAdded:Connect(function()
-    anchored, lastPos = false, nil
-    failedSettleTries = 0
-    pushFreezeLog("character respawned")
-end)
-
--- ACTIVITY LOG LOGIC
-local NON_ACTIVITY_TAGS = { ["STUCK?"] = true, ["RECOVER"] = true, ["INFO"] = true }
-
-local function logLine(tag, msg)
-    local line = string.format("[%7.2f] [%s] %s", os.clock() - logT0, tag, msg)
-    print(line)
-
-    logTotalLines = logTotalLines + 1
-    logBuffer[#logBuffer + 1] = line
-    while #logBuffer > LOG_BUFFER_MAX do
-        table.remove(logBuffer, 1)
+        local backward = -targetRoot.CFrame.LookVector
+        local offsetBehind = math.max(2.5, (boxSize.Z * 0.5) + 1.5)
+        local hoverHeight = math.max(3, (boxSize.Y * 0.5) + 2.5)
+        local destination = boxCf.Position + backward * offsetBehind + Vector3.new(0, hoverHeight, 0)
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.CFrame = CFrame.lookAt(destination, boxCf.Position)
+        return true
     end
 
-    logLineCount = logLineCount + 1
-    lastLogLine  = line
-    if not NON_ACTIVITY_TAGS[tag] then
-        lastActivityTime = os.clock()
-    end
+    local function runBossEncounter(boss, areaKey)
+        local bossName = boss and boss.Name or Game.areaBossName or "Boss"
+        Game.status = "Fighting " .. tostring(bossName) .. " with Axe"
+        notify("Boss encounter started: " .. tostring(bossName) .. "; equipping Axe and attacking until defeated.")
 
-    local mobName = extractMobName(line)
-    if mobName then saveMobName(mobName) end
-end
+        local lastToolWarning = 0
+        local lastMissingTargetWarning = 0
+        local bossMissingSince = nil
+        while not unloaded and Flags.AutoChop and Game.areaCompleteKey == areaKey do
+            local currentState = readAreaHudState()
+            if currentState.key ~= areaKey
+                or (currentState.percent ~= nil and currentState.percent < 99.9) then
+                return "area-changed"
+            end
 
-local function flushLog()
-    if not HAS_WRITE then return end
-    pcall(function()
-        if HAS_APPEND and isfile("activity_log.txt") and logTotalLines > logWrittenLines then
-            local firstInBuffer = logTotalLines - #logBuffer + 1
-            local fromIdx = (logWrittenLines + 1) - firstInBuffer + 1
-            if fromIdx < 1 then fromIdx = 1 end
-            if fromIdx <= #logBuffer then
-                local chunk = {}
-                for i = fromIdx, #logBuffer do
-                    chunk[#chunk + 1] = logBuffer[i]
+            local liveBoss = findActiveBoss(Game.areaBossName or bossName)
+            if not liveBoss then
+                -- Give Roblox a moment to update/reparent the model before deciding
+                -- the boss has actually disappeared or reached zero health.
+                bossMissingSince = bossMissingSince or os.clock()
+                if os.clock() - bossMissingSince >= 1.25 then
+                    return "defeated"
                 end
-                appendfile("activity_log.txt", table.concat(chunk, "\n") .. "\n")
-            end
-            logWrittenLines = logTotalLines
-        else
-            writefile("activity_log.txt", table.concat(logBuffer, "\n"))
-        end
-    end)
-end
-
-local enemyCache, lastScan = {}, 0
-local function scanEnemies()
-    if os.clock() - lastScan < 1.5 then return enemyCache end
-    lastScan = os.clock()
-    local list = {}
-    for _, d in ipairs(workspace:GetDescendants()) do
-        if d:IsA("Humanoid") and d.Health > 0 then
-            local model = d.Parent
-            if model and model ~= lp.Character
-                and not Players:GetPlayerFromCharacter(model) then
-                local root = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
-                if root then list[#list + 1] = { model = model, hum = d, root = root } end
-            end
-        end
-    end
-    enemyCache = list
-    return list
-end
-
-local function nearestEnemy(pos)
-    local best, bestD
-    for _, e in ipairs(scanEnemies()) do
-        if e.root and e.root.Parent then
-            local d = (e.root.Position - pos).Magnitude
-            if not bestD or d < bestD then best, bestD = e, d end
-        end
-    end
-    return best, bestD
-end
-
-local function nearestValidMob(pos)
-    local best, bestD
-    for _, e in ipairs(scanEnemies()) do
-        if e.root and e.root.Parent and not isBlacklisted(e.model) then
-            local d = (e.root.Position - pos).Magnitude
-            if not bestD or d < bestD then best, bestD = e, d end
-        end
-    end
-    return best, bestD
-end
-
-conns[#conns + 1] = LogService.MessageOut:Connect(function(msg, mtype)
-    if killed or not logRunning then return end
-    if mtype == Enum.MessageType.MessageOutput
-        or mtype == Enum.MessageType.MessageInfo then return end
-    for _, s in ipairs(IGNORE) do
-        if msg:find(s, 1, true) then return end
-    end
-    logLine(mtype == Enum.MessageType.MessageError and "ERROR" or "WARN", msg)
-end)
-
--- Remote hook: remotes are NOT logged at all. They still count as
--- "farm is alive" so stuck detection doesn't false-fire on a boss.
-pcall(function()
-    local old
-    old = hookmetamethod(game, "__namecall", function(self, ...)
-        local method = getnamecallmethod()
-        if not killed and logRunning
-            and (method == "FireServer" or method == "InvokeServer") then
-            lastActivityTime = os.clock()
-        end
-        return old(self, ...)
-    end)
-end)
-
-conns[#conns + 1] = RunService.Heartbeat:Connect(function()
-    if killed or not logRunning then return end
-    local root, hum = getRoot()
-    if not root then wLastPos = nil return end
-
-    local pos = root.Position
-
-    if wLastPos and (pos - wLastPos).Magnitude >= TELEPORT_DIST then
-        local e, d = nearestEnemy(pos)
-        logLine("TELEPORT", string.format("%s -> %s (%.0f studs) | nearest enemy: %s (%.1f away)",
-            fmtV(wLastPos), fmtV(pos), (pos - wLastPos).Magnitude,
-            e and e.model.Name or "none", d or 0))
-    end
-    wLastPos = pos
-
-    local gm, gd = nearestValidMob(pos)
-    if gm and gd < GOODPOS_MIN_DIST then
-        lastGoodPos  = pos
-        lastGoodTime = os.clock()
-    end
-
-    -- Remember the last mob we were fighting, for the freeze fallback.
-    if gm and gd and gd < 40 then
-        lastMobPos  = gm.root.Position
-        lastMobTime = os.clock()
-    end
-
-    if not wLastMoveCheckPos or (pos - wLastMoveCheckPos).Magnitude > STUCK_MOVE then
-        wLastMoveCheckPos, wLastMoveTime = pos, os.clock()
-    elseif os.clock() - wLastMoveTime >= STUCK_SECONDS
-        and os.clock() - wLastStuckLog > 5
-        and os.clock() - lastActivityTime >= RECOVER_LOG_SILENCE then
-        wLastStuckLog = os.clock()
-
-        local e, d = nearestEnemy(pos)
-        local info = string.format(
-            "not moving for %ds | pos %s | state %s | anchored %s | WalkSpeed %s | health %s",
-            STUCK_SECONDS, fmtV(pos),
-            hum and tostring(hum:GetState()) or "?",
-            tostring(root.Anchored),
-            hum and tostring(hum.WalkSpeed) or "?",
-            hum and string.format("%.0f/%.0f", hum.Health, hum.MaxHealth) or "?")
-        if e then
-            info = info .. string.format(" | nearest enemy %s %.1f studs away, hp %.0f, parent %s",
-                e.model.Name, d, e.hum.Health,
-                e.model.Parent and e.model.Parent.Name or "nil")
-        else
-            info = info .. " | NO living enemies found in workspace"
-        end
-        logLine("STUCK?", info)
-
-        if AUTO_RECOVER then
-            local sinceStart = os.clock() - logT0
-            local sinceLast  = os.clock() - lastAutoRecover
-
-            if sinceStart < STARTUP_GRACE then
-                logLine("RECOVER", string.format(
-                    "skipped (startup grace, %.1fs left)", STARTUP_GRACE - sinceStart))
-            elseif sinceLast < STUCK_TELEPORT_COOLDOWN then
-                logLine("RECOVER", string.format(
-                    "skipped (cooldown, %.1fs left)", STUCK_TELEPORT_COOLDOWN - sinceLast))
+                task.wait(0.2)
             else
-                local mob, mobDist = nearestValidMob(pos)
-                if not mob then
-                    if lastGoodPos and (os.clock() - lastGoodTime) < GOODPOS_MAX_AGE then
-                        root.CFrame = CFrame.new(lastGoodPos + Vector3.new(0, 3, 0))
-                        root.AssemblyLinearVelocity = Vector3.zero
-                        lastAutoRecover = os.clock()
-                        autoRecovers = autoRecovers + 1
-                        logLine("RECOVER", string.format(
-                            "no mobs nearby -> returned to last good spot %s (%.0fs ago) | attempt #%d",
-                            fmtV(lastGoodPos), os.clock() - lastGoodTime, autoRecovers))
-                    else
-                        logLine("RECOVER", "no valid mob and no recent good position")
+                bossMissingSince = nil
+                boss = liveBoss
+                bossName = boss.Name
+            end
+            if not liveBoss then
+                continue
+            end
+
+            local _, root = getRoot()
+            local targetRoot = modelRootPart(boss)
+            if not root or not targetRoot then
+                if os.clock() - lastMissingTargetWarning > 3 then
+                    lastMissingTargetWarning = os.clock()
+                    warn("[TheForest] Boss is present, but its root/character is not available yet.")
+                end
+                task.wait(0.25)
+            else
+                placeAboveBehindBoss(boss)
+                local axe = equipAxe()
+                if axe then
+                    -- Use the equipped tool's normal activation. If Activate is
+                    -- unavailable in this executor/tool, fall back to a normal
+                    -- virtual left-click rather than guessing a boss remote.
+                    local activated = pcall(function()
+                        axe:Activate()
+                    end)
+                    if not activated then
+                        pcall(function()
+                            VirtualUser:CaptureController()
+                            VirtualUser:ClickButton1(Vector2.new(800, 400))
+                        end)
                     end
-                elseif mobDist > STUCK_TELEPORT_MAXDIST then
-                    logLine("RECOVER", string.format(
-                        "skipped (nearest valid mob %s too far: %.0f > %d)",
-                        mob.model.Name, mobDist, STUCK_TELEPORT_MAXDIST))
+                elseif os.clock() - lastToolWarning > 3 then
+                    lastToolWarning = os.clock()
+                    warn("[TheForest] Boss is alive, but no Axe Tool was found in Character or Backpack.")
+                end
+                task.wait(0.18)
+            end
+        end
+        return "stopped"
+    end
+
+    local function stepFarm()
+        if not Remotes or not farmActive() or Game.busy then
+            return
+        end
+        if not getRoot() then
+            return
+        end
+        Game.busy = true
+        local ok, err = pcall(function()
+            local areaState = readAreaHudState()
+            local areaKey = areaState.key
+
+            if Game.currentAreaKey ~= areaKey then
+                Game.currentAreaKey = areaKey
+                Game.areaCompleteKey = nil
+                Game.areaCompletedAt = nil
+                Game.bossDefeatedKey = nil
+                Game.cachedBoss = nil
+                Game.lastBossScanAt = 0
+                Game.lastBossNotice = nil
+                Game.areaBossName = areaState.bossName
+            elseif areaState.bossName then
+                Game.areaBossName = areaState.bossName
+            end
+
+            -- A real progress percentage is the primary gate. If the HUD doesn't
+            -- expose it, retain the old no-tree wait instead of falsely claiming
+            -- the zone reached 100%.
+            if areaState.percent ~= nil then
+                local rounded = math.floor(areaState.percent * 10 + 0.5) / 10
+                if Game.lastProgressReport ~= tostring(areaKey) .. "=" .. tostring(rounded) then
+                    Game.lastProgressReport = tostring(areaKey) .. "=" .. tostring(rounded)
+                    Game.status = zoneLabel(Flags.Zone) .. " progress: " .. tostring(rounded) .. "%"
+                end
+                if areaState.percent >= 99.9 and Game.areaCompleteKey ~= areaKey then
+                    Game.areaCompleteKey = areaKey
+                    Game.areaCompletedAt = os.clock()
+                    Game.bossDefeatedKey = nil
+                    Game.cachedBoss = nil
+                    Game.lastBossScanAt = 0
+                    Game.lastBossNotice = nil
+                    notify(zoneLabel(Flags.Zone) .. " reached " .. tostring(rounded) .. "% cleared. Auto Chop paused for the boss encounter.")
+                elseif areaState.percent < 99.9 and Game.areaCompleteKey == areaKey then
+                    -- The area progress reset, or a new clear cycle began.
+                    Game.areaCompleteKey = nil
+                    Game.areaCompletedAt = nil
+                    Game.bossDefeatedKey = nil
+                    Game.cachedBoss = nil
+                    Game.lastBossNotice = nil
+                end
+            end
+
+            -- Once this area's HUD reaches 100%, pause tree chopping and wait for
+            -- the boss named by the HUD. After its defeat, remain paused until the
+            -- progress resets or the AREA n/total marker changes.
+            if Game.areaCompleteKey == areaKey then
+                if Game.bossDefeatedKey == areaKey then
+                    Game.status = "Area complete; boss defeated; Auto Chop paused"
+                    return
+                end
+
+                if os.clock() - Game.lastBossScanAt >= 0.5 then
+                    Game.lastBossScanAt = os.clock()
+                    Game.cachedBoss = findActiveBoss(Game.areaBossName)
+                elseif Game.cachedBoss and not Game.cachedBoss.Parent then
+                    Game.cachedBoss = nil
+                end
+
+                local boss = Game.cachedBoss
+                if boss then
+                    if Game.lastBossNotice ~= boss then
+                        Game.lastBossNotice = boss
+                        notify("Boss detected: " .. tostring(boss.Name) .. ". Starting Axe encounter.")
+                    end
+                    local outcome = runBossEncounter(boss, areaKey)
+                    if outcome == "defeated" then
+                        Game.cachedBoss = nil
+                        Game.bossDefeatedKey = areaKey
+                        Game.status = tostring(boss.Name) .. " defeated; Auto Chop paused"
+                        notify(tostring(boss.Name) .. " defeated. Auto Chop remains paused until the area changes or progress resets.")
+                    elseif outcome == "area-changed" then
+                        Game.cachedBoss = nil
+                    elseif outcome == "stopped" then
+                        Game.status = "Boss encounter paused"
+                    end
                 else
-                    local mobPos = mob.root.Position
-                    local dir = Vector3.new(pos.X - mobPos.X, 0, pos.Z - mobPos.Z)
-                    if dir.Magnitude < 0.1 then
-                        dir = Vector3.new(1, 0, 0)
-                    else
-                        dir = dir.Unit
+                    local waitingFor = Game.areaBossName and (" " .. tostring(Game.areaBossName)) or ""
+                    Game.status = "Area complete; waiting for boss" .. waitingFor
+                end
+                return
+            end
+
+            local full = carried() >= sellThreshold()
+            if Flags.AutoSell and (full or (carried() > 0 and not Flags.AutoChop and not (Flags.AutoPickup and #groundLogs() > 0))) then
+                sellLogs()
+                return
+            end
+            if Flags.AutoPickup and not full and #groundLogs() > 0 then
+                pickupLogs()
+                return
+            end
+            if Flags.AutoChop then
+                if not zoneUnlocked(Flags.Zone) then
+                    Game.status = zoneLabel(Flags.Zone) .. " is locked"
+                    return
+                end
+                if full and not Flags.AutoSell then
+                    Game.status = "Bag full"
+                    return
+                end
+                local tree = nearestTree()
+                if tree then
+                    Game.lastBossNotice = nil
+                    chopTree(tree)
+                else
+                    Game.status = "No trees in " .. zoneLabel(Flags.Zone) .. " (waiting for area progress/boss)"
+                end
+                return
+            end
+            Game.status = "Idle"
+        end)
+        Game.busy = false
+        if not ok then
+            error(err, 0)
+        end
+    end
+
+    local function stepCoins()
+        if not Remotes or not Remotes.CollectCash then 
+            return 
+        end
+        for _, spot in ipairs(sellSpots()) do
+            local folder = spot:FindFirstChild("Cash")
+            if folder then
+                for _, coin in ipairs(folder:GetChildren()) do
+                    if unloaded or not Flags.AutoCoins then 
+                        return 
                     end
-                    local targetPos = Vector3.new(
-                        mobPos.X + dir.X * STUCK_TELEPORT_RANGE,
-                        mobPos.Y + 3,
-                        mobPos.Z + dir.Z * STUCK_TELEPORT_RANGE)
-                    root.CFrame = CFrame.new(targetPos)
-                    root.AssemblyLinearVelocity = Vector3.zero
-                    lastAutoRecover = os.clock()
-                    autoRecovers = autoRecovers + 1
-                    logLine("RECOVER", string.format(
-                        "teleported to %s from %s (%.0f studs, target %s) | attempt #%d",
-                        fmtV(targetPos), mob.model.Name, mobDist,
-                        mob.model.Name, autoRecovers))
+                    if coin:GetAttribute("Owner") == LocalPlayer.UserId then
+                        pcall(function() 
+                            Remotes.CollectCash:FireServer(coin) 
+                        end)
+                    end
                 end
             end
         end
     end
-end)
 
-local function watchChar(char)
-    local hum = char:WaitForChild("Humanoid", 5)
-    if not hum then return end
-    conns[#conns + 1] = hum.StateChanged:Connect(function(_, new)
-        if not killed and logRunning then logLine("STATE", tostring(new)) end
-    end)
-    conns[#conns + 1] = hum.Died:Connect(function()
-        if not killed and logRunning then logLine("EVENT", "You died") end
-    end)
-end
-if lp.Character then task.spawn(watchChar, lp.Character) end
-conns[#conns + 1] = lp.CharacterAdded:Connect(function(c)
-    if logRunning then logLine("EVENT", "Character respawned") end
-    task.spawn(watchChar, c)
-end)
+    local function withLock(fn)
+        local started = os.clock()
+        while Game.busy and os.clock() - started < 70 and not unloaded do 
+            task.wait(0.1) 
+        end
+        if Game.busy or unloaded then 
+            return nil 
+        end
+        Game.busy = true
+        local ok, a, b = pcall(fn)
+        Game.busy = false
+        if not ok then 
+            warn(("[%s] %s"):format(GAME_NAME, tostring(a)))
+            return nil 
+        end
+        return a, b
+    end
 
-task.spawn(function()
-    while not killed do
+    local function buyAtStation(stationName, invoke)
+        local pos = stationPosition(stationName)
+        if not pos then 
+            return false 
+        end
+        return withLock(function()
+            local _, root = getRoot()
+            if not root then 
+                return false 
+            end
+            local back = root.CFrame
+            Game.status = "Buying"
+            teleport(pos + Vector3.new(0, 1, 0))
+            task.wait(0.4)
+            local result = invoke()
+            task.wait(0.2)
+            local _, r = getRoot()
+            if r and not farmActive() then 
+                r.CFrame = back 
+            end
+            return result
+        end)
+    end
+
+    local function tryBuyTool(name)
+        if not Remotes or not Remotes.BuyTool then 
+            return false 
+        end
+        local def = Config and Config.Tools and Config.Tools[name]
+        local price = def and tonumber(def.Price)
+        local station = TOOL_STATIONS[name] or ("Station_" .. name)
+        if name == "Dynamite" then 
+            station = "Station_Explosives" 
+        end
+        if not price or toolOwned(name) or cashValue() < price or not stationPosition(station) then 
+            return false 
+        end
+        if def.RequiresItem and backpackLevel() <= 0 then 
+            return false 
+        end
+        
+        return buyAtStation(station, function()
+            local ok, result = pcall(Remotes.BuyTool.InvokeServer, Remotes.BuyTool, name)
+            if ok and type(result) == "table" and result.Ok then
+                Game.bought += 1
+                notify("Bought " .. tostring(def.DisplayName or name))
+                return true
+            end
+            return false
+        end)
+    end
+
+    local function tryBuyUpgrade(id)
+        if not Remotes or not Remotes.BuyUpgrade then 
+            return false 
+        end
+        local price, item = nextUpgradePrice(id)
+        local _, section = upgradeDef(id)
+        local needs = section and section.Requires
+        if price and item and cashValue() >= price and (not needs or toolOwned(needs)) then
+            local level = LocalPlayer:GetAttribute("Up_" .. id)
+            Remotes.BuyUpgrade:FireServer(id)
+            task.wait(0.5)
+            if LocalPlayer:GetAttribute("Up_" .. id) ~= level then 
+                Game.bought += 1
+                return true
+            end
+        end
+        return false
+    end
+
+    local function tryBuyBackpack()
+        if not Remotes or not Remotes.BuyUpgrade then 
+            return false 
+        end
+        local price = nextUpgradePrice("GearBackpack")
+        if not price or cashValue() < price then 
+            return false 
+        end
+        local level = backpackLevel()
+        return buyAtStation("Station_Backpack", function()
+            Remotes.BuyUpgrade:FireServer("GearBackpack")
+            task.wait(0.5)
+            if backpackLevel() > level then 
+                Game.bought += 1
+                notify("Backpack upgraded")
+                return true
+            end
+            return false
+        end)
+    end
+
+    local function tryBuyCar(id)
+        if not Remotes or not Remotes.BuyVehicle then 
+            return false 
+        end
+        local map = workspace:FindFirstChild("Map")
+        local garage = map and map:FindFirstChild("Garage")
+        local enter = garage and garage:FindFirstChild("Enter")
+        local pos = partPosition(enter)
+        if not pos then 
+            return false 
+        end
+        
+        local def = vehicleDef(id)
+        local state = Game.carBuys[id] or 0
+        local have = def and (def.Currency == "Gems" and gemsValue() or cashValue()) or 0
+        
+        if def and state >= 3 and have >= def.Price then 
+            Game.carBuys[id] = 0 
+            state = 0 
+        end
+        if def and state >= 0 and state < 3 then
+            if (def.Currency == "Coins" or def.Currency == "Gems") and have >= def.Price then
+                local bought = withLock(function()
+                    Game.status = "Buying " .. id
+                    teleport(pos + Vector3.new(0, 3, 0))
+                    task.wait(0.4)
+                    local ok, result = pcall(Remotes.BuyVehicle.InvokeServer, Remotes.BuyVehicle, id)
+                    if ok and (result == true or (type(result) == "table" and result.Ok)) then
+                        Game.carBuys[id] = -1
+                        Game.bought += 1
+                        notify("Bought " .. id)
+                        return true
+                    else
+                        Game.carBuys[id] = state + 1
+                    end
+                    return false
+                end)
+                return bought
+            end
+        end
+        return false
+    end
+
+    local function stepBuyer()
+        if Game.busy or unloaded then 
+            return 
+        end
+        
+        if Flags.AutoTools then
+            for name, active in pairs(Flags.BuyTools) do
+                if active then
+                    if tryBuyTool(name) then 
+                        return 
+                    end
+                end
+            end
+        end
+        
+        if Flags.AutoUpgrades then
+            for id, active in pairs(Flags.BuyUpgrades) do
+                if active then
+                    if tryBuyUpgrade(id) then 
+                        return 
+                    end
+                end
+            end
+        end
+        
+        if Flags.AutoBackpack then
+            if tryBuyBackpack() then 
+                return 
+            end
+        end
+        
+        if Flags.AutoCars then
+            for id, active in pairs(Flags.BuyCars) do
+                if active then
+                    if tryBuyCar(id) then 
+                        return 
+                    end
+                end
+            end
+        end
+
+        if Flags.AutoDynamite then
+            if tryBuyTool("Dynamite") then 
+                return 
+            end
+        end
+        
+        if Flags.AutoClasses and next(Flags.BuyClasses) then
+            local stand = workspace:FindFirstChild("Lobby") and workspace.Lobby:FindFirstChild("LobbyClassStand")
+            if stand and Remotes and Remotes.BuyClass then
+                for id, active in pairs(Flags.BuyClasses) do
+                    if active then
+                        local price = tonumber(Config.Classes.Stock.Prices[id])
+                        local restock = tostring(workspace:GetAttribute("ClassRestockAt"))
+                        if price and not classOwned(id) and classInStock(id) and gemsValue() >= price and LobbyState.classTries[id .. restock] == nil then
+                            local bought = withLock(function()
+                                local _, root = getRoot()
+                                local back = root and root.CFrame
+                                Game.status = "Buying class " .. id
+                                teleport(stand:GetPivot().Position + Vector3.new(0, 4, 0))
+                                task.wait(0.5)
+                                local ok, result = pcall(Remotes.BuyClass.InvokeServer, Remotes.BuyClass, id)
+                                if ok and type(result) == "table" and result.Ok then
+                                    Game.bought += 1 
+                                    notify("Bought class " .. id)
+                                    return true
+                                else
+                                    LobbyState.classTries[id .. restock] = true
+                                end
+                                local _, r = getRoot()
+                                if r and back then 
+                                    r.CFrame = back 
+                                end
+                                return false
+                            end)
+                            if bought then 
+                                return 
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        if Flags.AutoGemPerks and next(Flags.BuyGemPerks) then
+            if Remotes and Remotes.BuyGemPerk and Config and Config.Shop then
+                for id, active in pairs(Flags.BuyGemPerks) do
+                    if active then
+                        for _, perk in ipairs(Config.Shop.Perks) do
+                            if perk.Id == id then
+                                local level = math.floor(tonumber(LocalPlayer:GetAttribute("GemPerk_" .. id)) or 0)
+                                local price = perk.Prices[level + 1]
+                                if price and gemsValue() >= price then
+                                    local ok, result = pcall(Remotes.BuyGemPerk.InvokeServer, Remotes.BuyGemPerk, id)
+                                    if ok and type(result) == "table" and result.Ok then 
+                                        Game.bought += 1 
+                                        task.wait(0.5)
+                                        return 
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    --=============================================================================
+    -- Lobby
+    --=============================================================================
+
+    local LobbyState = { saves = {}, pad = nil, joining = false, classTries = {}, onSavesChanged = nil }
+
+    local function inLobby()
+        local lobby = workspace:FindFirstChild("Lobby")
+        return LobbyRemotes ~= nil and lobby ~= nil and lobby:FindFirstChild("LobbyPads") ~= nil
+    end
+
+    local function playerWins() 
+        return tonumber(LocalPlayer:GetAttribute("Wins")) or 0 
+    end
+
+    local function difficultyWins(name)
+        for _, d in ipairs((LobbyConfig and LobbyConfig.Difficulties) or {}) do
+            if d.Name == name then 
+                return d.Wins or 0 
+            end
+        end
+        return 0
+    end
+
+    local function idlePad()
+        local pads = workspace.Lobby.LobbyPads
+        for i = 1, 8 do
+            local pad = pads:FindFirstChild("Pad" .. i)
+            if pad and pad:GetAttribute("Status") == "Idle" then 
+                return pad 
+            end
+        end
+        return nil
+    end
+
+    local function enterPad()
+        local pad = idlePad()
+        local floor = pad and pad:FindFirstChild("Floor")
+        if not floor then 
+            return nil 
+        end
+        LobbyState.pad = nil
+        teleport(floor.Position + Vector3.new(0, 4, 0))
+        local started = os.clock()
+        while not LobbyState.pad and os.clock() - started < 6 and not unloaded do 
+            task.wait(0.1) 
+        end
+        return LobbyState.pad
+    end
+
+    local function leavePad(padId)
+        if padId and LobbyRemotes and LobbyRemotes.CancelParty then
+            pcall(function() 
+                LobbyRemotes.CancelParty:FireServer(padId) 
+            end)
+        end
+        local _, root = getRoot()
+        if root then 
+            root.CFrame = root.CFrame + Vector3.new(0, 25, 0) 
+        end
+        local gui = LocalPlayer:FindFirstChild("PlayerGui") and LocalPlayer.PlayerGui:FindFirstChild("LobbyParty")
+        if gui then 
+            gui.Enabled = false 
+        end
+    end
+
+    local function onOpenCreate(padId, info)
+        if type(padId) == "string" then 
+            LobbyState.pad = padId 
+        end
+    end
+
+    local function saveLabel(entry)
+        local felled = math.floor(tonumber(entry.Felled) or 0)
+        return string.format("%s %s - %d trees (%s)", tostring(entry.Map or "Forest"), tostring(entry.Difficulty or "?"), felled, tostring(entry.Key))
+    end
+
+    local function onSaves(_, list)
+        if type(list) ~= "table" then 
+            return 
+        end
+        table.clear(LobbyState.saves)
+        for _, entry in ipairs(list) do
+            if type(entry) == "table" and entry.Key then
+                table.insert(LobbyState.saves, { label = saveLabel(entry), key = entry.Key })
+            end
+        end
+        if LobbyState.onSavesChanged then 
+            LobbyState.onSavesChanged() 
+        end
+    end
+
+    local function refreshSaves()
+        if not inLobby() or LobbyState.joining then 
+            return false 
+        end
+        return withLock(function()
+            Game.status = "Reading saved runs"
+            local padId = enterPad()
+            if padId then 
+                task.wait(1.5) 
+            end
+            leavePad(padId)
+            Game.status = "Idle"
+            return padId ~= nil
+        end)
+    end
+
+    local function joinRun(saveKey)
+        if not inLobby() or LobbyState.joining then 
+            return false 
+        end
+        return withLock(function()
+            LobbyState.joining = true
+            Game.status = saveKey and "Loading saved run" or "Creating run"
+            local padId = enterPad()
+            local ok, result = false, nil
+            if padId then
+                if saveKey and LobbyRemotes.LoadParty then
+                    ok, result = pcall(LobbyRemotes.LoadParty.InvokeServer, LobbyRemotes.LoadParty, padId, saveKey)
+                elseif LobbyRemotes.CreateParty then
+                    local diff = Flags.Difficulty
+                    if difficultyWins(diff) > playerWins() then 
+                        diff = "NORMAL" 
+                    end
+                    local size = math.clamp(math.floor(tonumber(Flags.PartySize) or 1), 1, (LobbyConfig and LobbyConfig.MaxParty) or 4)
+                    ok, result = pcall(LobbyRemotes.CreateParty.InvokeServer, LobbyRemotes.CreateParty, padId, diff, size, "Forest")
+                end
+            end
+            local success = ok and type(result) == "table" and result.Ok == true
+            if success then
+                Game.status = "Waiting for teleport"
+                local gui = LocalPlayer:FindFirstChild("PlayerGui") and LocalPlayer.PlayerGui:FindFirstChild("LobbyParty")
+                if gui then 
+                    gui.Enabled = false 
+                end
+                LobbyState.joining = false
+            else
+                Game.status = "Join failed: " .. tostring(type(result) == "table" and result.Why or result)
+                leavePad(padId)
+                LobbyState.joining = false
+            end
+            return success
+        end)
+    end
+
+    local function stepAutoJoin()
+        if not inLobby() or LobbyState.joining then 
+            return 
+        end
+        joinRun(nil)
         task.wait(5)
-        if killed then break end
-        flushLog()
-    end
-end)
-
--- GUI REFRESH
-local function refreshFreezeGui()
-    local r = getRoot()
-    if freezeEnabled then
-        dot.BackgroundColor3 = Color3.fromRGB(70, 220, 100)
-        mainLabel.Text = "Fall Freeze: ON"
-    else
-        dot.BackgroundColor3 = Color3.fromRGB(230, 70, 70)
-        mainLabel.Text = "Fall Freeze: OFF"
     end
 
-    if not r then
-        stateLabel.Text = "State: no character"
-        stateLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
-        posLabel.Text = "Y: --"
-    else
-        if anchored then
-            local left = math.max(0, SETTLE_AFTER - (os.clock() - frozenAt))
-            stateLabel.Text = string.format("State: FROZEN (floor check in %.1fs)", left)
-            stateLabel.TextColor3 = Color3.fromRGB(255, 190, 80)
-        elseif freezeEnabled then
-            stateLabel.Text = "State: watching"
-            stateLabel.TextColor3 = Color3.fromRGB(120, 190, 255)
-        else
-            stateLabel.Text = "State: paused"
-            stateLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
+    local function stepDaily()
+        if not inLobby() then 
+            return 
         end
-        local p, v = r.Position, r.AssemblyLinearVelocity
-        posLabel.Text = string.format("Pos: %.0f, %.1f, %.0f   fall speed: %.0f",
-            p.X, p.Y, p.Z, v.Y)
-    end
-    statLabel.Text = string.format("Falls caught: %d   Floor placements: %d", catches, settles)
-end
-
-local function refreshLogGui()
-    if logRunning then
-        wDot.BackgroundColor3 = Color3.fromRGB(70, 220, 100)
-        wMain.Text = string.format("Activity Log: RUNNING  (%d lines)", logLineCount)
-    else
-        wDot.BackgroundColor3 = Color3.fromRGB(230, 70, 70)
-        wMain.Text = string.format("Activity Log: PAUSED  (%d lines)", logLineCount)
-    end
-    wRecover.Text = string.format("Auto-recover: %d   (range %d studs)", autoRecovers, STUCK_TELEPORT_RANGE)
-
-    local tail = {}
-    local startIdx = math.max(1, #logBuffer - 2)
-    for i = startIdx, #logBuffer do tail[#tail + 1] = logBuffer[i] end
-    wLast.Text = #tail > 0 and table.concat(tail, "\n") or "(no output yet)"
-
-    if lastMobSeen ~= "" then
-        wMobs.Text = string.format("Mobs known: %d   (last: %s)", knownMobsCount, lastMobSeen)
-    else
-        wMobs.Text = string.format("Mobs known: %d", knownMobsCount)
-    end
-end
-
-task.spawn(function()
-    while not killed do
-        task.wait(0.1)
-        if killed then break end
-        pcall(refreshFreezeGui)
-        pcall(refreshLogGui)
-    end
-end)
-
--- KILL
-local function kill()
-    if killed then return end
-    killed = true
-    logRunning    = false
-    freezeEnabled = false
-    release(getRoot())
-    for _, c in ipairs(conns) do c:Disconnect() end
-    table.clear(conns)
-    flushLog()
-    dot.BackgroundColor3 = Color3.fromRGB(150, 150, 150)
-    mainLabel.Text = "Killed"
-    wDot.BackgroundColor3 = Color3.fromRGB(150, 150, 150)
-    wMain.Text = "Activity Log: STOPPED"
-    task.delay(1.2, function() gui:Destroy() end)
-    print("[FarmAssist] Killed.")
-end
-if getgenv then
-    getgenv().FallFreeze.kill   = kill
-    getgenv().ActivityLog.stop  = kill
-end
-
-conns[#conns + 1] = UserInputService.InputBegan:Connect(function(input)
-    if killed or UserInputService:GetFocusedTextBox() then return end
-    if input.KeyCode == TOGGLE_KEY then
-        local newState = not (freezeEnabled and logRunning)
-        freezeEnabled = newState
-        logRunning    = newState
-        if newState then
-            lastActivityTime  = os.clock()
-            wLastMoveCheckPos = nil
-            wLastPos          = nil
-            wLastStuckLog     = 0
-            pushFreezeLog("enabled (freeze + log)")
-        else
-            release(getRoot())
-            pushFreezeLog("paused (freeze + log)")
+        local today = math.floor(workspace:GetServerTimeNow() / 86400)
+        if (tonumber(LocalPlayer:GetAttribute("DailyDay")) or 0) >= today then 
+            return 
         end
-    elseif input.KeyCode == KILL_KEY then
-        kill()
+        local booth = workspace.Lobby:FindFirstChild("RewardBooth")
+        local zone = booth and booth:FindFirstChild("DailyReward") and booth.DailyReward:FindFirstChild("Zone")
+        if not zone then 
+            return 
+        end
+        withLock(function()
+            local _, root = getRoot()
+            local back = root and root.CFrame
+            Game.status = "Claiming daily"
+            local started = os.clock()
+            while os.clock() - started < 6 and not unloaded and (tonumber(LocalPlayer:GetAttribute("DailyDay")) or 0) < today do
+                teleport(zone.Position + Vector3.new(0, 3, 0))
+                task.wait(0.3)
+            end
+            if (tonumber(LocalPlayer:GetAttribute("DailyDay")) or 0) >= today then 
+                notify("Daily reward claimed") 
+            end
+            local _, r = getRoot()
+            if r and back then 
+                r.CFrame = back 
+            end
+            Game.status = "Idle"
+        end)
     end
-end)
 
-pushFreezeLog("loaded")
-logLine("INFO", string.format(
-    "FarmAssist loaded. F7 = toggle both. = = kill. Auto-recover = %s. Mobs known: %d.",
-    AUTO_RECOVER and "on" or "off", knownMobsCount))
+    local function classOwned(id)
+        local owned = "," .. tostring(LocalPlayer:GetAttribute("ClassesOwned") or "") .. ","
+        return string.find(owned, "," .. id .. ",", 1, true) ~= nil
+    end
+
+    local function classInStock(id)
+        local stock = "," .. tostring(workspace:GetAttribute("ClassStock") or "") .. ","
+        return string.find(stock, "," .. id .. ",", 1, true) ~= nil
+    end
+
+    --=============================================================================
+    -- Worker registry
+    --=============================================================================
+
+    local WORKER_STEPS = {
+        AutoCoins = { 1, stepCoins },
+        AutoJoin = { 2, stepAutoJoin },
+        AutoDaily = { 10, stepDaily },
+    }
+
+    local FARM_KEYS = { AutoChop = true, AutoPickup = true, AutoSell = true }
+    local BUY_KEYS = { AutoTools = true, AutoUpgrades = true, AutoBackpack = true, AutoCars = true, AutoDynamite = true, AutoClasses = true, AutoGemPerks = true }
+    local Setters = {}
+
+    function Setters.feature(key, value)
+        Flags[key] = value == true
+        saveConfig()
+        if FARM_KEYS[key] then
+            setWorker("Farm", farmActive(), 0.1, stepFarm)
+            if not farmActive() then 
+                Game.status = "Idle" 
+            end
+            return
+        end
+        if BUY_KEYS[key] then
+            local anyBuy = false
+            for k in pairs(BUY_KEYS) do 
+                if Flags[k] then 
+                    anyBuy = true 
+                end 
+            end
+            setWorker("Buyer", anyBuy, 2, stepBuyer)
+            return
+        end
+        local spec = WORKER_STEPS[key]
+        if spec then 
+            setWorker(key, Flags[key], spec[1], spec[2]) 
+        end
+    end
+
+    --=============================================================================
+    -- Player / client feature state
+    --=============================================================================
+
+    local walkSpeedRestore = {}
+    local noclipRestore = {}
+    local promptRestore = {}
+    local fpsRestore = {}
+    local flyState = nil
+    local infJumpConn, noclipConn, promptConn, fpsConn, antiAfkConn = nil, nil, nil, nil, nil
+    local antiAfkLast = 0
+    local reconnectConn, reconnectFailedConn = nil, nil
+    local reconnectToken = 0
+    local gameplayPauseConn = nil
+    local renderBacking = nil
+    local cursorBound = false
+    local menuCursor = nil
+    local window = nil
+
+    local function applyWalkSpeed()
+        local humanoid = select(1, getRoot())
+        if not humanoid then 
+            return 
+        end
+        if Flags.WalkSpeedEnabled then
+            if walkSpeedRestore[humanoid] == nil then 
+                walkSpeedRestore[humanoid] = humanoid.WalkSpeed 
+            end
+            humanoid.WalkSpeed = Flags.WalkSpeed
+        elseif walkSpeedRestore[humanoid] ~= nil then
+            humanoid.WalkSpeed = walkSpeedRestore[humanoid]
+            walkSpeedRestore[humanoid] = nil
+        end
+    end
+
+    local function setWalkSpeedEnabled(value) 
+        Flags.WalkSpeedEnabled = value == true 
+        applyWalkSpeed() 
+        saveConfig() 
+    end
+
+    local function setWalkSpeed(value) 
+        Flags.WalkSpeed = tonumber(value) or Flags.WalkSpeed 
+        if Flags.WalkSpeedEnabled then 
+            applyWalkSpeed() 
+        end 
+        saveConfig() 
+    end
+
+    local function setInfJump(value)
+        Flags.InfJump = value == true
+        if infJumpConn then 
+            infJumpConn:Disconnect() 
+            infJumpConn = nil 
+        end
+        if not Flags.InfJump then 
+            return 
+        end
+        infJumpConn = bind(UserInputService.JumpRequest, function()
+            if unloaded or not Flags.InfJump then 
+                return 
+            end
+            local humanoid = select(1, getRoot())
+            if humanoid then 
+                humanoid:ChangeState(Enum.HumanoidStateType.Jumping) 
+            end
+        end)
+    end
+
+    local function setNoClip(value)
+        Flags.NoClip = value == true
+        if noclipConn then 
+            noclipConn:Disconnect() 
+            noclipConn = nil 
+        end
+        if not Flags.NoClip then
+            for part, canCollide in pairs(noclipRestore) do 
+                if part.Parent then 
+                    part.CanCollide = canCollide 
+                end 
+            end
+            table.clear(noclipRestore)
+            return
+        end
+        noclipConn = bind(RunService.Stepped, function()
+            if unloaded or not Flags.NoClip then 
+                return 
+            end
+            local character = LocalPlayer.Character
+            if not character then 
+                return 
+            end
+            for _, part in ipairs(character:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    if noclipRestore[part] == nil then 
+                        noclipRestore[part] = part.CanCollide 
+                    end
+                    part.CanCollide = false
+                end
+            end
+        end)
+    end
+
+    local function snapshotPrompt(prompt)
+        if promptRestore[prompt] == nil then
+            promptRestore[prompt] = { 
+                HoldDuration = prompt.HoldDuration, 
+                MaxActivationDistance = prompt.MaxActivationDistance, 
+                RequiresLineOfSight = prompt.RequiresLineOfSight 
+            }
+        end
+        prompt.HoldDuration = 0
+        prompt.MaxActivationDistance = 50
+        prompt.RequiresLineOfSight = false
+    end
+
+    local function setInstantProximityPrompt(value)
+        Flags.InstantProximityPrompt = value == true
+        if promptConn then 
+            promptConn:Disconnect() 
+            promptConn = nil 
+        end
+        if not Flags.InstantProximityPrompt then
+            for prompt, prev in pairs(promptRestore) do
+                if prompt.Parent then
+                    prompt.HoldDuration = prev.HoldDuration
+                    prompt.MaxActivationDistance = prev.MaxActivationDistance
+                    prompt.RequiresLineOfSight = prev.RequiresLineOfSight
+                end
+            end
+            table.clear(promptRestore)
+            return
+        end
+        for _, inst in ipairs(workspace:GetDescendants()) do 
+            if inst:IsA("ProximityPrompt") then 
+                snapshotPrompt(inst) 
+            end 
+        end
+        promptConn = bind(workspace.DescendantAdded, function(inst)
+            if unloaded or not Flags.InstantProximityPrompt then 
+                return 
+            end
+            if inst:IsA("ProximityPrompt") then 
+                snapshotPrompt(inst) 
+            end
+        end)
+    end
+
+    local function stopFly()
+        if flyState and flyState.conn then 
+            flyState.conn:Disconnect() 
+        end
+        local humanoid = flyState and flyState.humanoid
+        if humanoid and humanoid.Parent and flyState and flyState.platformStand ~= nil then 
+            humanoid.PlatformStand = flyState.platformStand 
+        end
+        flyState = nil
+    end
+
+    local function setFly(value)
+        Flags.Fly = value == true
+        stopFly()
+        if not Flags.Fly then 
+            return 
+        end
+        local humanoid, root = getRoot()
+        if not (humanoid and root) then 
+            return 
+        end
+        flyState = { humanoid = humanoid, root = root, platformStand = humanoid.PlatformStand }
+        humanoid.PlatformStand = true
+        flyState.conn = bind(RunService.RenderStepped, function()
+            if unloaded or not Flags.Fly then 
+                return 
+            end
+            if UserInputService:GetFocusedTextBox() then 
+                return 
+            end
+            local hum, hrp = getRoot()
+            if not (hum and hrp) then 
+                return 
+            end
+            local cam = workspace.CurrentCamera
+            if not cam then 
+                return 
+            end
+            local move = Vector3.zero
+            if UserInputService:IsKeyDown(Enum.KeyCode.W) then 
+                move += cam.CFrame.LookVector 
+            end
+            if UserInputService:IsKeyDown(Enum.KeyCode.S) then 
+                move -= cam.CFrame.LookVector 
+            end
+            if UserInputService:IsKeyDown(Enum.KeyCode.A) then 
+                move -= cam.CFrame.RightVector 
+            end
+            if UserInputService:IsKeyDown(Enum.KeyCode.D) then 
+                move += cam.CFrame.RightVector 
+            end
+            if UserInputService:IsKeyDown(Enum.KeyCode.Space) then 
+                move += Vector3.yAxis 
+            end
+            if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then 
+                move -= Vector3.yAxis 
+            end
+            if move.Magnitude > 0 then 
+                hrp.AssemblyLinearVelocity = move.Unit * Flags.FlySpeed 
+            else 
+                hrp.AssemblyLinearVelocity = Vector3.zero 
+            end
+            hum.PlatformStand = true
+        end)
+    end
+
+    local function setFlySpeed(value) 
+        Flags.FlySpeed = tonumber(value) or Flags.FlySpeed 
+        saveConfig() 
+    end
+
+    local function setNoGameplayPaused(value)
+        Flags.AntiGameplayPause = value == true
+        if gameplayPauseConn then 
+            gameplayPauseConn:Disconnect() 
+            gameplayPauseConn = nil 
+        end
+        if not Flags.AntiGameplayPause then 
+            return 
+        end
+        pcall(function() 
+            StarterGui:SetCore("ResetButtonCallback", true) 
+        end)
+        gameplayPauseConn = bind(GuiService.MenuOpened, function()
+            if unloaded or not Flags.AntiGameplayPause then 
+                return 
+            end
+            pcall(function() 
+                GuiService.SelectedObject = nil 
+            end)
+        end)
+    end
+
+    local function setAutoReconnect(value)
+        Flags.AutoReconnect = value == true
+        if reconnectConn then 
+            reconnectConn:Disconnect() 
+            reconnectConn = nil 
+        end
+        if reconnectFailedConn then 
+            reconnectFailedConn:Disconnect() 
+            reconnectFailedConn = nil 
+        end
+        if not Flags.AutoReconnect then 
+            reconnectToken += 1 
+            return 
+        end
+        -- Some executors cannot connect to ErrorMessageChanged because it
+        -- requires RobloxScript capability. Treat it as an optional signal so
+        -- a restricted connection cannot abort the whole script on startup.
+        local errorSignalOk, errorSignal = pcall(function()
+            return GuiService.ErrorMessageChanged
+        end)
+        if errorSignalOk and errorSignal then
+            local connectOk, connectionOrErr = pcall(function()
+                return bind(errorSignal, function()
+                    if unloaded or not Flags.AutoReconnect then
+                        return
+                    end
+                    local token = reconnectToken + 1
+                    reconnectToken = token
+                    task.delay(1.5, function()
+                        if unloaded or not Flags.AutoReconnect or reconnectToken ~= token then
+                            return
+                        end
+                        pcall(function()
+                            TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+                        end)
+                    end)
+                end)
+            end)
+            if connectOk then
+                reconnectConn = connectionOrErr
+            else
+                warn("[TheForest] Auto Reconnect: ErrorMessageChanged is unavailable in this executor; using teleport-failure fallback.")
+            end
+        else
+            warn("[TheForest] Auto Reconnect: ErrorMessageChanged is unavailable; using teleport-failure fallback.")
+        end
+
+        -- Keep the supported teleport-failure fallback, but guard it too so
+        -- an executor limitation in this optional feature cannot stop startup.
+        local failedConnectOk, failedConnectionOrErr = pcall(function()
+            return bind(TeleportService.TeleportInitFailed, function(player)
+                if player ~= LocalPlayer or unloaded or not Flags.AutoReconnect then
+                    return
+                end
+                task.delay(2, function()
+                    if unloaded or not Flags.AutoReconnect then
+                        return
+                    end
+                    pcall(function()
+                        TeleportService:Teleport(game.PlaceId, LocalPlayer)
+                    end)
+                end)
+            end)
+        end)
+        if failedConnectOk then
+            reconnectFailedConn = failedConnectionOrErr
+        else
+            warn("[TheForest] Auto Reconnect fallback unavailable: " .. tostring(failedConnectionOrErr))
+        end
+    end
+
+    local function setDisable3D(value)
+        Flags.Disable3DRendering = value == true
+        if Flags.Disable3DRendering then
+            pcall(function() 
+                RunService:Set3dRenderingEnabled(false) 
+            end)
+            if not renderBacking then
+                local gui = Instance.new("ScreenGui")
+                gui.Name = "RenderBacking"
+                gui.IgnoreGuiInset = true
+                gui.DisplayOrder = -100
+                gui.ResetOnSpawn = false
+                local frame = Instance.new("Frame")
+                frame.BackgroundColor3 = Color3.new(0, 0, 0)
+                frame.Size = UDim2.fromScale(1, 1)
+                frame.BorderSizePixel = 0
+                frame.Parent = gui
+                gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+                renderBacking = gui
+            end
+        else
+            pcall(function() 
+                RunService:Set3dRenderingEnabled(true) 
+            end)
+            if renderBacking then 
+                renderBacking:Destroy() 
+                renderBacking = nil 
+            end
+        end
+    end
+
+    local function captureFps(inst)
+        if fpsRestore[inst] ~= nil then 
+            return 
+        end
+        local snap = {}
+        if inst:IsA("ParticleEmitter") or inst:IsA("Trail") or inst:IsA("Beam") or inst:IsA("Fire") or inst:IsA("Smoke") or inst:IsA("Sparkles") then
+            snap.Enabled = inst.Enabled
+            inst.Enabled = false
+        elseif inst:IsA("Explosion") then
+            snap.Visible = inst.Visible
+            inst.Visible = false
+        end
+        fpsRestore[inst] = snap
+    end
+
+    local function setFpsBoost(value)
+        Flags.FpsBoost = value == true
+        if fpsConn then 
+            fpsConn:Disconnect() 
+            fpsConn = nil 
+        end
+        if not Flags.FpsBoost then
+            for inst, snap in pairs(fpsRestore) do
+                if typeof(inst) == "Instance" and inst.Parent then
+                    for key, prev in pairs(snap) do 
+                        pcall(function() 
+                            inst[key] = prev 
+                        end) 
+                    end
+                end
+            end
+            local light = fpsRestore.Lighting
+            if light then 
+                Lighting.GlobalShadows = light.GlobalShadows
+                Lighting.FogEnd = light.FogEnd 
+            end
+            table.clear(fpsRestore)
+            return
+        end
+        if fpsRestore.Lighting == nil then
+            fpsRestore.Lighting = { GlobalShadows = Lighting.GlobalShadows, FogEnd = Lighting.FogEnd }
+            Lighting.GlobalShadows = false
+            Lighting.FogEnd = 1e6
+        end
+        for _, inst in ipairs(workspace:GetDescendants()) do 
+            captureFps(inst) 
+        end
+        fpsConn = bind(workspace.DescendantAdded, function(inst)
+            if unloaded or not Flags.FpsBoost then 
+                return 
+            end
+            captureFps(inst)
+        end)
+    end
+
+    local function pulseAntiAfk()
+        if unloaded or not Flags.AntiAfk then 
+            return 
+        end
+        local cam = workspace.CurrentCamera
+        if not cam then 
+            return 
+        end
+        pcall(function() 
+            VirtualUser:CaptureController() 
+            VirtualUser:ClickButton2(Vector2.new(), cam.CFrame) 
+        end)
+    end
+
+    local function setAntiAfk(value)
+        Flags.AntiAfk = value == true
+        if antiAfkConn then 
+            antiAfkConn:Disconnect() 
+            antiAfkConn = nil 
+        end
+        if not Flags.AntiAfk then 
+            stopWorker("AntiAfk") 
+            return 
+        end
+        antiAfkLast = os.clock()
+        antiAfkConn = bind(LocalPlayer.Idled, function() 
+            pulseAntiAfk() 
+        end)
+        startWorker("AntiAfk", 1, function()
+            if not Flags.AntiAfk then 
+                return 
+            end
+            if os.clock() - antiAfkLast >= 60 then 
+                antiAfkLast = os.clock() 
+                pulseAntiAfk() 
+            end
+        end)
+    end
+
+    local function setNoCustomCursor(value)
+        Flags.NoCustomCursor = value == true
+        if cursorBound then
+            pcall(function() 
+                RunService:UnbindFromRenderStep("OuroborosCursor") 
+            end)
+            cursorBound = false
+        end
+        if not Flags.NoCustomCursor then 
+            return 
+        end
+        cursorBound = true
+        RunService:BindToRenderStep("OuroborosCursor", Enum.RenderPriority.Last.Value + 10, function()
+            if unloaded or not Flags.NoCustomCursor then 
+                return 
+            end
+            UserInputService.MouseIconEnabled = true
+            local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+            local hud = playerGui and playerGui:FindFirstChild("ChopHud")
+            if hud then
+                for _, name in ipairs({ "Ring", "Dot" }) do
+                    local item = hud:FindFirstChild(name)
+                    if item and item:IsA("GuiObject") and item.Visible then 
+                        item.Visible = false 
+                    end
+                end
+            end
+        end)
+    end
+
+    local function menuOpen() 
+        return window ~= nil and window.Visible == true 
+    end
+
+    local function setFreeCursorMenu(value)
+        Flags.FreeCursorMenu = value == true
+        if menuCursor then
+            pcall(function() 
+                RunService:UnbindFromRenderStep("OuroborosMenuCursor") 
+            end)
+            if menuCursor.gui then 
+                menuCursor.gui:Destroy() 
+            end
+            menuCursor = nil
+        end
+        if not Flags.FreeCursorMenu then 
+            return 
+        end
+        local gui = Instance.new("ScreenGui")
+        gui.Name = "OuroborosMenuCursor"
+        gui.ResetOnSpawn = false
+        local button = Instance.new("TextButton")
+        button.BackgroundTransparency = 1
+        button.Text = ""
+        button.Size = UDim2.fromOffset(0, 0)
+        button.Modal = false
+        button.Parent = gui
+        gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+        menuCursor = { gui = gui, button = button }
+        RunService:BindToRenderStep("OuroborosMenuCursor", Enum.RenderPriority.Last.Value + 20, function()
+            if unloaded or not Flags.FreeCursorMenu or not menuCursor then 
+                return 
+            end
+            local shown = menuOpen()
+            if menuCursor.button.Modal ~= shown then 
+                menuCursor.button.Modal = shown 
+            end
+            if shown then
+                UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+                UserInputService.MouseIconEnabled = true
+            end
+        end)
+    end
+
+    local function bindCharacter(character)
+        task.defer(function()
+            if unloaded then 
+                return 
+            end
+            applyWalkSpeed()
+            if Flags.Fly then 
+                setFly(true) 
+            end
+        end)
+        local humanoid = character:FindFirstChildOfClass("Humanoid") or character:WaitForChild("Humanoid", 5)
+        if humanoid then
+            bind(humanoid:GetPropertyChangedSignal("WalkSpeed"), function()
+                if Flags.WalkSpeedEnabled and not unloaded then
+                    if humanoid.WalkSpeed ~= Flags.WalkSpeed then 
+                        humanoid.WalkSpeed = Flags.WalkSpeed 
+                    end
+                end
+            end)
+        end
+    end
+
+    --=============================================================================
+    -- Unload
+    --=============================================================================
+
+    local function stopAllFeatures()
+        for key in pairs(workers) do 
+            workers[key] = false 
+        end
+        for key in pairs(WORKER_STEPS) do 
+            Flags[key] = false 
+        end
+        for key in pairs(FARM_KEYS) do 
+            Flags[key] = false 
+        end
+        for key in pairs(BUY_KEYS) do 
+            Flags[key] = false 
+        end
+        setWalkSpeedEnabled(false)
+        setInfJump(false)
+        setNoClip(false)
+        setInstantProximityPrompt(false)
+        setFly(false)
+        setNoGameplayPaused(false)
+        setAutoReconnect(false)
+        setDisable3D(false)
+        setFpsBoost(false)
+        setAntiAfk(false)
+        setNoCustomCursor(false)
+        setFreeCursorMenu(false)
+    end
+
+    local unload = nil
+
+    --=============================================================================
+    -- Dynamic option lists
+    --=============================================================================
+
+    local LISTS = { zones = {}, tools = {}, upgrades = {}, cars = {}, classes = {}, perks = {}, diffs = {} }
+
+    pcall(function()
+        for _, key in ipairs(zoneOrder()) do 
+            table.insert(LISTS.zones, { id = key, label = zoneLabel(key) }) 
+        end
+    end)
+    if #LISTS.zones == 0 then
+        for id, label in pairs(ZONE_LABEL_FALLBACK) do 
+            table.insert(LISTS.zones, { id = id, label = label }) 
+        end
+    end
+
+    pcall(function()
+        for _, name in ipairs(Config.Tools.Order) do
+            local def = Config.Tools[name]
+            if def and tonumber(def.Price) and name ~= "Dynamite" then 
+                table.insert(LISTS.tools, { id = name, label = name }) 
+            end
+        end
+    end)
+    if #LISTS.tools == 0 then
+        for _, t in ipairs({ "Axe", "Vacuum", "Chainsaw", "Flamethrower" }) do 
+            table.insert(LISTS.tools, { id = t, label = t }) 
+        end
+    end
+
+    pcall(function()
+        for _, section in ipairs(Config.Upgrades.Sections) do
+            if not section.Hidden and not section.ComingSoon then
+                for _, item in ipairs(section.Items) do
+                    table.insert(LISTS.upgrades, { id = item.Id, label = tostring(section.DisplayName) .. ": " .. tostring(item.Name) })
+                end
+            end
+        end
+    end)
+
+    pcall(function()
+        for _, v in ipairs(Config.Vehicles.List) do
+            if v.Currency == "Coins" or v.Currency == "Gems" then
+                local label = v.Id:gsub("^Truck%d+_", "") .. " (" .. short(v.Price) .. " " .. v.Currency .. ")"
+                table.insert(LISTS.cars, { id = v.Id, label = label })
+            end
+        end
+    end)
+
+    pcall(function()
+        for _, c in ipairs(Config.Classes.List) do
+            local price = tonumber(Config.Classes.Stock.Prices[c.Id])
+            if price and price > 0 then
+                local label = tostring(c.Name) .. " (" .. tostring(c.Tier) .. ", " .. short(price) .. " gems)"
+                table.insert(LISTS.classes, { id = c.Id, label = label })
+            end
+        end
+    end)
+
+    pcall(function()
+        for _, perk in ipairs(Config.Shop.Perks) do
+            local label = (tostring(perk.Name):lower():gsub("(%a)(%w*)", function(a, b) return a:upper() .. b end))
+            table.insert(LISTS.perks, { id = perk.Id, label = label })
+        end
+    end)
+
+    pcall(function()
+        for _, d in ipairs(LobbyConfig.Difficulties) do 
+            table.insert(LISTS.diffs, { id = d.Name, label = d.Name }) 
+        end
+    end)
+    if #LISTS.diffs == 0 then
+        LISTS.diffs = { {id="NORMAL",label="NORMAL"}, {id="HARD",label="HARD"}, {id="INSANE",label="INSANE"} }
+    end
+
+    --=============================================================================
+    -- GUI Theme
+    --=============================================================================
+
+    local Theme = {
+        bg     = Color3.fromRGB(20, 20, 30),
+        panel  = Color3.fromRGB(26, 26, 38),
+        card   = Color3.fromRGB(33, 31, 45),
+        track  = Color3.fromRGB(45, 45, 60),
+        accent = Color3.fromRGB(255, 80, 140),
+        text   = Color3.fromRGB(240, 240, 255),
+        muted  = Color3.fromRGB(140, 140, 160),
+        danger = Color3.fromRGB(255, 100, 100),
+    }
+
+    local FONT      = Enum.Font.Gotham
+    local FONT_MED  = Enum.Font.GothamMedium
+    local FONT_BOLD = Enum.Font.GothamBold
+
+    --=============================================================================
+    -- GUI Primitives
+    --=============================================================================
+
+    local function new(class, props, parent)
+        local inst = Instance.new(class)
+        for k, v in pairs(props or {}) do 
+            inst[k] = v 
+        end
+        if parent then 
+            inst.Parent = parent 
+        end
+        return inst
+    end
+
+    local function corner(inst, radius) 
+        return new("UICorner", { CornerRadius = UDim.new(0, radius) }, inst) 
+    end
+
+    local guiHost = LocalPlayer:WaitForChild("PlayerGui")
+    pcall(function() 
+        if typeof(gethui) == "function" then 
+            guiHost = gethui() 
+        end 
+    end)
+    pcall(function()
+        local old = guiHost:FindFirstChild("ForestAutomation")
+        if old then 
+            old:Destroy() 
+        end
+    end)
+
+    local screenGui = new("ScreenGui", {
+        Name = "ForestAutomation", ResetOnSpawn = false, IgnoreGuiInset = true,
+        DisplayOrder = 999, ZIndexBehavior = Enum.ZIndexBehavior.Sibling, Parent = guiHost,
+    })
+
+    local popupLayer = new("Frame", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 900 }, screenGui)
+
+    local toggleBtn = new("TextButton", {
+        Size = UDim2.new(0, 48, 0, 48), Position = UDim2.new(0, 20, 1, -24), AnchorPoint = Vector2.new(0, 1),
+        BackgroundColor3 = Theme.card, Text = "≡", Font = FONT_BOLD, TextSize = 24, TextColor3 = Theme.accent, Visible = false,
+    }, screenGui)
+    corner(toggleBtn, 24)
+    new("UIStroke", { Color = Theme.accent }, toggleBtn)
+
+    window = new("Frame", {
+        Size = UDim2.new(0, 700, 0, 520), Position = UDim2.new(0.5, -350, 0.5, -260),
+        BackgroundColor3 = Theme.bg, BorderSizePixel = 0, ClipsDescendants = true,
+    }, screenGui)
+    corner(window, 14)
+    new("UIStroke", { Color = Theme.track }, window)
+
+    local titleBar = new("Frame", { Size = UDim2.new(1, 0, 0, 46), BackgroundColor3 = Theme.panel, BorderSizePixel = 0 }, window)
+    new("TextLabel", {
+        Position = UDim2.new(0, 16, 0, 0), Size = UDim2.new(0, 300, 1, 0), BackgroundTransparency = 1,
+        Text = "THE FOREST   ·   " .. SCRIPT_VERSION, Font = FONT_BOLD, TextSize = 13, TextColor3 = Theme.text,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, titleBar)
+    local closeBtn = new("TextButton", {
+        Size = UDim2.new(0, 30, 0, 30), Position = UDim2.new(1, -40, 0.5, -15),
+        BackgroundColor3 = Theme.card, Text = "X", Font = FONT_BOLD, TextSize = 13, TextColor3 = Theme.muted,
+    }, titleBar)
+    corner(closeBtn, 8)
+
+    local sidebar = new("Frame", { Size = UDim2.new(0, 140, 1, -46), Position = UDim2.new(0, 0, 0, 46), BackgroundColor3 = Theme.panel, BorderSizePixel = 0 }, window)
+    new("UIPadding", { PaddingTop = UDim.new(0, 12), PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12) }, sidebar)
+    new("UIListLayout", { Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder }, sidebar)
+
+    local content = new("Frame", { Size = UDim2.new(1, -141, 1, -46), Position = UDim2.new(0, 141, 0, 46), BackgroundTransparency = 1, ClipsDescendants = true }, window)
+    new("Frame", { Size = UDim2.new(0, 1, 1, -46), Position = UDim2.new(0, 140, 0, 46), BackgroundColor3 = Theme.track, BorderSizePixel = 0 }, window)
+
+    --=============================================================================
+    -- UI Framework
+    --=============================================================================
+
+    local pages = {}
+    local tabs = {}
+    local selectTab
+    local closePopup
+
+    local function makePage(id)
+        local page = new("ScrollingFrame", {
+            Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, BorderSizePixel = 0,
+            ScrollBarThickness = 3, ScrollBarImageColor3 = Theme.accent, CanvasSize = UDim2.new(0, 0, 0, 0),
+            AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollingDirection = Enum.ScrollingDirection.Y,
+            Visible = false, ClipsDescendants = true,
+        }, content)
+        local container = new("Frame", { Size = UDim2.new(1, -28, 0, 0), Position = UDim2.fromOffset(14, 14), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1 }, page)
+        new("UIPadding", { PaddingBottom = UDim.new(0, 14) }, container)
+        local leftCol = new("Frame", { Size = UDim2.new(0.5, -6, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1 }, container)
+        new("UIListLayout", { Padding = UDim.new(0, 12), SortOrder = Enum.SortOrder.LayoutOrder }, leftCol)
+        local rightCol = new("Frame", { Size = UDim2.new(0.5, -6, 0, 0), Position = UDim2.new(0.5, 6, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1 }, container)
+        new("UIListLayout", { Padding = UDim.new(0, 12), SortOrder = Enum.SortOrder.LayoutOrder }, rightCol)
+        pages[id] = page
+        return page, leftCol, rightCol
+    end
+
+    local function makeTab(id, label, icon)
+        local btn = new("TextButton", {
+            Size = UDim2.new(1, 0, 0, 36), BackgroundColor3 = Theme.card, BackgroundTransparency = 1,
+            Text = "  " .. icon .. "  " .. label, TextXAlignment = Enum.TextXAlignment.Left,
+            Font = FONT_MED, TextSize = 13, TextColor3 = Theme.muted, AutoButtonColor = false,
+        }, sidebar)
+        corner(btn, 8)
+        local indicator = new("Frame", { Size = UDim2.new(0, 3, 0, 16), Position = UDim2.new(0, 0, 0.5, -8), BackgroundColor3 = Theme.accent, BorderSizePixel = 0, Visible = false }, btn)
+        corner(indicator, 2)
+        btn.MouseButton1Click:Connect(function() 
+            selectTab(id) 
+        end)
+        tabs[id] = { button = btn, indicator = indicator }
+        return btn
+    end
+
+    function selectTab(id)
+        if closePopup then 
+            closePopup() 
+        end
+        for pid, page in pairs(pages) do 
+            page.Visible = (pid == id) 
+        end
+        for tid, tab in pairs(tabs) do
+            local act = (tid == id)
+            tab.button.BackgroundTransparency = act and 0 or 1
+            tab.button.TextColor3 = act and Theme.text or Theme.muted
+            tab.indicator.Visible = act
+        end
+    end
+
+    local function createCard(parent, icon, title)
+        local card = new("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = Theme.card, BorderSizePixel = 0, ClipsDescendants = false }, parent)
+        corner(card, 10)
+        new("TextLabel", { Position = UDim2.new(0, 12, 0, 10), Size = UDim2.new(0, 20, 0, 20), BackgroundTransparency = 1, Text = icon, Font = FONT_MED, TextSize = 16, TextColor3 = Theme.accent }, card)
+        new("TextLabel", { Position = UDim2.new(0, 34, 0, 10), Size = UDim2.new(1, -46, 0, 20), BackgroundTransparency = 1, Text = title, Font = FONT_BOLD, TextSize = 13, TextColor3 = Theme.text, TextXAlignment = Enum.TextXAlignment.Left }, card)
+        local inner = new("Frame", { Size = UDim2.new(1, -24, 0, 0), Position = UDim2.new(0, 12, 0, 36), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1 }, card)
+        new("UIListLayout", { Padding = UDim.new(0, 10), SortOrder = Enum.SortOrder.LayoutOrder }, inner)
+        new("UIPadding", { PaddingBottom = UDim.new(0, 14) }, inner)
+        return inner
+    end
+
+    local function makeBtn(parent, text, onClick)
+        local b = new("TextButton", { Size = UDim2.new(1, 0, 0, 28), BackgroundColor3 = Theme.track, BorderSizePixel = 0, Text = text, Font = FONT_MED, TextSize = 12, TextColor3 = Theme.text }, parent)
+        corner(b, 6)
+        b.MouseButton1Click:Connect(onClick)
+    end
+
+    local TOGGLE_FLAG_KEYS = {
+        ["Auto Pick Up Logs"] = "AutoPickup",
+        ["Auto Sell Logs"] = "AutoSell",
+        ["Auto Pick Up Coins"] = "AutoCoins",
+        ["Auto Chop Trees"] = "AutoChop",
+        ["Smart Weapon Swapping"] = "SmartWeapons",
+        ["Auto Join"] = "AutoJoin",
+        ["Auto Claim Daily Rewards"] = "AutoDaily",
+        ["Auto Buy Classes"] = "AutoClasses",
+        ["Auto Buy Gem Perks"] = "AutoGemPerks",
+        ["Auto Buy Tools"] = "AutoTools",
+        ["Auto Buy Dynamite"] = "AutoDynamite",
+        ["Auto Buy Backpacks"] = "AutoBackpack",
+        ["Auto Buy Upgrades"] = "AutoUpgrades",
+        ["Auto Buy Cars"] = "AutoCars",
+        ["Walk Speed"] = "WalkSpeedEnabled",
+        ["Infinite Jump"] = "InfJump",
+        ["No Clip"] = "NoClip",
+        ["Instant ProximityPrompt"] = "InstantProximityPrompt",
+        ["Auto Reconnect on Kick"] = "AutoReconnect",
+        ["Disable 3D Rendering"] = "Disable3DRendering",
+        ["FPS Boost"] = "FpsBoost",
+        ["Fly"] = "Fly",
+        ["Anti AFK"] = "AntiAfk",
+        ["Free Cursor While Menu Open"] = "FreeCursorMenu",
+    }
+
+    local function addToggle(parent, label, initial, onChanged)
+        local row = new("Frame", { Size = UDim2.new(1, 0, 0, 24), BackgroundTransparency = 1 }, parent)
+        new("TextLabel", { Size = UDim2.new(1, -50, 1, 0), BackgroundTransparency = 1, Text = label, Font = FONT_MED, TextSize = 12, TextColor3 = Theme.text, TextXAlignment = Enum.TextXAlignment.Left }, row)
+        local track = new("Frame", { Size = UDim2.new(0, 36, 0, 20), AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, 0, 0.5, 0), BackgroundColor3 = initial and Theme.accent or Theme.track, BorderSizePixel = 0 }, row)
+        corner(track, 10)
+        local knob = new("Frame", { Size = UDim2.new(0, 16, 0, 16), Position = UDim2.new(0, initial and 18 or 2, 0.5, -8), BackgroundColor3 = Color3.fromRGB(255, 255, 255), BorderSizePixel = 0, ZIndex = 2 }, track)
+        corner(knob, 8)
+        local state = initial
+        local btn = new("TextButton", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "", ZIndex = 3 }, track)
+        local function set(v, fire)
+            state = v
+            TweenService:Create(track, TweenInfo.new(0.15), { BackgroundColor3 = state and Theme.accent or Theme.track }):Play()
+            TweenService:Create(knob, TweenInfo.new(0.15), { Position = UDim2.new(0, state and 18 or 2, 0.5, -8) }):Play()
+            if fire then
+                local flagKey = TOGGLE_FLAG_KEYS[label]
+
+                -- Write the value from the actual UI toggle directly into Flags.
+                -- Then run the feature callback and re-assert it in case a callback
+                -- fails. Persistence does not depend on each callback saving itself.
+                if flagKey then
+                    Flags[flagKey] = state == true
+                end
+
+                local callbackOk, callbackErr = pcall(onChanged, state)
+                if flagKey then
+                    Flags[flagKey] = state == true
+                end
+
+                local saveOk, saveErr = saveConfig(true)
+                if not callbackOk then
+                    warn("[TheForest] Toggle callback failed for '" .. tostring(label) .. "': " .. tostring(callbackErr))
+                end
+                if saveOk then
+                    print("[TheForest] Saved toggle " .. tostring(flagKey or label) .. "=" .. tostring(state) .. " to " .. CONFIG_FILE)
+                else
+                    warn("[TheForest] Toggle save failed for '" .. tostring(label) .. "': " .. tostring(saveErr))
+                end
+            end
+        end
+        btn.MouseButton1Click:Connect(function() 
+            set(not state, true) 
+        end)
+        local hit = new("TextButton", { Size = UDim2.new(1, -40, 1, 0), BackgroundTransparency = 1, Text = "" }, row)
+        hit.MouseButton1Click:Connect(function() 
+            set(not state, true) 
+        end)
+    end
+
+    local function addSlider(parent, label, minV, maxV, initial, step, fmt, onChanged)
+        local container = new("Frame", { Size = UDim2.new(1, 0, 0, 38), BackgroundTransparency = 1 }, parent)
+        new("TextLabel", { Size = UDim2.new(0.6, 0, 0, 16), BackgroundTransparency = 1, Text = label, Font = FONT_MED, TextSize = 12, TextColor3 = Theme.text, TextXAlignment = Enum.TextXAlignment.Left }, container)
+        local valLabel = new("TextLabel", { Size = UDim2.new(0.4, 0, 0, 16), Position = UDim2.new(0.6, 0, 0, 0), BackgroundTransparency = 1, Text = fmt(initial), Font = FONT_BOLD, TextSize = 12, TextColor3 = Theme.text, TextXAlignment = Enum.TextXAlignment.Right }, container)
+        local track = new("Frame", { Size = UDim2.new(1, 0, 0, 4), Position = UDim2.new(0, 0, 0, 26), BackgroundColor3 = Theme.track, BorderSizePixel = 0 }, container)
+        corner(track, 2)
+        local fill = new("Frame", { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = Theme.accent, BorderSizePixel = 0 }, track)
+        corner(fill, 2)
+        local knob = new("Frame", { Size = UDim2.new(0, 12, 0, 12), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0, 0, 0.5, 0), BackgroundColor3 = Theme.accent, BorderSizePixel = 0, ZIndex = 2 }, track)
+        corner(knob, 6)
+        local hit = new("TextButton", { Position = UDim2.new(0, 0, 0, 14), Size = UDim2.new(1, 0, 0, 24), BackgroundTransparency = 1, Text = "", ZIndex = 3, Active = true }, container)
+        local raw, val = initial, initial
+        local function render()
+            local rel = (maxV > minV) and (raw - minV) / (maxV - minV) or 0
+            fill.Size = UDim2.new(rel, 0, 1, 0)
+            knob.Position = UDim2.new(rel, 0, 0.5, 0)
+            valLabel.Text = fmt(val)
+        end
+        local function setRaw(v, fire)
+            raw = math.clamp(v, minV, maxV)
+            val = math.floor(raw / step + 0.5) * step
+            render()
+            if fire then 
+                onChanged(val) 
+            end
+        end
+        local dragging = false
+        hit.InputBegan:Connect(function(i)
+            if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+                dragging = true
+                local w = math.max(1, track.AbsoluteSize.X)
+                local rel = math.clamp((i.Position.X - track.AbsolutePosition.X) / w, 0, 1)
+                setRaw(minV + (maxV - minV) * rel, true)
+            end
+        end)
+        bind(UserInputService.InputChanged, function(i)
+            if not dragging then 
+                return 
+            end
+            if i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch then
+                local w = math.max(1, track.AbsoluteSize.X)
+                local rel = math.clamp((i.Position.X - track.AbsolutePosition.X) / w, 0, 1)
+                setRaw(minV + (maxV - minV) * rel, true)
+            end
+        end)
+        bind(UserInputService.InputEnded, function(i)
+            if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then 
+                dragging = false 
+            end
+        end)
+        setRaw(initial, false)
+    end
+
+    local activePopup = nil
+    local activePopupClose = nil
+
+    closePopup = function()
+        if activePopup then 
+            activePopup:Destroy() 
+            activePopup = nil 
+        end
+        if activePopupClose then 
+            activePopupClose:Destroy() 
+            activePopupClose = nil 
+        end
+    end
+
+    local function addDropdown(parent, label, placeholder, options, initial, isMulti, onChanged)
+        local container = new("Frame", { Size = UDim2.new(1, 0, 0, 48), BackgroundTransparency = 1 }, parent)
+        if label then
+            new("TextLabel", { Size = UDim2.new(1, 0, 0, 16), BackgroundTransparency = 1, Text = label, Font = FONT_MED, TextSize = 12, TextColor3 = Theme.muted, TextXAlignment = Enum.TextXAlignment.Left }, container)
+        end
+        local btn = new("TextButton", { Size = UDim2.new(1, 0, 0, 28), Position = UDim2.new(0, 0, 0, 20), BackgroundColor3 = Theme.track, BorderSizePixel = 0, Text = "", AutoButtonColor = false }, container)
+        corner(btn, 6)
+        local btnStroke = new("UIStroke", { Color = Theme.track }, btn)
+        local text = new("TextLabel", { Size = UDim2.new(1, -28, 1, 0), Position = UDim2.new(0, 8, 0, 0), BackgroundTransparency = 1, Text = "", Font = FONT_MED, TextSize = 12, TextColor3 = Theme.text, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd }, btn)
+        local chev = new("TextLabel", { Size = UDim2.new(0, 20, 1, 0), Position = UDim2.new(1, -22, 0, 0), BackgroundTransparency = 1, Text = "v", Font = FONT_BOLD, TextSize = 11, TextColor3 = Theme.muted }, btn)
+
+        local currentOptions = options or {}
+
+        local selected = {}
+        if isMulti then
+            if type(initial) == "table" then
+                for k, v in pairs(initial) do
+                    if type(k) == "string" and v == true then 
+                        selected[k] = true
+                    elseif type(v) == "string" then 
+                        selected[v] = true 
+                    end
+                end
+            end
+        else
+            if type(initial) == "string" and initial ~= "" then 
+                selected[initial] = true 
+            end
+        end
+
+        local function refreshText()
+            local names = {}
+            for _, o in ipairs(currentOptions) do 
+                if selected[o.id] then 
+                    table.insert(names, o.label) 
+                end 
+            end
+            if #names == 0 then
+                text.Text = placeholder or "None"
+                text.TextColor3 = Theme.muted
+            else
+                local shown = names[1]
+                if #names >= 2 then 
+                    shown = names[1] .. ", " .. names[2] 
+                end
+                if #names > 2 then 
+                    shown = shown .. " +" .. (#names - 2) 
+                end
+                text.Text = shown
+                text.TextColor3 = Theme.text
+            end
+        end
+        refreshText()
+
+        btn.MouseButton1Click:Connect(function()
+            if activePopup and activePopup.Name == label then 
+                closePopup() 
+                return 
+            end
+            closePopup()
+            activePopupClose = new("TextButton", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ZIndex = 901, Text = "" }, popupLayer)
+            activePopupClose.MouseButton1Click:Connect(closePopup)
+
+            local showSearch = isMulti or #currentOptions > 6
+            local listH = math.clamp(#currentOptions * 28 + 8, 36, 168)
+            local y0 = 8
+            if showSearch then 
+                y0 += 36 
+            end
+            if isMulti then 
+                y0 += 34 
+            end
+            local totalH = y0 + listH + 4
+
+            local pos = btn.AbsolutePosition
+            local w = btn.AbsoluteSize.X
+            local cam = workspace.CurrentCamera
+            local vp = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+            local y = pos.Y + btn.AbsoluteSize.Y + 4
+            if y + totalH > vp.Y - 8 then 
+                y = math.max(8, pos.Y - totalH - 4) 
+            end
+
+            local popup = new("Frame", {
+                Name = label, Size = UDim2.fromOffset(w, totalH), Position = UDim2.fromOffset(pos.X, y),
+                BackgroundColor3 = Theme.bg, BorderSizePixel = 0, ZIndex = 902,
+            }, popupLayer)
+            corner(popup, 8)
+            new("UIStroke", { Color = Theme.accent }, popup)
+            activePopup = popup
+            btnStroke.Color = Theme.accent
+            chev.Text = "^"
+
+            local items = {}
+            local searchBox = nil
+            local cy = 8
+
+            if showSearch then
+                local sf = new("Frame", { Size = UDim2.new(1, -16, 0, 28), Position = UDim2.fromOffset(8, cy), BackgroundColor3 = Theme.track, BorderSizePixel = 0 }, popup)
+                corner(sf, 6)
+                searchBox = new("TextBox", {
+                    Size = UDim2.new(1, -16, 1, 0), Position = UDim2.fromOffset(8, 0),
+                    BackgroundTransparency = 1, Text = "", PlaceholderText = "Search...",
+                    PlaceholderColor3 = Theme.muted, TextColor3 = Theme.text,
+                    Font = FONT_MED, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left,
+                    ClearTextOnFocus = false,
+                }, sf)
+                cy += 36
+            end
+
+            local function paint(e)
+                local on = selected[e.id] == true
+                if isMulti then
+                    e.box.BackgroundColor3 = on and Theme.accent or Theme.track
+                    e.mark.Visible = on
+                else
+                    e.bar.Visible = on
+                end
+                e.lbl.TextColor3 = on and Theme.accent or Theme.text
+            end
+
+            local function bulk(state)
+                for _, e in ipairs(items) do
+                    if e.row.Visible then 
+                        selected[e.id] = state
+                        paint(e) 
+                    end
+                end
+                refreshText()
+                if isMulti then
+                    local map = {}
+                    for k, v in pairs(selected) do 
+                        if v then 
+                            map[k] = true 
+                        end 
+                    end
+                    onChanged(map)
+                else
+                    local arr = {}
+                    for k, v in pairs(selected) do 
+                        if v then 
+                            table.insert(arr, k) 
+                        end 
+                    end
+                    onChanged(arr[1])
+                end
+            end
+
+            if isMulti then
+                local half = UDim2.new(0.5, -12, 0, 26)
+                local selAll = new("TextButton", { Size = half, Position = UDim2.fromOffset(8, cy), BackgroundColor3 = Theme.track, BorderSizePixel = 0, Text = "Select all", Font = FONT_MED, TextSize = 12, TextColor3 = Theme.text }, popup)
+                corner(selAll, 6)
+                selAll.MouseButton1Click:Connect(function() 
+                    bulk(true) 
+                end)
+                local clr = new("TextButton", { Size = half, Position = UDim2.new(0.5, 4, 0, cy), BackgroundColor3 = Theme.track, BorderSizePixel = 0, Text = "Clear all", Font = FONT_MED, TextSize = 12, TextColor3 = Theme.text }, popup)
+                corner(clr, 6)
+                clr.MouseButton1Click:Connect(function() 
+                    bulk(false) 
+                end)
+                cy += 34
+            end
+
+            local list = new("ScrollingFrame", {
+                Size = UDim2.new(1, -8, 0, listH), Position = UDim2.fromOffset(4, cy),
+                BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 3, ScrollBarImageColor3 = Theme.accent,
+                CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+            }, popup)
+            new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }, list)
+            new("UIPadding", { PaddingTop = UDim.new(0, 4), PaddingBottom = UDim.new(0, 4) }, list)
+
+            for idx, o in ipairs(currentOptions) do
+                local row = new("TextButton", { Size = UDim2.new(1, -6, 0, 28), BackgroundTransparency = 1, Text = "", AutoButtonColor = false, LayoutOrder = idx }, list)
+                local e = { id = o.id, row = row, lower = string.lower(o.label) }
+                if isMulti then
+                    e.box = new("Frame", { Size = UDim2.fromOffset(16, 16), Position = UDim2.new(0, 8, 0.5, -8), BackgroundColor3 = Theme.track, BorderSizePixel = 0 }, row)
+                    corner(e.box, 4)
+                    new("UIStroke", { Color = Theme.track }, e.box)
+                    e.mark = new("TextLabel", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "✓", Font = FONT_BOLD, TextSize = 12, TextColor3 = Theme.bg, Visible = false }, e.box)
+                else
+                    e.bar = new("Frame", { Size = UDim2.fromOffset(3, 16), Position = UDim2.new(0, 2, 0.5, -8), BackgroundColor3 = Theme.accent, BorderSizePixel = 0, Visible = false }, row)
+                    corner(e.bar, 2)
+                end
+                e.lbl = new("TextLabel", { Size = UDim2.new(1, isMulti and -36 or -20, 1, 0), Position = UDim2.fromOffset(isMulti and 32 or 14, 0), BackgroundTransparency = 1, Text = o.label, Font = FONT_MED, TextSize = 12, TextColor3 = Theme.text, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd }, row)
+                paint(e)
+                table.insert(items, e)
+
+                row.MouseButton1Click:Connect(function()
+                    if isMulti then
+                        selected[e.id] = not selected[e.id]
+                        paint(e)
+                        refreshText()
+                        local map = {}
+                        for k, v in pairs(selected) do 
+                            if v then 
+                                map[k] = true 
+                            end 
+                        end
+                        onChanged(map)
+                    else
+                        for k in pairs(selected) do 
+                            selected[k] = nil 
+                        end
+                        selected[e.id] = true
+                        refreshText()
+                        onChanged(e.id)
+                        closePopup()
+                    end
+                end)
+            end
+
+            if searchBox then
+                searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+                    local q = string.lower(searchBox.Text)
+                    for _, e in ipairs(items) do 
+                        e.row.Visible = (q == "") or (string.find(e.lower, q, 1, true) ~= nil) 
+                    end
+                end)
+            end
+        end)
+
+        local dd = {}
+        function dd.SetOptions(newOptions)
+            currentOptions = newOptions or {}
+            local valid = {}
+            for _, o in ipairs(currentOptions) do 
+                valid[o.id] = true 
+            end
+            for id in pairs(selected) do 
+                if not valid[id] then 
+                    selected[id] = nil 
+                end 
+            end
+            if activePopup and activePopup.Name == label then 
+                closePopup() 
+            end
+            refreshText()
+        end
+        return dd
+    end
+
+    --=============================================================================
+    -- Pages
+    --=============================================================================
+
+    local _mainPage, mainLeft, mainRight = makePage("main")
+    makeTab("main", "Main", "🏠")
+    local _lobbyPage, lobbyLeft, lobbyRight = makePage("lobby")
+    makeTab("lobby", "Lobby", "👥")
+    local _shopPage, shopLeft, shopRight = makePage("shop")
+    makeTab("shop", "Shop", "🛍")
+    local _playerPage, playerLeft, playerRight = makePage("player")
+    makeTab("player", "Player", "🏃")
+    local _miscPage, miscLeft, _miscRight = makePage("misc")
+    makeTab("misc", "Misc", "⚙")
+
+    -- Main Tab
+    local overview = createCard(mainLeft, "📈", "Overview")
+    local function infoRow(parent, label, defVal)
+        local r = new("Frame", { Size = UDim2.new(1, 0, 0, 20), BackgroundTransparency = 1 }, parent)
+        new("TextLabel", { Size = UDim2.new(0.5, 0, 1, 0), BackgroundTransparency = 1, Text = label, Font = FONT, TextSize = 11, TextColor3 = Theme.muted, TextXAlignment = Enum.TextXAlignment.Left }, r)
+        local v = new("TextLabel", { Size = UDim2.new(0.5, 0, 1, 0), Position = UDim2.new(0.5, 0, 0, 0), BackgroundTransparency = 1, Text = defVal, Font = FONT_MED, TextSize = 11, TextColor3 = Theme.text, TextXAlignment = Enum.TextXAlignment.Right }, r)
+        return v
+    end
+    local statusVal = infoRow(overview, "Status", "Idle")
+    local cashVal = infoRow(overview, "Cash", "$0")
+    local logsVal = infoRow(overview, "Logs", "0/0")
+    local zoneVal = infoRow(overview, "Zone", "-")
+    local sessionVal = infoRow(overview, "Session", "0 trees, 0 sells, 0 buys")
+
+    local logsCash = createCard(mainRight, "🪵", "Logs & Cash")
+    addToggle(logsCash, "Auto Pick Up Logs", Flags.AutoPickup, function(v) Setters.feature("AutoPickup", v) end)
+    addToggle(logsCash, "Auto Sell Logs", Flags.AutoSell, function(v) Setters.feature("AutoSell", v) end)
+    addSlider(logsCash, "Sell At Logs", 1, 155, Flags.SellAt, 1, function(v) return tostring(v) end, function(v) Flags.SellAt = v; saveConfig() end)
+    addToggle(logsCash, "Auto Pick Up Coins", Flags.AutoCoins, function(v) Setters.feature("AutoCoins", v) end)
+
+    local chopping = createCard(mainLeft, "🪓", "Chopping")
+    addDropdown(chopping, "Zone", "Select Zone", LISTS.zones, Flags.Zone, false, function(v) 
+        Flags.Zone = v
+        table.clear(Game.badTrees) 
+        saveConfig()
+    end)
+    addToggle(chopping, "Auto Chop Trees", Flags.AutoChop, function(v) Setters.feature("AutoChop", v) end)
+    addToggle(chopping, "Smart Weapon Swapping", Flags.SmartWeapons, function(v) 
+        Flags.SmartWeapons = v
+        saveConfig() 
+    end)
+    addSlider(chopping, "Chop Delay", 0.1, 1.5, Flags.ChopDelay, 0.01, function(v) return string.format("%.2f", v) end, function(v) Flags.ChopDelay = v; saveConfig() end)
+
+    -- Lobby Tab
+    local autoJoin = createCard(lobbyLeft, "▶", "Auto Join")
+    addDropdown(autoJoin, "Difficulty", "NORMAL", LISTS.diffs, Flags.Difficulty, false, function(v) Flags.Difficulty = v; saveConfig() end)
+    addSlider(autoJoin, "Player Limit", 1, (LobbyConfig and LobbyConfig.MaxParty) or 4, Flags.PartySize, 1, function(v) return tostring(v) end, function(v) Flags.PartySize = v; saveConfig() end)
+    addToggle(autoJoin, "Auto Join", Flags.AutoJoin, function(v) Setters.feature("AutoJoin", v) end)
+
+    local savedRuns = createCard(lobbyLeft, "💾", "Saved Runs")
+    local savedDD = addDropdown(savedRuns, "Saved Run", "None", {}, Flags.SavedRun, false, function(v) Flags.SavedRun = v; saveConfig() end)
+    LobbyState.onSavesChanged = function()
+        local opts = {}
+        for _, s in ipairs(LobbyState.saves) do 
+            table.insert(opts, { id = s.key, label = s.label }) 
+        end
+        savedDD.SetOptions(opts)
+    end
+    makeBtn(savedRuns, "↻ Refresh Saved Runs", function()
+        task.spawn(function()
+            if not inLobby() then 
+                notify("Only works in the lobby")
+                return 
+            end
+            refreshSaves()
+            notify(#LobbyState.saves .. " saved run(s) found")
+        end)
+    end)
+    makeBtn(savedRuns, "↳ Join Saved Run", function()
+        task.spawn(function()
+            if not inLobby() then 
+                notify("Only works in the lobby")
+            elseif not Flags.SavedRun then 
+                notify("Pick a saved run first")
+            elseif not joinRun(Flags.SavedRun) then 
+                notify(Game.status) 
+            end
+        end)
+    end)
+
+    local rewards = createCard(lobbyRight, "🎁", "Rewards & Shop")
+    addToggle(rewards, "Auto Claim Daily Rewards", Flags.AutoDaily, function(v) Setters.feature("AutoDaily", v) end)
+    addDropdown(rewards, "Classes To Buy", "None", LISTS.classes, Flags.BuyClasses, true, function(v) Flags.BuyClasses = v; saveConfig() end)
+    addToggle(rewards, "Auto Buy Classes", Flags.AutoClasses, function(v) Setters.feature("AutoClasses", v) end)
+    addDropdown(rewards, "Gem Perks To Buy", "None", LISTS.perks, Flags.BuyGemPerks, true, function(v) Flags.BuyGemPerks = v; saveConfig() end)
+    addToggle(rewards, "Auto Buy Gem Perks", Flags.AutoGemPerks, function(v) Setters.feature("AutoGemPerks", v) end)
+
+    -- Shop Tab
+    local toolsCard = createCard(shopLeft, "🛠", "Tools")
+    addDropdown(toolsCard, "Tools To Buy", "None", LISTS.tools, Flags.BuyTools, true, function(v) Flags.BuyTools = v; saveConfig() end)
+    addToggle(toolsCard, "Auto Buy Tools", Flags.AutoTools, function(v) Setters.feature("AutoTools", v) end)
+    addToggle(toolsCard, "Auto Buy Dynamite", Flags.AutoDynamite, function(v) Setters.feature("AutoDynamite", v) end)
+    addToggle(toolsCard, "Auto Buy Backpacks", Flags.AutoBackpack, function(v) Setters.feature("AutoBackpack", v) end)
+
+    local upgradesCard = createCard(shopRight, "📈", "Upgrades")
+    addDropdown(upgradesCard, "Upgrades To Buy", "None", LISTS.upgrades, Flags.BuyUpgrades, true, function(v) Flags.BuyUpgrades = v; saveConfig() end)
+    addToggle(upgradesCard, "Auto Buy Upgrades", Flags.AutoUpgrades, function(v) Setters.feature("AutoUpgrades", v) end)
+
+    local carsCard = createCard(shopRight, "🚗", "Cars")
+    addDropdown(carsCard, "Cars To Buy", "None", LISTS.cars, Flags.BuyCars, true, function(v) Flags.BuyCars = v; saveConfig() end)
+    addToggle(carsCard, "Auto Buy Cars", Flags.AutoCars, function(v) Setters.feature("AutoCars", v) end)
+
+    -- Player Tab
+    local moveCard = createCard(playerLeft, "🏃", "Movement")
+    addToggle(moveCard, "Walk Speed", Flags.WalkSpeedEnabled, setWalkSpeedEnabled)
+    addSlider(moveCard, "Walk Speed Value", 16, 200, Flags.WalkSpeed, 1, function(v) return tostring(math.floor(v)) end, setWalkSpeed)
+    addToggle(moveCard, "Infinite Jump", Flags.InfJump, function(v) setInfJump(v); saveConfig() end)
+    addToggle(moveCard, "No Clip", Flags.NoClip, function(v) setNoClip(v); saveConfig() end)
+    addToggle(moveCard, "Instant ProximityPrompt", Flags.InstantProximityPrompt, function(v) setInstantProximityPrompt(v); saveConfig() end)
+
+    local clientCard = createCard(playerLeft, "🖥", "Client")
+    addToggle(clientCard, "Auto Reconnect on Kick", Flags.AutoReconnect, function(v) setAutoReconnect(v); saveConfig() end)
+    addToggle(clientCard, "Disable 3D Rendering", Flags.Disable3DRendering, function(v) setDisable3D(v); saveConfig() end)
+    addToggle(clientCard, "FPS Boost", Flags.FpsBoost, function(v) setFpsBoost(v); saveConfig() end)
+
+    local flyCard = createCard(playerRight, "✈", "Flight")
+    addToggle(flyCard, "Fly", Flags.Fly, function(v) setFly(v); saveConfig() end)
+    addSlider(flyCard, "Fly Speed", 20, 200, Flags.FlySpeed, 1, function(v) return tostring(math.floor(v)) end, setFlySpeed)
+    new("TextLabel", { Size = UDim2.new(1, 0, 0, 24), BackgroundTransparency = 1, Text = "WASD · Space · Ctrl", Font = FONT, TextSize = 11, TextColor3 = Theme.muted }, flyCard)
+
+    -- Misc Tab
+    local miscCard = createCard(miscLeft, "⚙", "Session")
+    addToggle(miscCard, "Anti AFK", Flags.AntiAfk, function(v) setAntiAfk(v); saveConfig() end)
+    addToggle(miscCard, "Free Cursor While Menu Open", Flags.FreeCursorMenu, function(v) setFreeCursorMenu(v); saveConfig() end)
+    makeBtn(miscCard, "Save Config Now", function()
+        local saved, err = saveConfig(true)
+        if saved then
+            notify("Config verified: " .. CONFIG_FILE)
+            print("[TheForest] Manual save verified: " .. CONFIG_FILE)
+        else
+            notify("Config save failed; check console")
+            warn("[TheForest] Manual config save failed: " .. tostring(err))
+        end
+    end)
+    makeBtn(miscCard, "Rejoin Server", function() 
+        pcall(function() 
+            TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer) 
+        end) 
+    end)
+    makeBtn(miscCard, "Unload Script", function() 
+        if unload then 
+            unload() 
+        end 
+    end)
+    new("TextLabel", { Size = UDim2.new(1, 0, 0, 24), BackgroundTransparency = 1, Text = "Press '=' to instantly kill the script", Font = FONT_MED, TextSize = 11, TextColor3 = Theme.danger, TextXAlignment = Enum.TextXAlignment.Left }, miscCard)
+
+    --=============================================================================
+    -- Window logic & workers
+    --=============================================================================
+
+    local function getViewport(): Vector2
+        local cam = workspace.CurrentCamera
+        return (cam and cam.ViewportSize) or Vector2.new(1920, 1080)
+    end
+
+    local function clampOffsets(x: number, y: number): (number, number)
+        local vp = getViewport()
+        local size = window.AbsoluteSize
+        return math.clamp(x, 0, math.max(0, vp.X - size.X)), math.clamp(y, 0, math.max(0, vp.Y - size.Y))
+    end
+
+    local isDragging = false
+    local dragStart: Vector2? = nil
+    local dragStartPos: Vector2? = nil
+
+    local function ensureOnScreen(): ()
+        if not window.Visible or isDragging then 
+            return 
+        end
+        local abs = window.AbsolutePosition
+        local cx, cy = clampOffsets(abs.X, abs.Y)
+        if math.abs(cx - abs.X) > 0.5 or math.abs(cy - abs.Y) > 0.5 then
+            window.Position = UDim2.new(0, cx, 0, cy)
+        end
+    end
+
+    titleBar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            local abs = window.AbsolutePosition
+            window.Position = UDim2.new(0, abs.X, 0, abs.Y)
+            dragStart = Vector2.new(input.Position.X, input.Position.Y)
+            dragStartPos = Vector2.new(window.Position.X.Offset, window.Position.Y.Offset)
+            isDragging = true
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then 
+                    isDragging = false 
+                    dragStart = nil 
+                    dragStartPos = nil 
+                end
+            end)
+        end
+    end)
+
+    bind(UserInputService.InputChanged, function(input)
+        if not isDragging or not dragStart or not dragStartPos then 
+            return 
+        end
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            local delta = Vector2.new(input.Position.X, input.Position.Y) - dragStart
+            local x, y = clampOffsets(dragStartPos.X + delta.X, dragStartPos.Y + delta.Y)
+            window.Position = UDim2.new(0, x, 0, y)
+        end
+    end)
+
+    local prevMouseBehavior = Enum.MouseBehavior.Default
+    local prevMouseIcon = true
+
+    local function setWindowVisible(visible: boolean): ()
+        closePopup()
+        window.Visible = visible
+        toggleBtn.Visible = not visible
+        if visible then
+            ensureOnScreen()
+            prevMouseBehavior = UserInputService.MouseBehavior
+            prevMouseIcon = UserInputService.MouseIconEnabled
+            UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+            UserInputService.MouseIconEnabled = true
+        else
+            UserInputService.MouseBehavior = prevMouseBehavior
+            UserInputService.MouseIconEnabled = prevMouseIcon
+        end
+    end
+
+    toggleBtn.MouseButton1Click:Connect(function() 
+        setWindowVisible(true) 
+    end)
+    closeBtn.MouseButton1Click:Connect(function() 
+        setWindowVisible(false) 
+    end)
+
+    bind(UserInputService.InputBegan, function(input, gp)
+        if unloaded then 
+            return 
+        end
+        if input.KeyCode == Enum.KeyCode.Equals then
+            if unload then 
+                unload() 
+            end
+            return
+        end
+        if gp then 
+            return 
+        end
+        if input.KeyCode == Enum.KeyCode.RightShift then
+            setWindowVisible(not window.Visible)
+        end
+    end)
+
+    bind(LocalPlayer.Idled, function() 
+        if not unloaded and Flags.AntiAfk then 
+            pulseAntiAfk() 
+        end 
+    end)
+    bind(UserInputService.JumpRequest, function() 
+        if not unloaded and Flags.InfJump then 
+            setInfJump(true) 
+        end 
+    end)
+
+    startWorker("status", 0.4, function()
+        statusVal.Text = Game.status .. (zoneUnlocked(Flags.Zone) and "" or " (locked)")
+        cashVal.Text = "$" .. short(cashValue()) .. "  Gems " .. short(gemsValue())
+        logsVal.Text = carried() .. " / " .. capacity() .. (Flags.AutoSell and ("  (sell at " .. sellThreshold() .. ")") or "")
+        zoneVal.Text = zoneLabel(Flags.Zone) .. (zoneUnlocked(Flags.Zone) and "" or " (locked)")
+        sessionVal.Text = Game.trees .. " trees, " .. Game.sells .. " sells, " .. Game.bought .. " buys"
+    end)
+
+    startWorker("windowsafe", 1.0, ensureOnScreen)
+
+    unload = function(): ()
+        if unloaded then
+            return
+        end
+
+        -- Keep the user's intended settings before cleanup resets active features.
+        -- Invalidate any queued saves and make delayed saves no-op once unloaded.
+        saveVersion += 1
+        local snapshotOk, savedConfigText = pcall(function()
+            return HttpService:JSONEncode(Flags)
+        end)
+        if not snapshotOk then
+            local snapshotErr = savedConfigText
+            savedConfigText = nil
+            warn("[TheForest] Could not encode config during shutdown: " .. tostring(snapshotErr))
+        end
+
+        unloaded = true
+        stopAllFeatures()
+        for _, c in ipairs(connections) do
+            pcall(function()
+                c:Disconnect()
+            end)
+        end
+        table.clear(connections)
+        stopFly()
+        local hum = getRoot()
+        if hum then
+            hum.WalkSpeed = 16
+        end
+        pcall(function()
+            screenGui:Destroy()
+        end)
+
+        -- Write the snapshot AFTER cleanup. This prevents cleanup setters from
+        -- replacing saved ON states with their temporary shutdown OFF states.
+        if type(writefile) == "function" and type(savedConfigText) == "string" then
+            local writeOk, writeErr = pcall(function()
+                writefile(CONFIG_FILE, savedConfigText)
+            end)
+            if writeOk then
+                local verifyOk = true
+                local verifyErr = nil
+                if type(readfile) == "function" then
+                    local readOk, currentText = pcall(function()
+                        return readfile(CONFIG_FILE)
+                    end)
+                    if not readOk or currentText ~= savedConfigText then
+                        verifyOk = false
+                        verifyErr = "read-back did not match shutdown snapshot"
+                    end
+                end
+                if verifyOk then
+                    print("[TheForest] Shutdown config saved and verified: " .. CONFIG_FILE)
+                else
+                    warn("[TheForest] Shutdown config verification failed: " .. tostring(verifyErr))
+                end
+            else
+                warn("[TheForest] Shutdown config write failed: " .. tostring(writeErr))
+            end
+        else
+            warn("[TheForest] Shutdown config could not be saved; writefile() or JSON encoding is unavailable")
+        end
+
+        notify("Script killed completely via kill switch.")
+    end
+
+    bind(LocalPlayer.CharacterAdded, bindCharacter)
+    if LocalPlayer.Character then 
+        bindCharacter(LocalPlayer.Character) 
+    end
+    if LobbyRemotes then
+        pcall(function()
+            bind(LobbyRemotes.OpenCreate.OnClientEvent, onOpenCreate)
+            bind(LobbyRemotes.Saves.OnClientEvent, onSaves)
+        end)
+    end
+
+    selectTab("main")
+    setWindowVisible(true)
+
+    if Flags.AntiGameplayPause then 
+        setNoGameplayPaused(true) 
+    end
+    if Flags.AntiAfk then 
+        setAntiAfk(true) 
+    end
+    if Flags.FreeCursorMenu then 
+        setFreeCursorMenu(true) 
+    end
+    if Flags.InstantProximityPrompt then 
+        setInstantProximityPrompt(true) 
+    end
+    if Flags.NoClip then 
+        setNoClip(true) 
+    end
+    if Flags.InfJump then 
+        setInfJump(true) 
+    end
+    if Flags.Fly then 
+        setFly(true) 
+    end
+    if Flags.WalkSpeedEnabled then 
+        setWalkSpeedEnabled(true) 
+    end
+    if Flags.AutoReconnect then 
+        setAutoReconnect(true) 
+    end
+    if Flags.Disable3DRendering then 
+        setDisable3D(true) 
+    end
+    if Flags.FpsBoost then 
+        setFpsBoost(true) 
+    end
+    if Flags.NoCustomCursor then 
+        setNoCustomCursor(true) 
+    end
+
+    for key in pairs(FARM_KEYS) do 
+        if Flags[key] then 
+            Setters.feature(key, true) 
+        end 
+    end
+    for key in pairs(WORKER_STEPS) do 
+        if Flags[key] then 
+            Setters.feature(key, true) 
+        end 
+    end
+    for key in pairs(BUY_KEYS) do 
+        if Flags[key] then 
+            Setters.feature(key, true) 
+        end 
+    end
+
+    if not Remotes or not Config then
+        notify("Game modules not found; farming/buying disabled")
+    else
+        notify("Loaded " .. SCRIPT_VERSION .. ". RightShift toggles the menu, '=' kills the script.")
+    end
+
+end, function(err)
+    print("========================================")
+    print("[FATAL ERROR] The script crashed!")
+    print("Error details: " .. tostring(err))
+    print("Traceback:")
+    print(debug.traceback())
+    print("========================================")
+    pcall(function()
+        game.StarterGui:SetCore("SendNotification", { Title = "Script Error", Text = "Check console.", Duration = 10 })
+    end)
+end)
