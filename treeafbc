@@ -22,7 +22,7 @@ if not game:IsLoaded() then
     game.Loaded:Wait() 
 end
 
-local SCRIPT_VERSION = "v3.1-boss-gun"
+local SCRIPT_VERSION = "v3.2-hud-zone-sync"
 local GAME_NAME      = "The Forest"
 local CONFIG_FILE    = "ForestConfig.json"
 
@@ -46,7 +46,7 @@ xpcall(function()
     -- are loaded first and remain authoritative across launches.
     local DEFAULT_FLAGS = {
         AutoChop = false, Zone = "OakWood", ChopDelay = 0.4,
-        AutoFightMobs = true, AutoAdvanceZone = true,
+        AutoFightMobs = true, AutoAdvanceZone = true, AutoDetectZone = true,
         SmartWeapons = false,
         AutoPickup = false, AutoSell = false, SellAt = 5, AutoCoins = false,
         AutoTools = false, BuyTools = {},
@@ -91,6 +91,8 @@ xpcall(function()
         lastMobNotice = nil,
         zoneAdvancePending = false,
         bossSearchWarningShown = false,
+        lastHudAreaReport = nil,
+        autoZoneAdvanceTarget = nil,
     }
 
     --=============================================================================
@@ -510,6 +512,56 @@ xpcall(function()
         return best
     end
 
+    local function normalizeAreaName(value)
+        return string.gsub(string.lower(tostring(value or "")), "[^%w]", "")
+    end
+
+    -- Resolve only exact known area labels (or a label combined with "AREA n/n").
+    -- This avoids mistaking instructional text elsewhere in the UI for the active area.
+    local function zoneKeyFromHudText(textValue)
+        local candidate = string.lower(tostring(textValue or ""))
+        local prefix = string.match(candidate, "^%s*(.-)%s*area%s*%d+%s*/%s*%d+")
+        if prefix and prefix ~= "" then
+            candidate = prefix
+        end
+        candidate = string.match(candidate, "^%s*(.-)%s*$") or candidate
+        local normalized = normalizeAreaName(candidate)
+        if normalized == "" then return nil end
+
+        for _, key in ipairs(zoneOrder()) do
+            if normalized == normalizeAreaName(zoneLabel(key)) or normalized == normalizeAreaName(key) then
+                return key
+            end
+        end
+        for key, label in pairs(ZONE_LABEL_FALLBACK) do
+            if normalized == normalizeAreaName(label) or normalized == normalizeAreaName(key) then
+                return key
+            end
+        end
+        return nil
+    end
+
+    local function isTopRightHudText(inst)
+        local ancestor = inst
+        while ancestor and ancestor ~= game do
+            if ancestor:IsA("GuiObject") and not ancestor.Visible then
+                return false
+            end
+            if ancestor:IsA("ScreenGui") and not ancestor.Enabled then
+                return false
+            end
+            ancestor = ancestor.Parent
+        end
+        local cam = workspace.CurrentCamera
+        local viewport = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+        local ok, pos = pcall(function()
+            return inst.AbsolutePosition
+        end)
+        if not ok or not pos then return false end
+        -- The zone label shown above AREA n/n sits in the upper-right HUD region.
+        return pos.X >= viewport.X * 0.52 and pos.Y <= viewport.Y * 0.32
+    end
+
     -- Read the game's actual area HUD so the same logic works across area labels
     -- and progress values instead of hardcoding Oak Wood or a particular percent.
     local function readAreaHudState()
@@ -520,6 +572,7 @@ xpcall(function()
             bossHealth = nil,
             bossMaxHealth = nil,
             areaName = zoneLabel(Flags.Zone),
+            detectedZone = nil,
         }
         local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
         local hudTextNodes = {}
@@ -530,6 +583,13 @@ xpcall(function()
                     if type(textValue) == "string" and textValue ~= "" then
                         table.insert(hudTextNodes, { inst = inst, text = textValue })
                         local lower = string.lower(textValue)
+                        if not state.detectedZone and isTopRightHudText(inst) then
+                            local hudZone = zoneKeyFromHudText(textValue)
+                            if hudZone then
+                                state.detectedZone = hudZone
+                                state.areaName = zoneLabel(hudZone)
+                            end
+                        end
                         local pct = string.match(lower, "([%d%.]+)%%%s*cleared")
                         if pct then
                             local parsed = tonumber(pct)
@@ -662,8 +722,58 @@ xpcall(function()
         return state
     end
 
-    -- Find the compact day/night indicator rather than instructional text like
-    -- "Day and night: 8-minute days, 4-minute nights" in the Night Monsters panel.
+    -- The top-right HUD is the source of truth for the current area. Keep the
+    -- dropdown editable, and let users disable this sync for a manual override.
+    local function syncZoneSelectionFromHud(areaState)
+        if not Flags.AutoDetectZone or not areaState or not areaState.detectedZone then
+            return false
+        end
+        local detectedZone = areaState.detectedZone
+        if zoneIndex(detectedZone) == nil then return false end
+
+        -- A post-boss zone advance is intentional: do not immediately snap back
+        -- to the old HUD label while the game transitions to the next area.
+        if Game.autoZoneAdvanceTarget then
+            if detectedZone == Game.autoZoneAdvanceTarget then
+                Game.autoZoneAdvanceTarget = nil
+            elseif Flags.Zone == Game.autoZoneAdvanceTarget then
+                return false
+            else
+                Game.autoZoneAdvanceTarget = nil
+            end
+        end
+
+        if Flags.Zone == detectedZone then
+            areaState.areaName = zoneLabel(detectedZone)
+            areaState.key = tostring(Flags.Zone) .. "|" .. tostring(areaState.marker or "")
+            if Game.lastHudAreaReport ~= detectedZone then
+                Game.lastHudAreaReport = detectedZone
+                print("[TheForest] Top-right HUD area detected: " .. zoneLabel(detectedZone))
+            end
+            return false
+        end
+
+        local previousZone = Flags.Zone
+        Flags.Zone = detectedZone
+        table.clear(Game.badTrees)
+        Game.currentAreaKey = nil
+        Game.lastProgressReport = nil
+        if zoneDropdown then
+            pcall(function() zoneDropdown.SetValue(detectedZone) end)
+        end
+        areaState.areaName = zoneLabel(detectedZone)
+        areaState.key = tostring(Flags.Zone) .. "|" .. tostring(areaState.marker or "")
+        saveConfig()
+        Game.lastHudAreaReport = detectedZone
+        print("[TheForest] Top-right HUD area detected: " .. zoneLabel(detectedZone)
+            .. "; Zone dropdown updated from " .. zoneLabel(previousZone) .. ".")
+        notify("HUD area matched: " .. zoneLabel(detectedZone) .. ". Zone dropdown updated.")
+        return true
+    end
+
+    -- Read the game's explicit phase label when available. The game has four
+    -- phases (Day -> Dusk -> Night -> Dawn -> Day), so Dusk/Dawn must not be
+    -- collapsed into Night/Day. Avoid broad tutorial text and hidden menu labels.
     local function readDayNightHud()
         local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
         if not playerGui then return nil end
@@ -671,8 +781,27 @@ xpcall(function()
         local bestState, bestScore = nil, -1
         for _, inst in ipairs(playerGui:GetDescendants()) do
             if (inst:IsA("TextLabel") or inst:IsA("TextButton")) and inst.Visible then
+                -- A child may be Visible while an ancestor ScreenGui/frame is hidden.
+                local hierarchyVisible = true
+                local ancestor = inst.Parent
+                while ancestor and ancestor ~= playerGui do
+                    if ancestor:IsA("GuiObject") and not ancestor.Visible then
+                        hierarchyVisible = false
+                        break
+                    end
+                    if ancestor:IsA("ScreenGui") and not ancestor.Enabled then
+                        hierarchyVisible = false
+                        break
+                    end
+                    ancestor = ancestor.Parent
+                end
+
+                local positionOk, labelY = pcall(function() return inst.AbsolutePosition.Y end)
+                -- Only inspect the upper HUD strip. This avoids reading a stale
+                -- "Cycle: Night" value from this script's own Overview panel.
+                local inTopHud = positionOk and labelY <= 180
                 local raw = string.lower(tostring(inst.Text or ""))
-                if raw ~= "" then
+                if hierarchyVisible and inTopHud and raw ~= "" then
                     local instructional = string.find(raw, "minute", 1, true)
                         or string.find(raw, "minions", 1, true)
                         or string.find(raw, "monsters", 1, true)
@@ -680,33 +809,38 @@ xpcall(function()
                         or string.find(raw, "replant", 1, true)
                         or string.find(raw, "thieves", 1, true)
                         or string.find(raw, "biters", 1, true)
+                        or string.find(raw, "day and night", 1, true)
                     if not instructional and #raw <= 48 then
                         local normalized = string.gsub(raw, "[^%a%d: ]", " ")
                         normalized = string.gsub(normalized, "%s+", " ")
                         normalized = string.match(normalized, "^%s*(.-)%s*$") or normalized
                         local first = string.match(normalized, "^(%a+)") or ""
                         local state = nil
-                        -- Accept compact labels (DAY, NIGHT, DAYTIME, NIGHTTIME) and
-                        -- top-HUD variants such as "Time: Night" or "It is Day".
-                        if first == "day" or first == "daytime"
-                            or string.find(normalized, "%f[%a]day%f[%A]")
-                            or string.find(normalized, "%f[%a]daytime%f[%A]") then
-                            state = "Day"
+
+                        -- Check transitional phases first and only accept whole words.
+                        if first == "dusk" or first == "dusktime"
+                            or string.find(normalized, "%f[%a]dusk%f[%A]") then
+                            state = "Dusk"
+                        elseif first == "dawn" or first == "dawntime"
+                            or string.find(normalized, "%f[%a]dawn%f[%A]") then
+                            state = "Dawn"
                         elseif first == "night" or first == "nighttime"
                             or string.find(normalized, "%f[%a]night%f[%A]")
                             or string.find(normalized, "%f[%a]nighttime%f[%A]") then
                             state = "Night"
-                        elseif string.find(normalized, "^current day[%s:%d]*$") then
+                        elseif first == "day" or first == "daytime"
+                            or string.find(normalized, "%f[%a]day%f[%A]")
+                            or string.find(normalized, "%f[%a]daytime%f[%A]") then
                             state = "Day"
-                        elseif string.find(normalized, "^current night[%s:%d]*$") then
-                            state = "Night"
                         end
 
                         if state then
-                            local score = (#normalized <= 20) and 3 or 1
-                            local ok, y = pcall(function() return inst.AbsolutePosition.Y end)
-                            if ok and y <= 180 then score += 2 end
-                            if normalized == "day" or normalized == "night" then score += 2 end
+                            local score = (#normalized <= 12) and 6 or 1
+                            score += 3 -- candidates already restricted to the upper HUD strip
+                            if normalized == "day" or normalized == "dusk"
+                                or normalized == "night" or normalized == "dawn" then
+                                score += 4
+                            end
                             if score > bestScore then
                                 bestState, bestScore = state, score
                             end
@@ -719,17 +853,22 @@ xpcall(function()
             return bestState
         end
 
-        -- Some versions of the HUD render the cycle as an icon rather than readable
-        -- text. Fall back to Lighting.ClockTime so the state is known on execute,
-        -- then keep polling the HUD so its explicit indicator can take precedence.
+        -- If the HUD phase is an icon with no readable text, use Lighting.ClockTime
+        -- as a fallback. Dusk and dawn get their own windows so night-only behavior
+        -- is not enabled during those transitions.
         local clockOk, clockTime = pcall(function()
             return Lighting.ClockTime
         end)
         if clockOk and type(clockTime) == "number" then
             if clockTime >= 6 and clockTime < 18 then
                 return "Day"
+            elseif clockTime >= 18 and clockTime < 19 then
+                return "Dusk"
+            elseif clockTime >= 5 and clockTime < 6 then
+                return "Dawn"
+            else
+                return "Night"
             end
-            return "Night"
         end
         return nil
     end
@@ -737,7 +876,7 @@ xpcall(function()
     -- Initialize the cycle immediately during script execution instead of waiting
     -- for the background worker's first polling interval.
     Game.dayNight = readDayNightHud() or "Unknown"
-    notify("Initial day/night detection: " .. Game.dayNight)
+    notify("Initial cycle detection: " .. Game.dayNight)
 
     local function normalizedName(value)
         return string.gsub(string.lower(tostring(value or "")), "[^%w]", "")
@@ -1531,7 +1670,7 @@ xpcall(function()
         local lastApproachChangeAt = os.clock()
 
         while not unloaded and Flags.AutoChop do
-            -- Nearby-mob interception is a night-only detour. If the HUD flips
+            -- Nearby-mob interception is active only during the Night phase (not Dusk/Dawn). If the HUD flips
             -- to Day during combat, stop intercepting and return to farming.
             if Game.dayNight ~= "Night" then
                 Game.cachedMob = nil
@@ -1648,6 +1787,7 @@ xpcall(function()
 
                 if nextZone then
                     Flags.Zone = nextZone
+                    Game.autoZoneAdvanceTarget = nextZone
                     table.clear(Game.badTrees)
                     Game.currentAreaKey = nil
                     Game.areaCompleteKey = nil
@@ -1689,6 +1829,10 @@ xpcall(function()
         Game.busy = true
         local ok, err = pcall(function()
             local areaState = readAreaHudState()
+            syncZoneSelectionFromHud(areaState)
+            -- syncZoneSelectionFromHud may have changed Flags.Zone, so rebuild
+            -- the key after it runs instead of keeping the old dropdown value.
+            areaState.key = tostring(Flags.Zone) .. "|" .. tostring(areaState.marker or "")
             local areaKey = areaState.key
 
             if Game.currentAreaKey ~= areaKey then
@@ -3610,7 +3754,19 @@ xpcall(function()
     local chopping = createCard(mainLeft, "🪓", "Chopping")
     zoneDropdown = addDropdown(chopping, "Zone", "Select Zone", LISTS.zones, Flags.Zone, false, function(v) 
         Flags.Zone = v
+        Game.autoZoneAdvanceTarget = nil
         table.clear(Game.badTrees) 
+        saveConfig()
+    end)
+    addToggle(chopping, "Auto Match Zone to HUD", Flags.AutoDetectZone, function(v)
+        Flags.AutoDetectZone = v == true
+        -- Turning this off leaves the manual Zone dropdown fully in control.
+        if not Flags.AutoDetectZone then
+            Game.autoZoneAdvanceTarget = nil
+            notify("Auto Match Zone to HUD disabled; use the Zone dropdown manually.")
+        else
+            notify("Auto Match Zone to HUD enabled; reading the top-right area label.")
+        end
         saveConfig()
     end)
     addToggle(chopping, "Auto Chop Trees", Flags.AutoChop, function(v) Setters.feature("AutoChop", v) end)
@@ -3860,8 +4016,15 @@ xpcall(function()
         local detected = readDayNightHud()
         if detected and detected ~= Game.dayNight then
             Game.dayNight = detected
-            notify("Day/night HUD detected: " .. detected)
+            notify("Cycle phase detected: " .. detected)
         end
+    end)
+
+    -- Run independently of Auto Chop, including immediately after execute, so
+    -- the Zone dropdown follows the actual upper-right HUD area from startup.
+    startWorker("areahudzone", 1.0, function()
+        local areaState = readAreaHudState()
+        syncZoneSelectionFromHud(areaState)
     end)
 
     startWorker("windowsafe", 1.0, ensureOnScreen)
