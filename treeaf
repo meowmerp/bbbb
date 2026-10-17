@@ -1,7 +1,7 @@
 --!nonstrict
 --=============================================================================
 -- Standalone The Forest Automation Script + GUI
--- v3.0 (Config persistence, area progress gate, automated boss phase)
+-- v3.3 (Config persistence, area progress gate, automated boss phase)
 --=============================================================================
 
 local Players            = game:GetService("Players")
@@ -22,7 +22,7 @@ if not game:IsLoaded() then
     game.Loaded:Wait() 
 end
 
-local SCRIPT_VERSION = "v3.3-boss-topbar-safety"
+local SCRIPT_VERSION = "v3.3"
 local GAME_NAME      = "The Forest"
 local CONFIG_FILE    = "ForestConfig.json"
 
@@ -1546,16 +1546,17 @@ xpcall(function()
         end
 
         local horizontal = Game.bossApproachDirection
-        local radius = math.clamp(math.max(boxSize.X, boxSize.Z) * 0.32, 5.5, 10)
-        -- Stay above the ground and roughly at the boss's torso level, without
-        -- jumping to the top of the model. The camera aims separately at the
-        -- upper-body point, so the player position needn't orbit around it.
-        local verticalOffset = math.clamp(boxSize.Y * 0.08, 2.5, 4.5)
+        -- Hold the player just above the boss's bounding-box top, with a small
+        -- offset behind it to avoid intersecting antlers/arms. The previous
+        -- torso-height offset left the player close to the ground and looked as
+        -- if anchoring had failed.
+        local radius = math.clamp(math.max(boxSize.X, boxSize.Z) * 0.14, 1.5, 4)
+        local verticalOffset = (boxSize.Y * 0.5) + 5.5
         local destination = boxCf.Position + horizontal * radius + Vector3.new(0, verticalOffset, 0)
-        local aimPoint = boxCf.Position + Vector3.new(0, math.clamp(boxSize.Y * 0.12, 2, 5), 0)
+        local aimPoint = boxCf.Position + Vector3.new(0, math.clamp(boxSize.Y * 0.10, 2, 5), 0)
 
-        -- Anchor the character root at the selected position for a stable firing
-        -- platform. Remember its original state so every normal exit restores it.
+        -- Anchor the character root at this elevated position so gravity cannot
+        -- pull it down. Remember the original state so every normal exit restores it.
         if Game.bossAnchoredRoot ~= playerRoot then
             Game.bossAnchoredRoot = playerRoot
             Game.bossRootWasAnchored = playerRoot.Anchored
@@ -1626,7 +1627,7 @@ xpcall(function()
     local function runBossEncounter(boss, areaKey)
         local bossName = boss and boss.Name or Game.areaBossName or "Boss"
         Game.status = "Fighting " .. tostring(bossName) .. " with Gun"
-        notify("Boss encounter started: " .. tostring(bossName) .. "; selecting slot 5 and locking behind the boss.")
+        notify("Boss encounter started: " .. tostring(bossName) .. "; selecting slot 5 and hovering above the boss.")
 
         local lastMissingTargetWarning = 0
         local bossMissingSince = nil
@@ -1712,8 +1713,13 @@ xpcall(function()
                         else
                             -- Hold fire only while both the live bar and the
                             -- corresponding model are present in the current scan.
-                            -- Lock behind the boss once, then only reposition if
-                            -- it has moved several studs; aim is refreshed each tick.
+                            -- Keep the character anchored aloft every tick, so a
+                            -- replication/state change cannot let gravity drop it.
+                            pcall(function()
+                                root.Anchored = true
+                                root.AssemblyLinearVelocity = Vector3.zero
+                                root.AssemblyAngularVelocity = Vector3.zero
+                            end)
                             Game.setAttackMouseDown(true)
                             local bossDisplacement = Game.bossLockedBossPosition
                                 and (targetRoot.Position - Game.bossLockedBossPosition).Magnitude
@@ -3381,7 +3387,7 @@ xpcall(function()
     new("UIStroke", { Color = Theme.accent }, toggleBtn)
 
     window = new("Frame", {
-        Size = UDim2.new(0, 700, 0, 520), Position = UDim2.new(0.5, -350, 0.5, -260),
+        Size = UDim2.new(0, 700, 0, 550), Position = UDim2.new(0.5, -350, 0.5, -275),
         BackgroundColor3 = Theme.bg, BorderSizePixel = 0, ClipsDescendants = true,
     }, screenGui)
     Game.overlayWindow = window
@@ -4070,43 +4076,76 @@ xpcall(function()
     local isDragging = false
     local dragStart: Vector2? = nil
     local dragStartPos: Vector2? = nil
+    local activeDragTouch: InputObject? = nil
+
+    local function stopDragging(): ()
+        isDragging = false
+        dragStart = nil
+        dragStartPos = nil
+        activeDragTouch = nil
+    end
 
     local function ensureOnScreen(): ()
-        if not window.Visible or isDragging then 
-            return 
+        if not window.Visible or isDragging then
+            return
         end
         local abs = window.AbsolutePosition
         local cx, cy = clampOffsets(abs.X, abs.Y)
         if math.abs(cx - abs.X) > 0.5 or math.abs(cy - abs.Y) > 0.5 then
-            window.Position = UDim2.new(0, cx, 0, cy)
+            window.Position = UDim2.fromOffset(cx, cy)
         end
     end
 
     titleBar.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            local abs = window.AbsolutePosition
-            window.Position = UDim2.new(0, abs.X, 0, abs.Y)
-            dragStart = Vector2.new(input.Position.X, input.Position.Y)
-            dragStartPos = Vector2.new(window.Position.X.Offset, window.Position.Y.Offset)
-            isDragging = true
-            input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then 
-                    isDragging = false 
-                    dragStart = nil 
-                    dragStartPos = nil 
-                end
-            end)
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1
+            and input.UserInputType ~= Enum.UserInputType.Touch then
+            return
         end
+
+        -- Ignore a press over the close button; it should close the window,
+        -- not start a drag. Capture the absolute window position BEFORE
+        -- converting away from the centered scale-based initial position.
+        local pointer = Vector2.new(input.Position.X, input.Position.Y)
+        local closePos = closeBtn.AbsolutePosition
+        local closeSize = closeBtn.AbsoluteSize
+        local overClose = pointer.X >= closePos.X and pointer.X <= closePos.X + closeSize.X
+            and pointer.Y >= closePos.Y and pointer.Y <= closePos.Y + closeSize.Y
+        if overClose then
+            return
+        end
+
+        local abs = window.AbsolutePosition
+        dragStart = pointer
+        dragStartPos = Vector2.new(abs.X, abs.Y)
+        activeDragTouch = input.UserInputType == Enum.UserInputType.Touch and input or nil
+        window.Position = UDim2.fromOffset(abs.X, abs.Y)
+        isDragging = true
     end)
 
     bind(UserInputService.InputChanged, function(input)
-        if not isDragging or not dragStart or not dragStartPos then 
-            return 
+        if not isDragging or not dragStart or not dragStartPos then
+            return
         end
-        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
-            local delta = Vector2.new(input.Position.X, input.Position.Y) - dragStart
-            local x, y = clampOffsets(dragStartPos.X + delta.X, dragStartPos.Y + delta.Y)
-            window.Position = UDim2.new(0, x, 0, y)
+
+        local isMouseMove = input.UserInputType == Enum.UserInputType.MouseMovement
+        local isActiveTouchMove = activeDragTouch ~= nil and input == activeDragTouch
+        if not isMouseMove and not isActiveTouchMove then
+            return
+        end
+
+        local pointer = Vector2.new(input.Position.X, input.Position.Y)
+        local delta = pointer - dragStart
+        local x, y = clampOffsets(dragStartPos.X + delta.X, dragStartPos.Y + delta.Y)
+        window.Position = UDim2.fromOffset(x, y)
+    end)
+
+    bind(UserInputService.InputEnded, function(input)
+        if not isDragging then
+            return
+        end
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or (activeDragTouch ~= nil and input == activeDragTouch) then
+            stopDragging()
         end
     end)
 
