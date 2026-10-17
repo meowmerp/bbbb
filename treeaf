@@ -771,8 +771,9 @@ xpcall(function()
         return true
     end
 
-    -- Find the compact day/night indicator rather than instructional text like
-    -- "Day and night: 8-minute days, 4-minute nights" in the Night Monsters panel.
+    -- Read the game's explicit phase label when available. The game has four
+    -- phases (Day -> Dusk -> Night -> Dawn -> Day), so Dusk/Dawn must not be
+    -- collapsed into Night/Day. Avoid broad tutorial text and hidden menu labels.
     local function readDayNightHud()
         local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
         if not playerGui then return nil end
@@ -780,8 +781,27 @@ xpcall(function()
         local bestState, bestScore = nil, -1
         for _, inst in ipairs(playerGui:GetDescendants()) do
             if (inst:IsA("TextLabel") or inst:IsA("TextButton")) and inst.Visible then
+                -- A child may be Visible while an ancestor ScreenGui/frame is hidden.
+                local hierarchyVisible = true
+                local ancestor = inst.Parent
+                while ancestor and ancestor ~= playerGui do
+                    if ancestor:IsA("GuiObject") and not ancestor.Visible then
+                        hierarchyVisible = false
+                        break
+                    end
+                    if ancestor:IsA("ScreenGui") and not ancestor.Enabled then
+                        hierarchyVisible = false
+                        break
+                    end
+                    ancestor = ancestor.Parent
+                end
+
+                local positionOk, labelY = pcall(function() return inst.AbsolutePosition.Y end)
+                -- Only inspect the upper HUD strip. This avoids reading a stale
+                -- "Cycle: Night" value from this script's own Overview panel.
+                local inTopHud = positionOk and labelY <= 180
                 local raw = string.lower(tostring(inst.Text or ""))
-                if raw ~= "" then
+                if hierarchyVisible and inTopHud and raw ~= "" then
                     local instructional = string.find(raw, "minute", 1, true)
                         or string.find(raw, "minions", 1, true)
                         or string.find(raw, "monsters", 1, true)
@@ -789,33 +809,38 @@ xpcall(function()
                         or string.find(raw, "replant", 1, true)
                         or string.find(raw, "thieves", 1, true)
                         or string.find(raw, "biters", 1, true)
+                        or string.find(raw, "day and night", 1, true)
                     if not instructional and #raw <= 48 then
                         local normalized = string.gsub(raw, "[^%a%d: ]", " ")
                         normalized = string.gsub(normalized, "%s+", " ")
                         normalized = string.match(normalized, "^%s*(.-)%s*$") or normalized
                         local first = string.match(normalized, "^(%a+)") or ""
                         local state = nil
-                        -- Accept compact labels (DAY, NIGHT, DAYTIME, NIGHTTIME) and
-                        -- top-HUD variants such as "Time: Night" or "It is Day".
-                        if first == "day" or first == "daytime"
-                            or string.find(normalized, "%f[%a]day%f[%A]")
-                            or string.find(normalized, "%f[%a]daytime%f[%A]") then
-                            state = "Day"
+
+                        -- Check transitional phases first and only accept whole words.
+                        if first == "dusk" or first == "dusktime"
+                            or string.find(normalized, "%f[%a]dusk%f[%A]") then
+                            state = "Dusk"
+                        elseif first == "dawn" or first == "dawntime"
+                            or string.find(normalized, "%f[%a]dawn%f[%A]") then
+                            state = "Dawn"
                         elseif first == "night" or first == "nighttime"
                             or string.find(normalized, "%f[%a]night%f[%A]")
                             or string.find(normalized, "%f[%a]nighttime%f[%A]") then
                             state = "Night"
-                        elseif string.find(normalized, "^current day[%s:%d]*$") then
+                        elseif first == "day" or first == "daytime"
+                            or string.find(normalized, "%f[%a]day%f[%A]")
+                            or string.find(normalized, "%f[%a]daytime%f[%A]") then
                             state = "Day"
-                        elseif string.find(normalized, "^current night[%s:%d]*$") then
-                            state = "Night"
                         end
 
                         if state then
-                            local score = (#normalized <= 20) and 3 or 1
-                            local ok, y = pcall(function() return inst.AbsolutePosition.Y end)
-                            if ok and y <= 180 then score += 2 end
-                            if normalized == "day" or normalized == "night" then score += 2 end
+                            local score = (#normalized <= 12) and 6 or 1
+                            score += 3 -- candidates already restricted to the upper HUD strip
+                            if normalized == "day" or normalized == "dusk"
+                                or normalized == "night" or normalized == "dawn" then
+                                score += 4
+                            end
                             if score > bestScore then
                                 bestState, bestScore = state, score
                             end
@@ -828,17 +853,22 @@ xpcall(function()
             return bestState
         end
 
-        -- Some versions of the HUD render the cycle as an icon rather than readable
-        -- text. Fall back to Lighting.ClockTime so the state is known on execute,
-        -- then keep polling the HUD so its explicit indicator can take precedence.
+        -- If the HUD phase is an icon with no readable text, use Lighting.ClockTime
+        -- as a fallback. Dusk and dawn get their own windows so night-only behavior
+        -- is not enabled during those transitions.
         local clockOk, clockTime = pcall(function()
             return Lighting.ClockTime
         end)
         if clockOk and type(clockTime) == "number" then
             if clockTime >= 6 and clockTime < 18 then
                 return "Day"
+            elseif clockTime >= 18 and clockTime < 19 then
+                return "Dusk"
+            elseif clockTime >= 5 and clockTime < 6 then
+                return "Dawn"
+            else
+                return "Night"
             end
-            return "Night"
         end
         return nil
     end
@@ -846,7 +876,7 @@ xpcall(function()
     -- Initialize the cycle immediately during script execution instead of waiting
     -- for the background worker's first polling interval.
     Game.dayNight = readDayNightHud() or "Unknown"
-    notify("Initial day/night detection: " .. Game.dayNight)
+    notify("Initial cycle detection: " .. Game.dayNight)
 
     local function normalizedName(value)
         return string.gsub(string.lower(tostring(value or "")), "[^%w]", "")
@@ -1640,7 +1670,7 @@ xpcall(function()
         local lastApproachChangeAt = os.clock()
 
         while not unloaded and Flags.AutoChop do
-            -- Nearby-mob interception is a night-only detour. If the HUD flips
+            -- Nearby-mob interception is active only during the Night phase (not Dusk/Dawn). If the HUD flips
             -- to Day during combat, stop intercepting and return to farming.
             if Game.dayNight ~= "Night" then
                 Game.cachedMob = nil
@@ -3986,7 +4016,7 @@ xpcall(function()
         local detected = readDayNightHud()
         if detected and detected ~= Game.dayNight then
             Game.dayNight = detected
-            notify("Day/night HUD detected: " .. detected)
+            notify("Cycle phase detected: " .. detected)
         end
     end)
 
