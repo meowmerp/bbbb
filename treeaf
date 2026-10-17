@@ -1,6 +1,6 @@
 --!nonstrict
 --=============================================================================
--- Standalone The Forest Automation Script + GUI
+-- Chop A Forest automation script + GUI
 -- v3.3 (Config persistence, area progress gate, automated boss phase)
 --=============================================================================
 
@@ -96,6 +96,10 @@ xpcall(function()
         bossNextRepositionAt = 0,
         bossAnchoredRoot = nil,
         bossRootWasAnchored = nil,
+        bossEncounterActive = false,
+        bossPlayerDied = false,
+        bossReturnPosition = nil,
+        bossRespawnTeleportPending = false,
     }
 
     --=============================================================================
@@ -1609,6 +1613,10 @@ xpcall(function()
 
         Game.bossAimPoint = aimPoint
         Game.bossLockedBossPosition = targetRoot.Position
+        -- Keep a return point in the same boss area so a death does not send
+        -- the player back to the tree-farming spawn. This is refreshed while
+        -- the boss is alive and is used after CharacterAdded.
+        Game.bossReturnPosition = targetRoot.Position + Vector3.new(0, 3, 0)
         Game.bossNextRepositionAt = os.clock() + 0.8
         Game.aimCameraAt(aimPoint)
         return true
@@ -1676,6 +1684,8 @@ xpcall(function()
         Game.bossApproachDirection = nil
         Game.bossLockedBossPosition = nil
         Game.bossNextRepositionAt = 0
+        Game.bossPlayerDied = false
+        Game.bossEncounterActive = true
         Game.bossAnchoredRoot = nil
         Game.bossRootWasAnchored = nil
         local previousWindowVisible = Game.overlayWindow and Game.overlayWindow.Visible
@@ -1689,6 +1699,10 @@ xpcall(function()
 
         local loopOk, loopErr = pcall(function()
             while not unloaded and Flags.AutoChop and Game.areaCompleteKey == areaKey do
+                if Game.bossPlayerDied then
+                    outcome = "player-died"
+                    break
+                end
                 local currentState = readAreaHudState()
                 if currentState.key ~= areaKey
                     or (currentState.percent ~= nil and currentState.percent < 99.9) then
@@ -1782,6 +1796,7 @@ xpcall(function()
         end
         Game.bossAnchoredRoot = nil
         Game.bossRootWasAnchored = nil
+        Game.bossEncounterActive = false
         Game.bossApproachDirection = nil
         Game.bossLockedBossPosition = nil
         Game.bossNextRepositionAt = 0
@@ -2105,6 +2120,11 @@ xpcall(function()
                         end
                     elseif outcome == "area-changed" then
                         Game.cachedBoss = nil
+                    elseif outcome == "player-died" then
+                        Game.cachedBoss = nil
+                        Game.lastBossNotice = nil
+                        Game.status = "Respawned after boss death; returning to boss area"
+                        notify("Died during boss fight. Returning to the boss area and waiting for it to respawn.")
                     elseif outcome == "boss-bar-lost" then
                         Game.cachedBoss = nil
                         Game.status = "Boss bar missing; firing stopped, waiting for bar"
@@ -2269,6 +2289,13 @@ xpcall(function()
             if ok and type(result) == "table" and result.Ok then
                 Game.bought += 1
                 notify("Bought " .. tostring(def.DisplayName or name))
+                if name == "Axe" then
+                    task.wait(0.25)
+                    if Game.pressWeaponSlot then
+                        Game.pressWeaponSlot(2)
+                    end
+                    notify("Axe bought; pressed slot 2 to equip it.")
+                end
                 return true
             end
             return false
@@ -2372,6 +2399,18 @@ xpcall(function()
     local function stepBuyer()
         if Game.busy or unloaded then 
             return 
+        end
+
+        -- Axe is the mandatory first purchase. Do not spend on upgrades or
+        -- any other shop items until the player owns it. This intentionally
+        -- runs even when AutoTools is off, as long as the buyer worker is active.
+        if not toolOwned("Axe") then
+            Game.status = "Axe required first — waiting to buy Axe"
+            local boughtAxe = tryBuyTool("Axe")
+            if boughtAxe then
+                notify("Axe purchased; other purchases are unlocked.")
+            end
+            return
         end
         
         if Flags.AutoTools then
@@ -3234,6 +3273,30 @@ xpcall(function()
                     end
                 end
             end)
+            bind(humanoid.Died, function()
+                if Game.bossEncounterActive and Game.bossReturnPosition then
+                    Game.bossPlayerDied = true
+                    Game.bossRespawnTeleportPending = true
+                    notify("Boss defeated your character; saved the boss-area return point for respawn.")
+                end
+            end)
+        end
+        if Game.bossRespawnTeleportPending and Game.bossReturnPosition then
+            task.spawn(function()
+                local root = character:FindFirstChild("HumanoidRootPart") or character:WaitForChild("HumanoidRootPart", 8)
+                local newHumanoid = character:FindFirstChildOfClass("Humanoid") or character:WaitForChild("Humanoid", 5)
+                if not unloaded and root and root:IsA("BasePart") and newHumanoid and newHumanoid.Health > 0 then
+                    task.wait(0.25)
+                    local returnPosition = Game.bossReturnPosition
+                    if returnPosition then
+                        root.AssemblyLinearVelocity = Vector3.zero
+                        root.CFrame = CFrame.new(returnPosition)
+                        Game.status = "Returned to boss area; waiting for boss respawn"
+                        notify("Teleported back to the boss area. Waiting for the boss to respawn.")
+                    end
+                end
+                Game.bossRespawnTeleportPending = false
+            end)
         end
     end
 
@@ -3422,7 +3485,7 @@ xpcall(function()
     local titleBar = new("Frame", { Size = UDim2.new(1, 0, 0, 46), BackgroundColor3 = Theme.panel, BorderSizePixel = 0 }, window)
     new("TextLabel", {
         Position = UDim2.new(0, 16, 0, 0), Size = UDim2.new(0, 300, 1, 0), BackgroundTransparency = 1,
-        Text = "THE FOREST   ·   " .. SCRIPT_VERSION, Font = FONT_BOLD, TextSize = 13, TextColor3 = Theme.text,
+        Text = "CHOP A FOREST   ·   " .. SCRIPT_VERSION, Font = FONT_BOLD, TextSize = 13, TextColor3 = Theme.text,
         TextXAlignment = Enum.TextXAlignment.Left,
     }, titleBar)
     local closeBtn = new("TextButton", {
