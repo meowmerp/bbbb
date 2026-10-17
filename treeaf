@@ -91,6 +91,11 @@ xpcall(function()
         bossSearchWarningShown = false,
         lastHudAreaReport = nil,
         autoZoneAdvanceTarget = nil,
+        bossApproachDirection = nil,
+        bossLockedBossPosition = nil,
+        bossNextRepositionAt = 0,
+        bossAnchoredRoot = nil,
+        bossRootWasAnchored = nil,
     }
 
     --=============================================================================
@@ -1512,12 +1517,13 @@ xpcall(function()
         end
     end
 
-    Game.placeAtBossWeakpoint = function(boss, orbitIndex)
-        local _, root = getRoot()
+    Game.placeAtBossWeakpoint = function(boss, resetDirection)
+        local _, playerRoot = getRoot()
         local targetRoot = modelRootPart(boss)
-        if not root or not targetRoot then
+        if not playerRoot or not targetRoot then
             return false
         end
+
         local boxCf, boxSize
         local ok = pcall(function()
             boxCf, boxSize = boss:GetBoundingBox()
@@ -1526,25 +1532,44 @@ xpcall(function()
             boxCf = targetRoot.CFrame
             boxSize = targetRoot.Size
         end
-        -- Aim near the upper-front body (the marked weak-point area in the
-        -- screenshot), and rotate through four nearby sides while firing so the
-        -- camera/character can keep facing the target from different angles.
-        local aimPoint = boxCf.Position + boxCf.UpVector * (boxSize.Y * 0.20)
+
+        -- Choose one stable world-space approach direction from the boss's
+        -- facing. Do not orbit through four sides; that was causing the erratic
+        -- motion reported during otherwise successful fights.
+        if resetDirection or not Game.bossApproachDirection then
+            local look = targetRoot.CFrame.LookVector
+            local horizontalLook = Vector3.new(look.X, 0, look.Z)
+            if horizontalLook.Magnitude < 0.05 then
+                horizontalLook = Vector3.new(0, 0, -1)
+            end
+            Game.bossApproachDirection = -horizontalLook.Unit
+        end
+
+        local horizontal = Game.bossApproachDirection
+        local radius = math.clamp(math.max(boxSize.X, boxSize.Z) * 0.32, 5.5, 10)
+        -- Stay above the ground and roughly at the boss's torso level, without
+        -- jumping to the top of the model. The camera aims separately at the
+        -- upper-body point, so the player position needn't orbit around it.
+        local verticalOffset = math.clamp(boxSize.Y * 0.08, 2.5, 4.5)
+        local destination = boxCf.Position + horizontal * radius + Vector3.new(0, verticalOffset, 0)
+        local aimPoint = boxCf.Position + Vector3.new(0, math.clamp(boxSize.Y * 0.12, 2, 5), 0)
+
+        -- Anchor the character root at the selected position for a stable firing
+        -- platform. Remember its original state so every normal exit restores it.
+        if Game.bossAnchoredRoot ~= playerRoot then
+            Game.bossAnchoredRoot = playerRoot
+            Game.bossRootWasAnchored = playerRoot.Anchored
+        end
+        pcall(function()
+            playerRoot.AssemblyLinearVelocity = Vector3.zero
+            playerRoot.AssemblyAngularVelocity = Vector3.zero
+            playerRoot.Anchored = true
+            playerRoot.CFrame = CFrame.lookAt(destination, aimPoint)
+        end)
+
         Game.bossAimPoint = aimPoint
-        local directions = {
-            targetRoot.CFrame.LookVector,
-            targetRoot.CFrame.RightVector,
-            -targetRoot.CFrame.LookVector,
-            -targetRoot.CFrame.RightVector,
-        }
-        local direction = directions[((tonumber(orbitIndex) or 1) - 1) % #directions + 1]
-        local horizontal = Vector3.new(direction.X, 0, direction.Z)
-        if horizontal.Magnitude < 0.05 then horizontal = Vector3.new(1, 0, 0) end
-        horizontal = horizontal.Unit
-        local radius = math.clamp(math.max(boxSize.X, boxSize.Z) * 0.25, 3, 7)
-        local destination = aimPoint + horizontal * radius + Vector3.new(0, 1.5, 0)
-        root.AssemblyLinearVelocity = Vector3.zero
-        root.CFrame = CFrame.lookAt(destination, aimPoint)
+        Game.bossLockedBossPosition = targetRoot.Position
+        Game.bossNextRepositionAt = os.clock() + 0.8
         Game.aimCameraAt(aimPoint)
         return true
     end
@@ -1601,14 +1626,17 @@ xpcall(function()
     local function runBossEncounter(boss, areaKey)
         local bossName = boss and boss.Name or Game.areaBossName or "Boss"
         Game.status = "Fighting " .. tostring(bossName) .. " with Gun"
-        notify("Boss encounter started: " .. tostring(bossName) .. "; selecting slot 5 and waiting for the top boss bar.")
+        notify("Boss encounter started: " .. tostring(bossName) .. "; selecting slot 5 and locking behind the boss.")
 
         local lastMissingTargetWarning = 0
         local bossMissingSince = nil
         local bossBarMissingSince = nil
         local outcome = "stopped"
-        local orbitIndex = 0
-        local nextOrbitAt = 0
+        Game.bossApproachDirection = nil
+        Game.bossLockedBossPosition = nil
+        Game.bossNextRepositionAt = 0
+        Game.bossAnchoredRoot = nil
+        Game.bossRootWasAnchored = nil
         local previousWindowVisible = Game.overlayWindow and Game.overlayWindow.Visible
         if Game.overlayWindow then
             Game.overlayWindow.Visible = false
@@ -1684,13 +1712,27 @@ xpcall(function()
                         else
                             -- Hold fire only while both the live bar and the
                             -- corresponding model are present in the current scan.
+                            -- Lock behind the boss once, then only reposition if
+                            -- it has moved several studs; aim is refreshed each tick.
                             Game.setAttackMouseDown(true)
-                            if os.clock() >= nextOrbitAt then
-                                orbitIndex = orbitIndex % 4 + 1
-                                Game.placeAtBossWeakpoint(boss, orbitIndex)
-                                nextOrbitAt = os.clock() + 0.35
+                            local bossDisplacement = Game.bossLockedBossPosition
+                                and (targetRoot.Position - Game.bossLockedBossPosition).Magnitude
+                                or math.huge
+                            if not Game.bossLockedBossPosition
+                                or (bossDisplacement >= 5 and os.clock() >= (Game.bossNextRepositionAt or 0)) then
+                                Game.placeAtBossWeakpoint(boss, false)
                             else
-                                Game.aimCameraAt(Game.bossAimPoint or targetRoot.Position)
+                                local currentAimPoint = targetRoot.Position
+                                local boundsOk, currentBoxCf, currentBoxSize = pcall(function()
+                                    local cf, size = boss:GetBoundingBox()
+                                    return cf, size
+                                end)
+                                if boundsOk and currentBoxCf and currentBoxSize then
+                                    currentAimPoint = currentBoxCf.Position
+                                        + Vector3.new(0, math.clamp(currentBoxSize.Y * 0.12, 2, 5), 0)
+                                end
+                                Game.bossAimPoint = currentAimPoint
+                                Game.aimCameraAt(currentAimPoint)
                             end
                             task.wait(0.08)
                         end
@@ -1700,6 +1742,18 @@ xpcall(function()
         end)
 
         Game.setAttackMouseDown(false)
+        if Game.bossAnchoredRoot and Game.bossAnchoredRoot.Parent then
+            pcall(function()
+                Game.bossAnchoredRoot.AssemblyLinearVelocity = Vector3.zero
+                Game.bossAnchoredRoot.AssemblyAngularVelocity = Vector3.zero
+                Game.bossAnchoredRoot.Anchored = (Game.bossRootWasAnchored == true)
+            end)
+        end
+        Game.bossAnchoredRoot = nil
+        Game.bossRootWasAnchored = nil
+        Game.bossApproachDirection = nil
+        Game.bossLockedBossPosition = nil
+        Game.bossNextRepositionAt = 0
         if Game.overlayWindow and previousWindowVisible ~= nil then
             Game.overlayWindow.Visible = previousWindowVisible
         end
@@ -4155,6 +4209,20 @@ xpcall(function()
         end
 
         unloaded = true
+        -- If the script is unloaded during a boss fight, release the held fire
+        -- input and undo the temporary player-root anchor immediately.
+        pcall(function()
+            if Game.setAttackMouseDown then
+                Game.setAttackMouseDown(false)
+            end
+            if Game.bossAnchoredRoot and Game.bossAnchoredRoot.Parent then
+                Game.bossAnchoredRoot.AssemblyLinearVelocity = Vector3.zero
+                Game.bossAnchoredRoot.AssemblyAngularVelocity = Vector3.zero
+                Game.bossAnchoredRoot.Anchored = (Game.bossRootWasAnchored == true)
+            end
+        end)
+        Game.bossAnchoredRoot = nil
+        Game.bossRootWasAnchored = nil
         stopAllFeatures()
         for _, c in ipairs(connections) do
             pcall(function()
