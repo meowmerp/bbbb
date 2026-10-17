@@ -1540,6 +1540,19 @@ xpcall(function()
         return targetRoot and targetRoot.Position or Vector3.zero
     end
 
+    Game.getPlayerHeadOffset = function(playerRoot)
+        -- The HumanoidRootPart sits below the player's eye/head level. Aligning
+        -- the root itself with the boss's aim point makes the player look too high.
+        -- Measure the actual head-to-root offset so the player's head/shot level
+        -- lines up with the boss point being aimed at.
+        local character = LocalPlayer.Character
+        local head = character and character:FindFirstChild("Head", true)
+        if playerRoot and head and head:IsA("BasePart") then
+            return head.Position.Y - playerRoot.Position.Y
+        end
+        return 1.5
+    end
+
     Game.placeAtBossWeakpoint = function(boss, resetDirection)
         local _, playerRoot = getRoot()
         local targetRoot = modelRootPart(boss)
@@ -1556,9 +1569,9 @@ xpcall(function()
             boxSize = targetRoot.Size
         end
 
-        -- Choose one stable approach direction in FRONT of the boss. Do not
-        -- orbit through multiple sides; that caused erratic movement. Roblox's
-        -- LookVector points forward from the boss's facing direction.
+        -- Choose one stable approach direction in FRONT of the boss. Roblox's
+        -- LookVector is the boss's forward-facing direction; keep the player's
+        -- approach horizontal so the avatar doesn't pitch upward toward the aim point.
         if resetDirection or not Game.bossApproachDirection then
             local look = targetRoot.CFrame.LookVector
             local horizontalLook = Vector3.new(look.X, 0, look.Z)
@@ -1569,18 +1582,20 @@ xpcall(function()
         end
 
         local horizontal = Game.bossApproachDirection
-        -- Keep the player 10 studs in front, but at the same world height as
-        -- the boss's Head part (not floating over the top of its bounding box).
         local frontDistance = 10
         local aimPoint = Game.getBossHeadPosition(boss, boxCf, boxSize, targetRoot)
+        local headOffset = Game.getPlayerHeadOffset(playerRoot)
+
+        -- Put the player's HEAD at the same height as the exact point the camera
+        -- and gun are aiming at. The root itself must therefore be lower by the
+        -- player's measured head-to-root offset (not at aimPoint.Y).
         local destination = Vector3.new(
             boxCf.Position.X + horizontal.X * frontDistance,
-            aimPoint.Y,
+            aimPoint.Y - headOffset,
             boxCf.Position.Z + horizontal.Z * frontDistance
         )
+        local flatFacingPoint = Vector3.new(aimPoint.X, destination.Y, aimPoint.Z)
 
-        -- Anchor the character root at this elevated position so gravity cannot
-        -- pull it down. Remember the original state so every normal exit restores it.
         if Game.bossAnchoredRoot ~= playerRoot then
             Game.bossAnchoredRoot = playerRoot
             Game.bossRootWasAnchored = playerRoot.Anchored
@@ -1589,7 +1604,7 @@ xpcall(function()
             playerRoot.AssemblyLinearVelocity = Vector3.zero
             playerRoot.AssemblyAngularVelocity = Vector3.zero
             playerRoot.Anchored = true
-            playerRoot.CFrame = CFrame.lookAt(destination, aimPoint)
+            playerRoot.CFrame = CFrame.lookAt(destination, flatFacingPoint)
         end)
 
         Game.bossAimPoint = aimPoint
@@ -1763,7 +1778,9 @@ xpcall(function()
                                 -- Keep hover height in line with the head if the
                                 -- boss animates vertically, without constantly
                                 -- teleporting the player around its sides.
-                                if math.abs(root.Position.Y - currentAimPoint.Y) > 1.5
+                                local playerHeadOffset = Game.getPlayerHeadOffset(root)
+                                local estimatedPlayerHeadY = root.Position.Y + playerHeadOffset
+                                if math.abs(estimatedPlayerHeadY - currentAimPoint.Y) > 1.5
                                     and os.clock() >= (Game.bossNextRepositionAt or 0) then
                                     Game.placeAtBossWeakpoint(boss, false)
                                 end
