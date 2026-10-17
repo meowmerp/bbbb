@@ -28,6 +28,10 @@ local RETRY_AFTER  = 5
 local RAY_UP       = 80
 local RAY_DOWN     = 400
 local FREEZE_LOG_LINES = 5
+-- Fallback: if settleOnFloor fails this many times in a row, teleport
+-- to the last mob we saw (exact position, no offset).
+local FALLBACK_AFTER_TRIES = 5
+local FALLBACK_MAX_AGE     = 60   -- seconds; last mob older than this is ignored
 
 -- Activity Log
 local TELEPORT_DIST = 12
@@ -67,6 +71,7 @@ local freezeEnabled = true
 local anchored, lastPos, frozenAt = false, nil, 0
 local catches, settles = 0, 0
 local freezeLines = {}
+local failedSettleTries = 0
 
 local logRunning     = true
 local logBuffer      = {}
@@ -85,6 +90,10 @@ local autoRecovers     = 0
 local lastGoodPos      = nil
 local lastGoodTime     = 0
 local lastActivityTime = os.clock()
+
+-- Last mob we were near, used as a fallback if settleOnFloor keeps failing.
+local lastMobPos  = nil
+local lastMobTime = 0
 
 local wLastPos, wLastMoveCheckPos, wLastMoveTime = nil, nil, os.clock()
 local wLastStuckLog = 0
@@ -352,10 +361,11 @@ local function isBlacklisted(model)
     return false
 end
 
--- FALL FREEZE LOGIC (original v2, unchanged)
+-- FALL FREEZE LOGIC
 local function release(r)
     if r then r.Anchored = false end
     anchored = false
+    failedSettleTries = 0
 end
 
 local function settleOnFloor(r)
@@ -368,10 +378,33 @@ local function settleOnFloor(r)
         r.CFrame = CFrame.new(hit.Position + Vector3.new(0, 3.2, 0)) * (r.CFrame - r.CFrame.Position)
         r.AssemblyLinearVelocity = Vector3.zero
         settles = settles + 1
+        failedSettleTries = 0
         pushFreezeLog(string.format("floor: %s y=%.1f", hit.Instance.Name, hit.Position.Y))
         return true
     end
-    pushFreezeLog("no floor under you, staying frozen")
+
+    failedSettleTries = failedSettleTries + 1
+
+    if failedSettleTries >= FALLBACK_AFTER_TRIES then
+        if lastMobPos and (os.clock() - lastMobTime) < FALLBACK_MAX_AGE then
+            r.CFrame = CFrame.new(lastMobPos)
+            r.AssemblyLinearVelocity = Vector3.zero
+            settles = settles + 1
+            failedSettleTries = 0
+            pushFreezeLog(string.format(
+                "no floor after %d tries -> teleported to last mob %s (%.0fs ago)",
+                FALLBACK_AFTER_TRIES, fmtV(lastMobPos), os.clock() - lastMobTime))
+            return true
+        else
+            pushFreezeLog(string.format(
+                "no floor after %d tries, but no recent mob to fall back to",
+                failedSettleTries))
+            return false
+        end
+    end
+
+    pushFreezeLog(string.format("no floor under you, staying frozen (try %d/%d)",
+        failedSettleTries, FALLBACK_AFTER_TRIES))
     return false
 end
 
@@ -400,6 +433,7 @@ conns[#conns + 1] = RunService.Heartbeat:Connect(function()
         r.Anchored = true
         anchored = true
         frozenAt = os.clock()
+        failedSettleTries = 0
         catches = catches + 1
         pushFreezeLog(string.format("caught fall #%d at y=%.1f", catches, pos.Y))
     end
@@ -408,6 +442,7 @@ end)
 
 conns[#conns + 1] = lp.CharacterAdded:Connect(function()
     anchored, lastPos = false, nil
+    failedSettleTries = 0
     pushFreezeLog("character respawned")
 end)
 
@@ -539,6 +574,12 @@ conns[#conns + 1] = RunService.Heartbeat:Connect(function()
     if gm and gd < GOODPOS_MIN_DIST then
         lastGoodPos  = pos
         lastGoodTime = os.clock()
+    end
+
+    -- Remember the last mob we were fighting, for the freeze fallback.
+    if gm and gd and gd < 40 then
+        lastMobPos  = gm.root.Position
+        lastMobTime = os.clock()
     end
 
     if not wLastMoveCheckPos or (pos - wLastMoveCheckPos).Magnitude > STUCK_MOVE then
