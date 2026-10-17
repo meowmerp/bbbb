@@ -1517,6 +1517,29 @@ xpcall(function()
         end
     end
 
+    Game.getBossHeadPosition = function(boss, boxCf, boxSize, targetRoot)
+        -- Prefer the boss's actual Head part so our hover height and aim point
+        -- are level with its head, not above the model's bounding box.
+        local head = nil
+        pcall(function()
+            local candidate = boss:FindFirstChild("Head", true)
+            if candidate and candidate:IsA("BasePart") then
+                head = candidate
+            end
+        end)
+        if head then
+            return head.Position
+        end
+
+        -- Some custom NPC rigs do not expose a part named Head. In that case,
+        -- aim near the upper quarter of the model and keep the player at that
+        -- same height as a practical fallback.
+        if boxCf and boxSize then
+            return boxCf.Position + Vector3.new(0, boxSize.Y * 0.22, 0)
+        end
+        return targetRoot and targetRoot.Position or Vector3.zero
+    end
+
     Game.placeAtBossWeakpoint = function(boss, resetDirection)
         local _, playerRoot = getRoot()
         local targetRoot = modelRootPart(boss)
@@ -1533,27 +1556,28 @@ xpcall(function()
             boxSize = targetRoot.Size
         end
 
-        -- Choose one stable world-space approach direction from the boss's
-        -- facing. Do not orbit through four sides; that was causing the erratic
-        -- motion reported during otherwise successful fights.
+        -- Choose one stable approach direction in FRONT of the boss. Do not
+        -- orbit through multiple sides; that caused erratic movement. Roblox's
+        -- LookVector points forward from the boss's facing direction.
         if resetDirection or not Game.bossApproachDirection then
             local look = targetRoot.CFrame.LookVector
             local horizontalLook = Vector3.new(look.X, 0, look.Z)
             if horizontalLook.Magnitude < 0.05 then
                 horizontalLook = Vector3.new(0, 0, -1)
             end
-            Game.bossApproachDirection = -horizontalLook.Unit
+            Game.bossApproachDirection = horizontalLook.Unit
         end
 
         local horizontal = Game.bossApproachDirection
-        -- Hold the player just above the boss's bounding-box top, with a small
-        -- offset behind it to avoid intersecting antlers/arms. The previous
-        -- torso-height offset left the player close to the ground and looked as
-        -- if anchoring had failed.
-        local radius = math.clamp(math.max(boxSize.X, boxSize.Z) * 0.14, 1.5, 4)
-        local verticalOffset = (boxSize.Y * 0.5) + 5.5
-        local destination = boxCf.Position + horizontal * radius + Vector3.new(0, verticalOffset, 0)
-        local aimPoint = boxCf.Position + Vector3.new(0, math.clamp(boxSize.Y * 0.10, 2, 5), 0)
+        -- Keep the player 10 studs in front, but at the same world height as
+        -- the boss's Head part (not floating over the top of its bounding box).
+        local frontDistance = 10
+        local aimPoint = Game.getBossHeadPosition(boss, boxCf, boxSize, targetRoot)
+        local destination = Vector3.new(
+            boxCf.Position.X + horizontal.X * frontDistance,
+            aimPoint.Y,
+            boxCf.Position.Z + horizontal.Z * frontDistance
+        )
 
         -- Anchor the character root at this elevated position so gravity cannot
         -- pull it down. Remember the original state so every normal exit restores it.
@@ -1626,8 +1650,9 @@ xpcall(function()
 
     local function runBossEncounter(boss, areaKey)
         local bossName = boss and boss.Name or Game.areaBossName or "Boss"
-        Game.status = "Fighting " .. tostring(bossName) .. " with Gun"
-        notify("Boss encounter started: " .. tostring(bossName) .. "; selecting slot 5 and hovering above the boss.")
+        Game.status = "Boss: 10 studs away (front/head-level)"
+        notify("Boss encounter started: " .. tostring(bossName) .. "; selecting slot 5 and hovering 10 studs in front at head level.")
+        warn("[TheForest] Boss hover position set 10 studs in front at head level.")
 
         local lastMissingTargetWarning = 0
         local bossMissingSince = nil
@@ -1728,14 +1753,19 @@ xpcall(function()
                                 or (bossDisplacement >= 5 and os.clock() >= (Game.bossNextRepositionAt or 0)) then
                                 Game.placeAtBossWeakpoint(boss, false)
                             else
-                                local currentAimPoint = targetRoot.Position
-                                local boundsOk, currentBoxCf, currentBoxSize = pcall(function()
-                                    local cf, size = boss:GetBoundingBox()
-                                    return cf, size
+                                local currentBoxCf, currentBoxSize
+                                pcall(function()
+                                    currentBoxCf, currentBoxSize = boss:GetBoundingBox()
                                 end)
-                                if boundsOk and currentBoxCf and currentBoxSize then
-                                    currentAimPoint = currentBoxCf.Position
-                                        + Vector3.new(0, math.clamp(currentBoxSize.Y * 0.12, 2, 5), 0)
+                                local currentAimPoint = Game.getBossHeadPosition(
+                                    boss, currentBoxCf, currentBoxSize, targetRoot
+                                )
+                                -- Keep hover height in line with the head if the
+                                -- boss animates vertically, without constantly
+                                -- teleporting the player around its sides.
+                                if math.abs(root.Position.Y - currentAimPoint.Y) > 1.5
+                                    and os.clock() >= (Game.bossNextRepositionAt or 0) then
+                                    Game.placeAtBossWeakpoint(boss, false)
                                 end
                                 Game.bossAimPoint = currentAimPoint
                                 Game.aimCameraAt(currentAimPoint)
@@ -3387,7 +3417,7 @@ xpcall(function()
     new("UIStroke", { Color = Theme.accent }, toggleBtn)
 
     window = new("Frame", {
-        Size = UDim2.new(0, 700, 0, 550), Position = UDim2.new(0.5, -350, 0.5, -275),
+        Size = UDim2.new(0, 700, 0, 560), Position = UDim2.new(0.5, -350, 0.5, -280),
         BackgroundColor3 = Theme.bg, BorderSizePixel = 0, ClipsDescendants = true,
     }, screenGui)
     Game.overlayWindow = window
