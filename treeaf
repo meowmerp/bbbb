@@ -47,7 +47,6 @@ xpcall(function()
     local DEFAULT_FLAGS = {
         AutoChop = false, Zone = "OakWood", ChopDelay = 0.4,
         AutoFightMobs = true, AutoAdvanceZone = true, AutoDetectZone = true,
-        SmartWeapons = false,
         AutoPickup = false, AutoSell = false, SellAt = 5, AutoCoins = false,
         AutoTools = false, BuyTools = {},
         AutoUpgrades = false, BuyUpgrades = {},
@@ -75,7 +74,6 @@ xpcall(function()
         trees = 0, sells = 0, bought = 0,
         status = "Idle", busy = false, hitSeq = 0,
         badTrees = {}, badLogs = {}, carBuys = {},
-        lastFlameUse = 0,
         lastBossNotice = nil,
         currentAreaKey = nil,
         areaCompleteKey = nil,
@@ -1325,33 +1323,11 @@ xpcall(function()
                 r.CFrame = CFrame.lookAt(standAt, Vector3.new(base.Position.X, standAt.Y, base.Position.Z))
             end
 
-            local usedFlame = false
-            if Flags.SmartWeapons then
-                if os.clock() - Game.lastFlameUse >= 12 then
-                    local flame = equipTool("Flamethrower")
-                    if flame then
-                        Game.status = "Flaming " .. tostring(tree:GetAttribute("TreeType") or "Tree")
-                        VirtualUser:CaptureController()
-                        VirtualUser:ClickButton1(Vector2.new(800, 400))
-                        Game.lastFlameUse = os.clock()
-                        task.wait(1.5)
-                        usedFlame = true
-                    end
-                end
-            end
-
-            if not usedFlame then
-                if Flags.SmartWeapons then
-                    equipTool("Axe")
-                    Game.status = "Chopping " .. tostring(tree:GetAttribute("TreeType") or "Tree")
-                else
-                    Game.status = "Chopping " .. tostring(tree:GetAttribute("TreeType") or "Tree")
-                end
-                
-                Game.hitSeq += 1
-                Remotes.Chop:FireServer(tree, base.Position + Vector3.new(1, 1, 0), 1, Game.hitSeq)
-                task.wait(math.max(0.1, Flags.ChopDelay))
-            end
+            -- Standard chopping only; no automatic tool switching.
+            Game.status = "Chopping " .. tostring(tree:GetAttribute("TreeType") or "Tree")
+            Game.hitSeq += 1
+            Remotes.Chop:FireServer(tree, base.Position + Vector3.new(1, 1, 0), 1, Game.hitSeq)
+            task.wait(math.max(0.1, Flags.ChopDelay))
 
             local hp = tonumber(tree:GetAttribute("HP")) or 0
             if hp < lastHp then
@@ -3319,7 +3295,6 @@ xpcall(function()
         ["Auto Sell Logs"] = "AutoSell",
         ["Auto Pick Up Coins"] = "AutoCoins",
         ["Auto Chop Trees"] = "AutoChop",
-        ["Smart Weapon Swapping"] = "SmartWeapons",
         ["Auto Join"] = "AutoJoin",
         ["Auto Claim Daily Rewards"] = "AutoDaily",
         ["Auto Buy Classes"] = "AutoClasses",
@@ -3777,10 +3752,6 @@ xpcall(function()
     addToggle(chopping, "Auto Advance Zone After Boss", Flags.AutoAdvanceZone, function(v)
         Flags.AutoAdvanceZone = v == true
         saveConfig()
-    end)
-    addToggle(chopping, "Smart Weapon Swapping", Flags.SmartWeapons, function(v) 
-        Flags.SmartWeapons = v
-        saveConfig() 
     end)
     addSlider(chopping, "Chop Delay", 0.1, 1.5, Flags.ChopDelay, 0.01, function(v) return string.format("%.2f", v) end, function(v) Flags.ChopDelay = v; saveConfig() end)
 
