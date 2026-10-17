@@ -1,7 +1,7 @@
 --!nonstrict
 --=============================================================================
 -- Chop A Forest automation script + GUI
--- v3.4 (Axe swing pulses, recovery attack retries, config persistence)
+-- v3.5 (multi-path Axe swing input, recovery retries, config persistence)
 --=============================================================================
 
 local Players            = game:GetService("Players")
@@ -22,7 +22,7 @@ if not game:IsLoaded() then
     game.Loaded:Wait() 
 end
 
-local SCRIPT_VERSION = "v3.4"
+local SCRIPT_VERSION = "v3.5"
 local GAME_NAME      = "The Forest"
 local CONFIG_FILE    = "ForestConfig.json"
 
@@ -501,7 +501,7 @@ xpcall(function()
                                     warn("[TheForest] Returned to the boss area, but the Axe could not yet be confirmed as equipped. The recovery attack watcher will keep retrying slot 2, equip, and Axe swings.")
                                 end
 
-                                -- Repeatedly send short, separate Axe swings while waiting for
+                                -- Repeatedly send multi-path Axe attack pulses while waiting for
                                 -- the boss HUD/model to respawn. No continuous mouse hold is used.
                                 if not Game.bossRecoveryAttackRunning then
                                     Game.bossRecoveryAttackRunning = true
@@ -1871,47 +1871,59 @@ xpcall(function()
     end
 
     Game.clickAttack = function()
-        -- Strict Axe-only guard: do not activate or click while any other Tool
-        -- is equipped. No generic-tool fallback is allowed.
+        -- Axe-only attack pulse. Do not treat pcall() success as proof that an
+        -- input reached the game: executor mouse APIs can exist yet silently do
+        -- nothing after a respawn. Try independent attack paths every pulse.
         local character = LocalPlayer.Character
         local heldTool = character and character:FindFirstChildOfClass("Tool")
         if not isAxeTool(heldTool) then
             return false
         end
-        local activationSucceeded = pcall(function() heldTool:Activate() end)
-        -- Boss attacks use short, separate taps, never a long-lived mouse hold.
-        -- Try the executor's native click first; if unavailable, send an explicit
-        -- down/up pair and always attempt the release so a failed tap cannot leave
-        -- MouseButton1 stuck down. VirtualUser is the final fallback.
+
         local camera = workspace.CurrentCamera
         local viewport = camera and camera.ViewportSize or Vector2.new(1600, 900)
         local point = Vector2.new(math.floor(viewport.X * 0.5), math.floor(viewport.Y * 0.5))
-        local clickSucceeded = false
+        local attempted = false
+
+        -- Tool activation works for tools that listen to Tool.Activated rather
+        -- than UserInputService mouse state. A short pulse avoids leaving the
+        -- activation held when slot keys or a teleport occur.
+        local activateOk = pcall(function() heldTool:Activate() end)
+        attempted = attempted or activateOk
+        task.wait(0.045)
+        pcall(function() heldTool:Deactivate() end)
+
+        -- Attempt executor click even if pcall reports success elsewhere; a
+        -- successful Lua call does not guarantee the client generated an input.
         if type(mouse1click) == "function" then
             local nativeOk = pcall(mouse1click)
-            clickSucceeded = nativeOk
+            attempted = attempted or nativeOk
         end
-        if not clickSucceeded then
-            local virtualInput = nil
-            pcall(function() virtualInput = game:GetService("VirtualInputManager") end)
-            if virtualInput then
-                local downOk = pcall(function()
-                    virtualInput:SendMouseButtonEvent(point.X, point.Y, 0, true, game, 0)
-                end)
-                if downOk then task.wait(0.055) end
-                local upOk = pcall(function()
-                    virtualInput:SendMouseButtonEvent(point.X, point.Y, 0, false, game, 0)
-                end)
-                clickSucceeded = downOk and upOk
-            end
-        end
-        if not clickSucceeded then
-            clickSucceeded = pcall(function()
-                VirtualUser:CaptureController()
-                VirtualUser:ClickButton1(point)
+
+        -- VirtualUser is used on every pulse, not just when another API throws.
+        -- This fixes the previous false-positive fallback logic where pcall()
+        -- returned true even though no visible swing occurred.
+        local virtualUserOk = pcall(function()
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton1(point)
+        end)
+        attempted = attempted or virtualUserOk
+
+        -- Also send a balanced explicit down/up event. Always release in a
+        -- separate protected call so a failure cannot leave the button stuck.
+        local virtualInput = nil
+        pcall(function() virtualInput = game:GetService("VirtualInputManager") end)
+        if virtualInput then
+            local downOk = pcall(function()
+                virtualInput:SendMouseButtonEvent(point.X, point.Y, 0, true, game, 0)
             end)
+            if downOk then task.wait(0.055) end
+            local upOk = pcall(function()
+                virtualInput:SendMouseButtonEvent(point.X, point.Y, 0, false, game, 0)
+            end)
+            attempted = attempted or downOk or upOk
         end
-        return activationSucceeded or clickSucceeded
+        return attempted
     end
 
     Game.getBossHeadPosition = function(boss, boxCf, boxSize, targetRoot)
@@ -2049,7 +2061,7 @@ xpcall(function()
     end
 
     local function runBossEncounter(boss, areaKey)
-        -- Clear any stale mouse hold from a prior run; boss combat uses discrete Axe swings.
+        -- Clear any stale mouse hold from a prior run; boss combat uses repeated Axe attack pulses.
         if Game.setBossMeleeHeld and not Game.bossRecoveryActive and not Game.bossRecoveryAttackRunning then
             pcall(Game.setBossMeleeHeld, false)
         end
@@ -2173,9 +2185,9 @@ xpcall(function()
                             Game.placeAtBossWeakpoint(boss, false)
                             local axe = equipAxe()
                             if isAxeTool(axe) then
-                                -- Use repeated short swing inputs instead of a continuous hold.
-                                -- Keyboard input (such as slot 2 during recovery) can cancel a
-                                -- held mouse input in some executors; a fresh tap each pulse avoids that.
+                                -- Use repeated independent attack pulses instead of a continuous hold.
+                                -- clickAttack now tries Tool activation, executor click, VirtualUser,
+                                -- and balanced VirtualInputManager mouse events on every pulse.
                                 if os.clock() >= nextAxeAttackAt then
                                     local attackOk, attackResult = pcall(Game.clickAttack)
                                     if attackOk and attackResult and Game.bossRecoveryActive then
