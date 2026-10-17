@@ -66,6 +66,8 @@ xpcall(function()
         AntiAfk = true,
     }
     local Flags = {}
+    -- Shared lobby state must be declared before workers that reference it.
+    local LobbyState = { saves = {}, pad = nil, joining = false, classTries = {}, onSavesChanged = nil }
     -- Assigned when the Chopping tab is built; lets the farm worker update the visible dropdown.
     local zoneDropdown = nil
 
@@ -1635,6 +1637,17 @@ xpcall(function()
         return false
     end
 
+    -- Defined before stepBuyer so its closures resolve these local helpers.
+    local function classOwned(id)
+        local owned = "," .. tostring(LocalPlayer:GetAttribute("ClassesOwned") or "") .. ","
+        return string.find(owned, "," .. tostring(id) .. ",", 1, true) ~= nil
+    end
+
+    local function classInStock(id)
+        local stock = "," .. tostring(workspace:GetAttribute("ClassStock") or "") .. ","
+        return string.find(stock, "," .. tostring(id) .. ",", 1, true) ~= nil
+    end
+
     local function stepBuyer()
         if Game.busy or unloaded then 
             return 
@@ -1687,7 +1700,8 @@ xpcall(function()
             if stand and Remotes and Remotes.BuyClass then
                 for id, active in pairs(Flags.BuyClasses) do
                     if active then
-                        local price = tonumber(Config.Classes.Stock.Prices[id])
+                        local classPrices = Config and Config.Classes and Config.Classes.Stock and Config.Classes.Stock.Prices
+                        local price = tonumber(classPrices and classPrices[id])
                         local restock = tostring(workspace:GetAttribute("ClassRestockAt"))
                         if price and not classOwned(id) and classInStock(id) and gemsValue() >= price and LobbyState.classTries[id .. restock] == nil then
                             local bought = withLock(function()
@@ -1746,8 +1760,6 @@ xpcall(function()
     --=============================================================================
     -- Lobby
     --=============================================================================
-
-    local LobbyState = { saves = {}, pad = nil, joining = false, classTries = {}, onSavesChanged = nil }
 
     local function inLobby()
         local lobby = workspace:FindFirstChild("Lobby")
@@ -1930,15 +1942,6 @@ xpcall(function()
         end)
     end
 
-    local function classOwned(id)
-        local owned = "," .. tostring(LocalPlayer:GetAttribute("ClassesOwned") or "") .. ","
-        return string.find(owned, "," .. id .. ",", 1, true) ~= nil
-    end
-
-    local function classInStock(id)
-        local stock = "," .. tostring(workspace:GetAttribute("ClassStock") or "") .. ","
-        return string.find(stock, "," .. id .. ",", 1, true) ~= nil
-    end
 
     --=============================================================================
     -- Worker registry
@@ -3185,6 +3188,9 @@ xpcall(function()
         return dd
     end
 
+    -- Build tabs in a separate function to keep the main chunk below Luau's 200-local-register limit.
+    local UIRefs = {}
+    local function buildTabContents()
     --=============================================================================
     -- Pages
     --=============================================================================
@@ -3208,12 +3214,12 @@ xpcall(function()
         local v = new("TextLabel", { Size = UDim2.new(0.5, 0, 1, 0), Position = UDim2.new(0.5, 0, 0, 0), BackgroundTransparency = 1, Text = defVal, Font = FONT_MED, TextSize = 11, TextColor3 = Theme.text, TextXAlignment = Enum.TextXAlignment.Right }, r)
         return v
     end
-    local statusVal = infoRow(overview, "Status", "Idle")
-    local cashVal = infoRow(overview, "Cash", "$0")
-    local logsVal = infoRow(overview, "Logs", "0/0")
-    local zoneVal = infoRow(overview, "Zone", "-")
-    local cycleVal = infoRow(overview, "Cycle", "Unknown")
-    local sessionVal = infoRow(overview, "Session", "0 trees, 0 sells, 0 buys")
+    UIRefs.statusVal = infoRow(overview, "Status", "Idle")
+    UIRefs.cashVal = infoRow(overview, "Cash", "$0")
+    UIRefs.logsVal = infoRow(overview, "Logs", "0/0")
+    UIRefs.zoneVal = infoRow(overview, "Zone", "-")
+    UIRefs.cycleVal = infoRow(overview, "Cycle", "Unknown")
+    UIRefs.sessionVal = infoRow(overview, "Session", "0 trees, 0 sells, 0 buys")
 
     local logsCash = createCard(mainRight, "🪵", "Logs & Cash")
     addToggle(logsCash, "Auto Pick Up Logs", Flags.AutoPickup, function(v) Setters.feature("AutoPickup", v) end)
@@ -3345,6 +3351,9 @@ xpcall(function()
     end)
     new("TextLabel", { Size = UDim2.new(1, 0, 0, 24), BackgroundTransparency = 1, Text = "Press '=' to instantly kill the script", Font = FONT_MED, TextSize = 11, TextColor3 = Theme.danger, TextXAlignment = Enum.TextXAlignment.Left }, miscCard)
 
+    end
+    buildTabContents()
+
     --=============================================================================
     -- Window logic & workers
     --=============================================================================
@@ -3459,12 +3468,12 @@ xpcall(function()
     end)
 
     startWorker("status", 0.4, function()
-        statusVal.Text = Game.status .. (zoneUnlocked(Flags.Zone) and "" or " (locked)")
-        cashVal.Text = "$" .. short(cashValue()) .. "  Gems " .. short(gemsValue())
-        logsVal.Text = carried() .. " / " .. capacity() .. (Flags.AutoSell and ("  (sell at " .. sellThreshold() .. ")") or "")
-        zoneVal.Text = zoneLabel(Flags.Zone) .. (zoneUnlocked(Flags.Zone) and "" or " (locked)")
-        cycleVal.Text = Game.dayNight or "Unknown"
-        sessionVal.Text = Game.trees .. " trees, " .. Game.sells .. " sells, " .. Game.bought .. " buys"
+        UIRefs.statusVal.Text = Game.status .. (zoneUnlocked(Flags.Zone) and "" or " (locked)")
+        UIRefs.cashVal.Text = "$" .. short(cashValue()) .. "  Gems " .. short(gemsValue())
+        UIRefs.logsVal.Text = carried() .. " / " .. capacity() .. (Flags.AutoSell and ("  (sell at " .. sellThreshold() .. ")") or "")
+        UIRefs.zoneVal.Text = zoneLabel(Flags.Zone) .. (zoneUnlocked(Flags.Zone) and "" or " (locked)")
+        UIRefs.cycleVal.Text = Game.dayNight or "Unknown"
+        UIRefs.sessionVal.Text = Game.trees .. " trees, " .. Game.sells .. " sells, " .. Game.bought .. " buys"
     end)
 
     startWorker("daynight", 0.8, function()
