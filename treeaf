@@ -420,6 +420,40 @@ xpcall(function()
                                 if currentHumanoid and currentHumanoid.Health > 0
                                     and currentRoot and currentRoot:IsA("BasePart")
                                     and not isKnockedDownScreenVisible() then
+                                    -- Prime the melee input immediately BEFORE teleporting,
+                                    -- while the player is fully awake and the game accepts input.
+                                    -- setBossMeleeHeld normally rejects input during recovery, so
+                                    -- temporarily lift the recovery guards just for this live input
+                                    -- handoff, then restore them for the actual teleport attempt.
+                                    if Game.pressWeaponSlot then
+                                        pcall(Game.pressWeaponSlot, 2)
+                                    end
+                                    task.wait(0.12)
+                                    local preTeleportAxe = nil
+                                    if equipAxe then
+                                        local equipOk, equipped = pcall(equipAxe)
+                                        if equipOk then preTeleportAxe = equipped end
+                                    end
+                                    if isAxeTool(preTeleportAxe) and Game.setBossMeleeHeld then
+                                        pcall(Game.setBossMeleeHeld, false)
+                                        task.wait(0.04)
+                                        local priorPending = Game.bossRespawnTeleportPending
+                                        local priorDied = Game.bossPlayerDied
+                                        Game.bossRespawnTeleportPending = false
+                                        Game.bossPlayerDied = false
+                                        local holdOk, holdResult = pcall(Game.setBossMeleeHeld, true)
+                                        if holdOk and holdResult == true then
+                                            pcall(function() preTeleportAxe:Activate() end)
+                                            warn("[TheForest] Recovery: started Axe melee hold while alive, immediately before teleporting to the boss.")
+                                        else
+                                            warn("[TheForest] Recovery: pre-teleport melee hold did not start; will retry after teleport.")
+                                        end
+                                        Game.bossRespawnTeleportPending = priorPending
+                                        Game.bossPlayerDied = priorDied
+                                    else
+                                        warn("[TheForest] Recovery: Axe not confirmed before teleport; will retry equip and melee after returning.")
+                                    end
+                                    task.wait(0.05)
                                     local ok = pcall(function()
                                         currentRoot.Anchored = false
                                         currentRoot.AssemblyLinearVelocity = Vector3.zero
@@ -459,20 +493,22 @@ xpcall(function()
                                     if equipOk then axe = equipped end
                                 end
                                 if axe then
-                                    Game.status = "Returned to boss area; Axe equipped; melee hold restarting"
-                                    -- The old input hold is released when the knockdown is detected.
-                                    -- Force a fresh MouseButton1-down after teleport/equip, then keep
-                                    -- it held while the game brings the boss bar/model back.
-                                    if Game.setBossMeleeHeld then
-                                        pcall(Game.setBossMeleeHeld, false)
+                                    Game.status = "Returned to boss area; Axe equipped; melee hold active"
+                                    -- Prefer keeping the hold started while the character was alive
+                                    -- just before teleport. Only create a new hold here if that
+                                    -- pre-teleport input did not succeed.
+                                    if Game.setBossMeleeHeld and not Game.bossMeleeHeld then
                                         task.wait(0.06)
                                         local holdOk, holdResult = pcall(Game.setBossMeleeHeld, true)
                                         if holdOk and holdResult == true then
-                                            notify("Returned to the boss area; Axe equipped and melee button held again.")
-                                            warn("[TheForest] Recovery: restarted continuous Axe melee hold after teleport.")
+                                            notify("Returned to the boss area; Axe melee hold is active.")
+                                            warn("[TheForest] Recovery: started continuous Axe melee hold after teleport as fallback.")
                                         else
-                                            warn("[TheForest] Recovery: could not start the melee hold yet; retrying while waiting for the boss.")
+                                            warn("[TheForest] Recovery: melee hold is still unavailable; attack watcher will retry.")
                                         end
+                                    elseif Game.bossMeleeHeld then
+                                        notify("Returned to the boss area with the Axe melee hold already active.")
+                                        warn("[TheForest] Recovery: preserved the pre-teleport Axe melee hold across teleport.")
                                     end
                                 else
                                     Game.status = "Returned to boss area; retrying Axe equip"
