@@ -46,6 +46,7 @@ xpcall(function()
     -- are loaded first and remain authoritative across launches.
     local DEFAULT_FLAGS = {
         AutoChop = false, Zone = "OakWood", ChopDelay = 0.4,
+        AutoFightMobs = true, AutoAdvanceZone = true,
         SmartWeapons = false,
         AutoPickup = false, AutoSell = false, SellAt = 5, AutoCoins = false,
         AutoTools = false, BuyTools = {},
@@ -65,6 +66,8 @@ xpcall(function()
         AntiAfk = true,
     }
     local Flags = {}
+    -- Assigned when the Chopping tab is built; lets the farm worker update the visible dropdown.
+    local zoneDropdown = nil
 
     local Game = {
         trees = 0, sells = 0, bought = 0,
@@ -80,6 +83,11 @@ xpcall(function()
         lastBossScanAt = 0,
         cachedBoss = nil,
         lastProgressReport = nil,
+        dayNight = "Unknown",
+        cachedMob = nil,
+        lastMobScanAt = 0,
+        lastMobNotice = nil,
+        zoneAdvancePending = false,
     }
 
     --=============================================================================
@@ -546,6 +554,56 @@ xpcall(function()
         return state
     end
 
+    -- Find the compact day/night indicator rather than instructional text like
+    -- "Day and night: 8-minute days, 4-minute nights" in the Night Monsters panel.
+    local function readDayNightHud()
+        local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        if not playerGui then return nil end
+
+        local bestState, bestScore = nil, -1
+        for _, inst in ipairs(playerGui:GetDescendants()) do
+            if (inst:IsA("TextLabel") or inst:IsA("TextButton")) and inst.Visible then
+                local raw = string.lower(tostring(inst.Text or ""))
+                if raw ~= "" then
+                    local instructional = string.find(raw, "minute", 1, true)
+                        or string.find(raw, "minions", 1, true)
+                        or string.find(raw, "monsters", 1, true)
+                        or string.find(raw, "climb", 1, true)
+                        or string.find(raw, "replant", 1, true)
+                        or string.find(raw, "thieves", 1, true)
+                        or string.find(raw, "biters", 1, true)
+                    if not instructional and #raw <= 48 then
+                        local normalized = string.gsub(raw, "[^%a%d: ]", " ")
+                        normalized = string.gsub(normalized, "%s+", " ")
+                        normalized = string.match(normalized, "^%s*(.-)%s*$") or normalized
+                        local first = string.match(normalized, "^(%a+)") or ""
+                        local state = nil
+                        if first == "day" or first == "daytime" then
+                            state = "Day"
+                        elseif first == "night" or first == "nighttime" then
+                            state = "Night"
+                        elseif string.find(normalized, "^current day[%s:%d]*$") then
+                            state = "Day"
+                        elseif string.find(normalized, "^current night[%s:%d]*$") then
+                            state = "Night"
+                        end
+
+                        if state then
+                            local score = (#normalized <= 20) and 3 or 1
+                            local ok, y = pcall(function() return inst.AbsolutePosition.Y end)
+                            if ok and y <= 180 then score += 2 end
+                            if normalized == "day" or normalized == "night" then score += 2 end
+                            if score > bestScore then
+                                bestState, bestScore = state, score
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        return bestState
+    end
+
     local function normalizedName(value)
         return string.gsub(string.lower(tostring(value or "")), "[^%w]", "")
     end
@@ -612,6 +670,82 @@ xpcall(function()
             end
         end
         return nil
+    end
+
+    local MOB_NAME_PARTS = { "sprout", "biter", "thief", "monster", "minion" }
+
+    local function isLiveMob(model)
+        if not model or not model:IsA("Model") or not model.Parent or model == LocalPlayer.Character then
+            return false
+        end
+        local candidate = normalizedName(model.Name)
+        -- Some NPC rigs have generic Model names and expose the type separately.
+        for _, attributeName in ipairs({ "MobType", "MonsterType", "EnemyType", "NPCType", "Type", "DisplayName" }) do
+            local attributeValue = model:GetAttribute(attributeName)
+            if attributeValue ~= nil then
+                candidate ..= normalizedName(attributeValue)
+            end
+        end
+        for _, childName in ipairs({ "MobType", "MonsterType", "EnemyType", "NPCType", "Type", "DisplayName" }) do
+            local valueObject = model:FindFirstChild(childName)
+            if valueObject and (valueObject:IsA("StringValue")) then
+                candidate ..= normalizedName(valueObject.Value)
+            end
+        end
+        if candidate == "" or string.find(candidate, "boss", 1, true)
+            or string.find(candidate, "barkback", 1, true) then
+            return false
+        end
+        local nameMatch = false
+        for _, part in ipairs(MOB_NAME_PARTS) do
+            if string.find(candidate, part, 1, true) then
+                nameMatch = true
+                break
+            end
+        end
+        if not nameMatch then return false end
+
+        local folder = treesFolder()
+        if folder and model:IsDescendantOf(folder) then return false end
+        local hp = modelHealth(model)
+        if hp ~= nil and hp <= 0 then return false end
+        return modelRootPart(model) ~= nil
+    end
+
+    local function findNearestMob(maxDistance)
+        maxDistance = maxDistance or 90
+        local _, root = getRoot()
+        if not root then return nil end
+
+        -- Reuse a live nearby target between scans so we don't walk the entire
+        -- workspace hierarchy on every 0.1-second farm tick.
+        if isLiveMob(Game.cachedMob) then
+            local mobRoot = modelRootPart(Game.cachedMob)
+            if mobRoot and (mobRoot.Position - root.Position).Magnitude <= maxDistance then
+                if os.clock() - Game.lastMobScanAt < 0.4 then
+                    return Game.cachedMob
+                end
+            else
+                Game.cachedMob = nil
+            end
+        else
+            Game.cachedMob = nil
+        end
+        if os.clock() - Game.lastMobScanAt < 0.4 then return nil end
+        Game.lastMobScanAt = os.clock()
+
+        local best, bestDistance = nil, maxDistance
+        for _, inst in ipairs(workspace:GetDescendants()) do
+            if inst:IsA("Model") and isLiveMob(inst) then
+                local mobRoot = modelRootPart(inst)
+                local distance = mobRoot and (mobRoot.Position - root.Position).Magnitude or math.huge
+                if distance <= bestDistance then
+                    best, bestDistance = inst, distance
+                end
+            end
+        end
+        Game.cachedMob = best
+        return best
     end
 
     local function groundLogs()
@@ -992,6 +1126,194 @@ xpcall(function()
         return "stopped"
     end
 
+    local function placeNearMob(mob, approachIndex)
+        local _, playerRoot = getRoot()
+        local targetRoot = modelRootPart(mob)
+        if not playerRoot or not targetRoot then return false end
+
+        -- Stay at melee range and face the model's root rather than swinging at
+        -- its old position. Rotate around the target when hits stop registering.
+        local directions = {
+            targetRoot.CFrame.LookVector,
+            -targetRoot.CFrame.LookVector,
+            targetRoot.CFrame.RightVector,
+            -targetRoot.CFrame.RightVector,
+        }
+        local direction = directions[((tonumber(approachIndex) or 1) - 1) % #directions + 1]
+        local horizontal = Vector3.new(direction.X, 0, direction.Z)
+        if horizontal.Magnitude < 0.05 then horizontal = Vector3.new(0, 0, 1) end
+        horizontal = horizontal.Unit
+
+        local closeDistance = math.max(2.2, targetRoot.Size.Z * 0.5 + 1.1)
+        local destination = targetRoot.Position + horizontal * closeDistance + Vector3.new(0, 0.35, 0)
+        playerRoot.AssemblyLinearVelocity = Vector3.zero
+        playerRoot.CFrame = CFrame.lookAt(destination, targetRoot.Position + Vector3.new(0, 0.8, 0))
+        return true
+    end
+
+    local function attackMobWithAxe(mob, areaKey)
+        local mobName = mob and mob.Name or "Night Monster"
+        Game.status = "Defending against " .. tostring(mobName) .. " with Axe"
+        if Game.lastMobNotice ~= mob then
+            Game.lastMobNotice = mob
+            notify("Mob detected nearby: " .. tostring(mobName) .. ". Moving into axe range and attacking.")
+        end
+
+        local startedAt = os.clock()
+        local lastKnownHealth = modelHealth(mob)
+        local lastDamageAt = os.clock()
+        local lastWarningAt = 0
+        local nextPositionAdjustAt = 0
+        local approachIndex = 1
+        local lastApproachChangeAt = os.clock()
+
+        while not unloaded and Flags.AutoChop do
+            if not isLiveMob(mob) then
+                -- If it was removed or its health reached zero, allow replication
+                -- a moment before resuming tree chopping.
+                task.wait(0.25)
+                if not isLiveMob(mob) then
+                    Game.cachedMob = nil
+                    Game.lastMobNotice = nil
+                    notify(tostring(mobName) .. " is no longer active; resuming the area routine.")
+                    return "defeated"
+                end
+            end
+
+            -- If a target has been moved away, don't chase it around the map.
+            local _, playerRoot = getRoot()
+            local targetRoot = modelRootPart(mob)
+            if not playerRoot or not targetRoot then
+                task.wait(0.15)
+                continue
+            end
+            if (targetRoot.Position - playerRoot.Position).Magnitude > 110 then
+                Game.cachedMob = nil
+                Game.lastMobNotice = nil
+                return "out-of-range"
+            end
+
+            if os.clock() - lastApproachChangeAt > 2.5 and os.clock() - lastDamageAt > 2.5 then
+                approachIndex = approachIndex % 4 + 1
+                lastApproachChangeAt = os.clock()
+                nextPositionAdjustAt = 0
+            end
+            if os.clock() >= nextPositionAdjustAt then
+                placeNearMob(mob, approachIndex)
+                nextPositionAdjustAt = os.clock() + 0.22
+            end
+
+            local axe = equipAxe()
+            if axe then
+                -- Try the Tool's normal activation; only send a normal click if the
+                -- executor/tool rejected activation. The server still validates hits.
+                local ok = pcall(function() axe:Activate() end)
+                if not ok then
+                    pcall(function()
+                        VirtualUser:CaptureController()
+                        VirtualUser:ClickButton1(Vector2.new(800, 400))
+                    end)
+                end
+            elseif os.clock() - lastWarningAt > 3 then
+                lastWarningAt = os.clock()
+                warn("[TheForest] Mob is nearby, but no Axe Tool was found in Character or Backpack.")
+            end
+
+            local currentHealth = modelHealth(mob)
+            if currentHealth ~= nil then
+                if lastKnownHealth == nil or currentHealth < lastKnownHealth then
+                    lastKnownHealth = currentHealth
+                    lastDamageAt = os.clock()
+                elseif currentHealth > 0 and os.clock() - lastDamageAt > 2 then
+                    approachIndex = approachIndex % 4 + 1
+                    lastApproachChangeAt = os.clock()
+                    lastDamageAt = os.clock()
+                    nextPositionAdjustAt = 0
+                    if os.clock() - lastWarningAt > 6 then
+                        lastWarningAt = os.clock()
+                        warn("[TheForest] Axe hits have not reduced " .. tostring(mobName) .. " health yet; cycling melee positions and retrying.")
+                    end
+                end
+                if currentHealth <= 0 then
+                    Game.cachedMob = nil
+                    Game.lastMobNotice = nil
+                    notify(tostring(mobName) .. " defeated; resuming the area routine.")
+                    return "defeated"
+                end
+            elseif os.clock() - startedAt > 90 then
+                warn("[TheForest] Could not confirm whether " .. tostring(mobName) .. " was defeated (no exposed health value). Returning to the farm loop.")
+                Game.cachedMob = nil
+                Game.lastMobNotice = nil
+                return "unconfirmed"
+            end
+            task.wait(0.16)
+        end
+        return "stopped"
+    end
+
+    local function advanceToNextZone()
+        if Game.zoneAdvancePending then return end
+        local oldZone = Flags.Zone
+        local oldIndex = zoneIndex(oldZone)
+        local order = zoneOrder()
+        if not oldIndex or #order == 0 then
+            warn("[TheForest] Cannot advance to the next zone: zone order is unavailable.")
+            return
+        end
+
+        Game.zoneAdvancePending = true
+        Game.status = "Boss defeated; waiting for the next area to unlock"
+        task.spawn(function()
+            local deadline = os.clock() + 10
+            while not unloaded and os.clock() < deadline do
+                -- Respect manual changes made while waiting for server unlock state.
+                if Flags.Zone ~= oldZone then
+                    Game.zoneAdvancePending = false
+                    return
+                end
+
+                local nextZone = nil
+                local liveOrder = zoneOrder()
+                for i = oldIndex + 1, #liveOrder do
+                    if zoneUnlocked(liveOrder[i]) then
+                        nextZone = liveOrder[i]
+                        break
+                    end
+                end
+
+                if nextZone then
+                    Flags.Zone = nextZone
+                    table.clear(Game.badTrees)
+                    Game.currentAreaKey = nil
+                    Game.areaCompleteKey = nil
+                    Game.areaCompletedAt = nil
+                    Game.bossDefeatedKey = nil
+                    Game.cachedBoss = nil
+                    Game.lastBossNotice = nil
+                    Game.cachedMob = nil
+                    Game.lastMobNotice = nil
+                    if zoneDropdown then
+                        pcall(function() zoneDropdown.SetValue(nextZone) end)
+                    end
+                    local saved, saveErr = saveConfig(true)
+                    if not saved then
+                        warn("[TheForest] Moved to " .. zoneLabel(nextZone) .. " but could not save config: " .. tostring(saveErr))
+                    end
+                    Game.status = "Advanced to " .. zoneLabel(nextZone)
+                    notify("Boss defeated; Zone dropdown advanced to " .. zoneLabel(nextZone) .. ". Auto Chop will use trees from that zone.")
+                    Game.zoneAdvancePending = false
+                    return
+                end
+                task.wait(0.25)
+            end
+
+            if not unloaded then
+                notify("Boss defeated, but no next unlocked zone appeared. Kept Zone set to " .. zoneLabel(oldZone) .. ".")
+            end
+            Game.zoneAdvancePending = false
+        end)
+    end
+
     local function stepFarm()
         if not Remotes or not farmActive() or Game.busy then
             return
@@ -1049,7 +1371,9 @@ xpcall(function()
             -- progress resets or the AREA n/total marker changes.
             if Game.areaCompleteKey == areaKey then
                 if Game.bossDefeatedKey == areaKey then
-                    Game.status = "Area complete; boss defeated; Auto Chop paused"
+                    Game.status = Game.zoneAdvancePending
+                        and "Boss defeated; waiting for next zone unlock"
+                        or "Area complete; boss defeated; Auto Chop paused"
                     return
                 end
 
@@ -1070,8 +1394,13 @@ xpcall(function()
                     if outcome == "defeated" then
                         Game.cachedBoss = nil
                         Game.bossDefeatedKey = areaKey
-                        Game.status = tostring(boss.Name) .. " defeated; Auto Chop paused"
-                        notify(tostring(boss.Name) .. " defeated. Auto Chop remains paused until the area changes or progress resets.")
+                        Game.status = tostring(boss.Name) .. " defeated; moving to next unlocked zone"
+                        if Flags.AutoAdvanceZone then
+                            notify(tostring(boss.Name) .. " defeated. Looking for the next unlocked zone.")
+                            advanceToNextZone()
+                        else
+                            notify(tostring(boss.Name) .. " defeated. Auto Advance Zone is disabled; keeping the current selection.")
+                        end
                     elseif outcome == "area-changed" then
                         Game.cachedBoss = nil
                     elseif outcome == "stopped" then
@@ -1082,6 +1411,19 @@ xpcall(function()
                     Game.status = "Area complete; waiting for boss" .. waitingFor
                 end
                 return
+            end
+
+            if Flags.AutoChop and Flags.AutoFightMobs then
+                local mob = findNearestMob(90)
+                if mob then
+                    local outcome = attackMobWithAxe(mob, areaKey)
+                    if outcome == "defeated" then
+                        Game.status = "Mob defeated; resuming tree chopping"
+                    elseif outcome == "unconfirmed" then
+                        Game.status = "Mob attack unconfirmed; resuming farm loop"
+                    end
+                    return
+                end
             end
 
             local full = carried() >= sellThreshold()
@@ -2825,6 +3167,21 @@ xpcall(function()
             end
             refreshText()
         end
+        function dd.SetValue(value)
+            table.clear(selected)
+            local exists = false
+            for _, option in ipairs(currentOptions) do
+                if option.id == value then
+                    exists = true
+                    break
+                end
+            end
+            if exists then selected[value] = true end
+            if activePopup and activePopup.Name == label then
+                closePopup()
+            end
+            refreshText()
+        end
         return dd
     end
 
@@ -2855,6 +3212,7 @@ xpcall(function()
     local cashVal = infoRow(overview, "Cash", "$0")
     local logsVal = infoRow(overview, "Logs", "0/0")
     local zoneVal = infoRow(overview, "Zone", "-")
+    local cycleVal = infoRow(overview, "Cycle", "Unknown")
     local sessionVal = infoRow(overview, "Session", "0 trees, 0 sells, 0 buys")
 
     local logsCash = createCard(mainRight, "🪵", "Logs & Cash")
@@ -2864,12 +3222,20 @@ xpcall(function()
     addToggle(logsCash, "Auto Pick Up Coins", Flags.AutoCoins, function(v) Setters.feature("AutoCoins", v) end)
 
     local chopping = createCard(mainLeft, "🪓", "Chopping")
-    addDropdown(chopping, "Zone", "Select Zone", LISTS.zones, Flags.Zone, false, function(v) 
+    zoneDropdown = addDropdown(chopping, "Zone", "Select Zone", LISTS.zones, Flags.Zone, false, function(v) 
         Flags.Zone = v
         table.clear(Game.badTrees) 
         saveConfig()
     end)
     addToggle(chopping, "Auto Chop Trees", Flags.AutoChop, function(v) Setters.feature("AutoChop", v) end)
+    addToggle(chopping, "Auto Fight Nearby Mobs", Flags.AutoFightMobs, function(v)
+        Flags.AutoFightMobs = v == true
+        saveConfig()
+    end)
+    addToggle(chopping, "Auto Advance Zone After Boss", Flags.AutoAdvanceZone, function(v)
+        Flags.AutoAdvanceZone = v == true
+        saveConfig()
+    end)
     addToggle(chopping, "Smart Weapon Swapping", Flags.SmartWeapons, function(v) 
         Flags.SmartWeapons = v
         saveConfig() 
@@ -3097,7 +3463,16 @@ xpcall(function()
         cashVal.Text = "$" .. short(cashValue()) .. "  Gems " .. short(gemsValue())
         logsVal.Text = carried() .. " / " .. capacity() .. (Flags.AutoSell and ("  (sell at " .. sellThreshold() .. ")") or "")
         zoneVal.Text = zoneLabel(Flags.Zone) .. (zoneUnlocked(Flags.Zone) and "" or " (locked)")
+        cycleVal.Text = Game.dayNight or "Unknown"
         sessionVal.Text = Game.trees .. " trees, " .. Game.sells .. " sells, " .. Game.bought .. " buys"
+    end)
+
+    startWorker("daynight", 0.8, function()
+        local detected = readDayNightHud()
+        if detected and detected ~= Game.dayNight then
+            Game.dayNight = detected
+            notify("Day/night HUD detected: " .. detected)
+        end
     end)
 
     startWorker("windowsafe", 1.0, ensureOnScreen)
