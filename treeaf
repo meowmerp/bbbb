@@ -103,6 +103,9 @@ xpcall(function()
         bossKnockedDownDetectedAt = nil,
         bossReturnMonitorRunning = false,
         bossDownedWatcherRunning = false,
+        -- Keep the completed-area boss phase latched after a knockdown until
+        -- a live boss is reacquired and Axe attacks resume.
+        bossRecoveryActive = false,
     }
 
     --=============================================================================
@@ -381,6 +384,10 @@ xpcall(function()
         return false
     end
 
+    -- Forward-declare so the respawn monitor can re-equip the Axe as soon as
+    -- the character wakes and is teleported back to the encounter area.
+    local equipAxe
+
     -- Run independently of CharacterAdded because waking at the cabin can reuse
     -- the same character. Wait until the countdown HUD goes away and a live root
     -- exists, then teleport back to the last saved boss-side position.
@@ -431,10 +438,28 @@ xpcall(function()
                                 Game.bossRespawnTeleportPending = false
                                 Game.bossPlayerDied = false
                                 Game.bossKnockedDownDetectedAt = nil
+                                Game.bossRecoveryActive = true
                                 Game.cachedBoss = nil
                                 Game.lastBossNotice = nil
-                                Game.status = "Returned to boss area; searching for boss again"
-                                notify("Back at the saved boss area. Looking for the boss again.")
+
+                                -- Respawning may clear the selected hotbar tool. Re-select
+                                -- slot 2 and explicitly equip the Axe from the Backpack.
+                                if Game.pressWeaponSlot then
+                                    pcall(Game.pressWeaponSlot, 2)
+                                end
+                                task.wait(0.2)
+                                local axe = nil
+                                if equipAxe then
+                                    local equipOk, equipped = pcall(equipAxe)
+                                    if equipOk then axe = equipped end
+                                end
+                                if axe then
+                                    Game.status = "Returned to boss area; Axe equipped; searching for boss"
+                                    notify("Returned to the boss area and re-equipped the Axe. Waiting for the boss to respawn.")
+                                else
+                                    Game.status = "Returned to boss area; retrying Axe equip"
+                                    warn("[TheForest] Returned to the boss area, but the Axe could not yet be confirmed as equipped. The boss loop will retry slot 2 and Axe equip before attacking.")
+                                end
                                 break
                             end
                         else
@@ -473,6 +498,7 @@ xpcall(function()
         local firstDetection = not Game.bossRespawnTeleportPending
         Game.bossPlayerDied = true
         Game.bossRespawnTeleportPending = true
+        Game.bossRecoveryActive = true
         Game.bossKnockedDownDetectedAt = Game.bossKnockedDownDetectedAt or os.clock()
         if firstDetection then
             Game.status = "Knocked down; waiting to return to boss area"
@@ -1629,7 +1655,7 @@ xpcall(function()
         return false
     end
 
-    local function equipAxe()
+    equipAxe = function()
         local humanoid, root = getRoot()
         local character = LocalPlayer.Character
         if not character or not humanoid or not root then
@@ -1688,25 +1714,26 @@ xpcall(function()
         if not isAxeTool(heldTool) then
             return false
         end
-        pcall(function() heldTool:Activate() end)
-        -- Use the viewport center because the camera is aimed at the target. A
-        -- hard-coded point such as (800, 400) can land on the open script menu.
+        local activationSucceeded = pcall(function() heldTool:Activate() end)
+        -- Use the viewport center because the camera is aimed at the target. Prefer
+        -- a direct mouse down/up so the attack still fires after a respawn; use
+        -- VirtualUser as a fallback when VirtualInputManager is unavailable.
         local camera = workspace.CurrentCamera
         local viewport = camera and camera.ViewportSize or Vector2.new(1600, 900)
         local point = Vector2.new(math.floor(viewport.X * 0.5), math.floor(viewport.Y * 0.5))
         local clickSucceeded = pcall(function()
-            VirtualUser:CaptureController()
-            VirtualUser:ClickButton1(point)
+            local virtualInput = game:GetService("VirtualInputManager")
+            virtualInput:SendMouseButtonEvent(point.X, point.Y, 0, true, game, 0)
+            task.wait(0.05)
+            virtualInput:SendMouseButtonEvent(point.X, point.Y, 0, false, game, 0)
         end)
         if not clickSucceeded then
             clickSucceeded = pcall(function()
-                local virtualInput = game:GetService("VirtualInputManager")
-                virtualInput:SendMouseButtonEvent(point.X, point.Y, 0, true, game, 0)
-                task.wait(0.04)
-                virtualInput:SendMouseButtonEvent(point.X, point.Y, 0, false, game, 0)
+                VirtualUser:CaptureController()
+                VirtualUser:ClickButton1(point)
             end)
         end
-        return clickSucceeded
+        return activationSucceeded or clickSucceeded
     end
 
     Game.getBossHeadPosition = function(boss, boxCf, boxSize, targetRoot)
@@ -1774,9 +1801,11 @@ xpcall(function()
         end
 
         local horizontal = Game.bossApproachDirection
-        -- Axe combat needs melee distance. Stand just beyond the boss model's
-        -- horizontal bounds, with a small buffer so the player doesn't clip inside it.
-        local frontDistance = math.max(4, math.max(boxSize.X, boxSize.Z) * 0.5 + 1.5)
+        -- Axe combat needs actual melee range. The full model bounding box can
+        -- include huge limbs/effects and place the player too far away to hit, so
+        -- calculate from the boss root and cap the offset to a close melee band.
+        local rootFootprint = math.max(targetRoot.Size.X, targetRoot.Size.Z)
+        local frontDistance = math.clamp(rootFootprint * 0.5 + 1.2, 2.8, 4.25)
         local aimPoint = Game.getBossHeadPosition(boss, boxCf, boxSize, targetRoot)
         local headOffset = Game.getPlayerHeadOffset(playerRoot)
 
@@ -1960,7 +1989,11 @@ xpcall(function()
                             local axe = equipAxe()
                             if isAxeTool(axe) then
                                 if os.clock() >= nextAxeAttackAt then
-                                    Game.clickAttack()
+                                    local attackSent = Game.clickAttack()
+                                    if attackSent and Game.bossRecoveryActive then
+                                        Game.bossRecoveryActive = false
+                                        notify("Axe attacks resumed after returning to the boss area.")
+                                    end
                                     nextAxeAttackAt = os.clock() + 0.22
                                 end
                             else
@@ -1993,6 +2026,9 @@ xpcall(function()
         if not loopOk then
             warn("[TheForest] Boss attack loop stopped safely: " .. tostring(loopErr))
             return "stopped"
+        end
+        if outcome == "defeated" or outcome == "area-changed" then
+            Game.bossRecoveryActive = false
         end
         if outcome == "defeated" then
             Game.pressWeaponSlot(2)
@@ -2213,6 +2249,7 @@ xpcall(function()
 
             if Game.currentAreaKey ~= areaKey then
                 Game.currentAreaKey = areaKey
+                Game.bossRecoveryActive = false
                 Game.areaCompleteKey = nil
                 Game.areaCompletedAt = nil
                 Game.bossDefeatedKey = nil
@@ -2249,8 +2286,13 @@ xpcall(function()
                     Game.lastBossNotice = nil
                     Game.bossSearchWarningShown = false
                     notify(zoneLabel(Flags.Zone) .. " reached " .. tostring(rounded) .. "% cleared. Auto Chop paused for the boss encounter.")
-                elseif areaState.percent < 99.9 and Game.areaCompleteKey == areaKey then
-                    -- The area progress reset, or a new clear cycle began.
+                elseif areaState.percent < 99.9 and Game.areaCompleteKey == areaKey
+                    and not Game.bossRecoveryActive
+                    and not Game.bossRespawnTeleportPending
+                    and not Game.bossPlayerDied then
+                    -- The area progress reset, or a new clear cycle began. During
+                    -- post-knockdown recovery keep this latched until the boss has
+                    -- actually been reacquired and an Axe attack has resumed.
                     Game.areaCompleteKey = nil
                     Game.areaCompletedAt = nil
                     Game.bossDefeatedKey = nil
