@@ -22,7 +22,7 @@ if not game:IsLoaded() then
     game.Loaded:Wait() 
 end
 
-local SCRIPT_VERSION = "v3.2-hud-zone-sync"
+local SCRIPT_VERSION = "v3.3-boss-topbar-safety"
 local GAME_NAME      = "The Forest"
 local CONFIG_FILE    = "ForestConfig.json"
 
@@ -47,7 +47,6 @@ xpcall(function()
     local DEFAULT_FLAGS = {
         AutoChop = false, Zone = "OakWood", ChopDelay = 0.4,
         AutoFightMobs = true, AutoAdvanceZone = true, AutoDetectZone = true,
-        SmartWeapons = false,
         AutoPickup = false, AutoSell = false, SellAt = 5, AutoCoins = false,
         AutoTools = false, BuyTools = {},
         AutoUpgrades = false, BuyUpgrades = {},
@@ -75,7 +74,6 @@ xpcall(function()
         trees = 0, sells = 0, bought = 0,
         status = "Idle", busy = false, hitSeq = 0,
         badTrees = {}, badLogs = {}, carBuys = {},
-        lastFlameUse = 0,
         lastBossNotice = nil,
         currentAreaKey = nil,
         areaCompleteKey = nil,
@@ -568,7 +566,9 @@ xpcall(function()
         local state = {
             percent = nil,
             marker = nil,
-            bossName = nil,
+            bossName = nil, -- Active boss name read from the top health bar only.
+            bossHintName = nil, -- Name mentioned by the area objective.
+            bossBarPresent = false,
             bossHealth = nil,
             bossMaxHealth = nil,
             areaName = zoneLabel(Flags.Zone),
@@ -608,7 +608,7 @@ xpcall(function()
                         if expected then
                             expected = string.match(expected, "^%s*(.-)%s*$")
                             if expected and expected ~= "" then
-                                state.bossName = expected
+                                state.bossHintName = expected
                             end
                         end
                     end
@@ -616,11 +616,34 @@ xpcall(function()
             end
         end
 
-        -- Some areas show the boss only in the live health bar (for example,
-        -- the top-left "OLD BARKBACK" name above "521/800"). If the instruction
-        -- text didn't name it, infer the name from a nearby label above an HP
-        -- fraction. This supports bosses whose names never contain the word Boss.
-        if not state.bossName and #hudTextNodes > 1 then
+        -- Remove hidden/stale UI nodes before looking for an active boss bar.
+        -- Some games leave old health-bar labels in PlayerGui after hiding them.
+        for i = #hudTextNodes, 1, -1 do
+            local ancestor = hudTextNodes[i].inst
+            local visible = true
+            while ancestor and ancestor ~= game do
+                if ancestor:IsA("GuiObject") and not ancestor.Visible then
+                    visible = false
+                    break
+                end
+                if ancestor:IsA("ScreenGui") and not ancestor.Enabled then
+                    visible = false
+                    break
+                end
+                ancestor = ancestor.Parent
+            end
+            if not visible then
+                table.remove(hudTextNodes, i)
+            end
+        end
+
+        -- The live boss health bar is the source of truth for the active boss.
+        -- Objective text ("Clear it all to wake ...") is only a hint. Read only
+        -- a name paired with an HP fraction in the top 24% of the screen, so a
+        -- world-space tag or menu label cannot become a boss target.
+        local camera = workspace.CurrentCamera
+        local viewport = camera and camera.ViewportSize or Vector2.new(1920, 1080)
+        if #hudTextNodes > 1 then
             local bestName, bestScore = nil, -math.huge
             for _, hpEntry in ipairs(hudTextNodes) do
                 local hpCurrent, hpMax = string.match(hpEntry.text, "^%s*([%d,%.]+)%s*/%s*([%d,%.]+)%s*$")
@@ -630,7 +653,7 @@ xpcall(function()
                     local hpOk, hpPos, hpSize = pcall(function()
                         return hpEntry.inst.AbsolutePosition, hpEntry.inst.AbsoluteSize
                     end)
-                    if hpOk and hpPos and hpSize then
+                    if hpOk and hpPos and hpSize and hpPos.Y >= 0 and hpPos.Y <= viewport.Y * 0.24 then
                         for _, nameEntry in ipairs(hudTextNodes) do
                             if nameEntry.inst ~= hpEntry.inst then
                                 local candidate = string.match(nameEntry.text, "^%s*(.-)%s*$") or ""
@@ -648,7 +671,8 @@ xpcall(function()
                                     local nameOk, namePos, nameSize = pcall(function()
                                         return nameEntry.inst.AbsolutePosition, nameEntry.inst.AbsoluteSize
                                     end)
-                                    if nameOk and namePos and nameSize then
+                                    if nameOk and namePos and nameSize and namePos.Y >= 0
+                                        and namePos.Y <= viewport.Y * 0.22 then
                                         local verticalGap = hpPos.Y - (namePos.Y + nameSize.Y)
                                         local hpCenter = hpPos.X + hpSize.X * 0.5
                                         local nameCenter = namePos.X + nameSize.X * 0.5
@@ -671,6 +695,7 @@ xpcall(function()
             end
             if bestName then
                 state.bossName = bestName
+                state.bossBarPresent = true
             end
         end
 
@@ -688,7 +713,7 @@ xpcall(function()
                     local hpOk, hpPos, hpSize = pcall(function()
                         return hpEntry.inst.AbsolutePosition, hpEntry.inst.AbsoluteSize
                     end)
-                    if hpOk and hpPos and hpSize then
+                    if hpOk and hpPos and hpSize and hpPos.Y >= 0 and hpPos.Y <= viewport.Y * 0.24 then
                         for _, nameEntry in ipairs(hudTextNodes) do
                             local label = string.match(nameEntry.text, "^%s*(.-)%s*$") or ""
                             local labelNorm = string.gsub(string.lower(label), "[^%w]", "")
@@ -925,84 +950,145 @@ xpcall(function()
     local function findActiveBoss(preferredName)
         preferredName = preferredName or Game.areaBossName
         local preferred = normalizedName(preferredName)
+        local preferredCore = string.gsub(preferred, "^the", "")
         local _, playerRoot = getRoot()
         local bestModel, bestScore = nil, -math.huge
+
+        -- Do not let short nested-model names such as "Old" or UI models such
+        -- as "OldBarkbackHealthBar" masquerade as the live boss. Only accept a
+        -- name that exactly matches the HUD name or contains the full HUD name.
+        local function matchesPreferred(value)
+            local normalized = normalizedName(value)
+            if normalized == "" or preferred == "" then return false, 0 end
+            if normalized == preferred or (preferredCore ~= "" and normalized == preferredCore) then
+                return true, 2
+            end
+            if #preferred >= 6 and #normalized >= #preferred
+                and string.find(normalized, preferred, 1, true) ~= nil then
+                return true, 1
+            end
+            if #preferredCore >= 6 and #normalized >= #preferredCore
+                and string.find(normalized, preferredCore, 1, true) ~= nil then
+                return true, 1
+            end
+            return false, 0
+        end
+
+        local function isUiOrEffectModel(value)
+            local n = normalizedName(value)
+            for _, token in ipairs({ "healthbar", "bossbar", "healthui", "billboard", "nameplate", "nametag", "indicator", "displaygui", "effect", "vfx" }) do
+                if string.find(n, token, 1, true) ~= nil then return true end
+            end
+            return false
+        end
+
+        local function explicitRigRoot(model)
+            local humanoid = model:FindFirstChildOfClass("Humanoid")
+                or model:FindFirstChildWhichIsA("Humanoid", true)
+            local root = model:FindFirstChild("HumanoidRootPart", true)
+                or model:FindFirstChild("RootPart", true)
+                or model:FindFirstChild("PrimaryPart", true)
+                or model:FindFirstChild("UpperTorso", true)
+                or model:FindFirstChild("Torso", true)
+                or model.PrimaryPart
+                or (humanoid and humanoid.RootPart)
+            if root and root:IsA("BasePart") then return root, humanoid end
+            return nil, humanoid
+        end
+
+        local function consider(model, kind, strength)
+            if not model or not model:IsA("Model") or model == LocalPlayer.Character
+                or not model.Parent or isUiOrEffectModel(model.Name) then
+                return
+            end
+            local targetRoot, humanoid = explicitRigRoot(model)
+            -- A real NPC rig should expose either a Humanoid or a stable named
+            -- root part. Do not use the first arbitrary BasePart in a building,
+            -- accessory, or HUD model as a teleport destination.
+            if not targetRoot then return end
+            local hp = modelHealth(model)
+            if hp ~= nil and hp <= 0 then return end
+            local distance = playerRoot and (targetRoot.Position - playerRoot.Position).Magnitude or 1000
+            local score = strength - distance
+            if humanoid then score += 2500 end
+            if targetRoot.Name == "HumanoidRootPart" or targetRoot.Name == "RootPart" then score += 1000 end
+            local boxOk, _, boxSize = pcall(function() return model:GetBoundingBox() end)
+            if boxOk and boxSize and typeof(boxSize) == "Vector3" then
+                -- Only a tiny tie-breaker: huge buildings should never beat a rig match.
+                score += math.min(boxSize.Magnitude, 80) * 0.1
+            end
+            if score > bestScore then
+                bestModel, bestScore = model, score
+            end
+        end
+
         for _, inst in ipairs(workspace:GetDescendants()) do
-            if inst:IsA("Model") and inst ~= LocalPlayer.Character then
+            if inst:IsA("Model") then
                 local candidate = normalizedName(inst.Name)
-                local namedMatch = preferred ~= "" and candidate ~= ""
-                    and (candidate == preferred
-                        or string.find(candidate, preferred, 1, true) ~= nil
-                        or string.find(preferred, candidate, 1, true) ~= nil)
+                local namedMatch, nameStrength = matchesPreferred(candidate)
+                local displayMatch = false
+                local displayStrength = 0
                 local genericMatch = string.find(candidate, "boss", 1, true) ~= nil
                     or string.find(candidate, "barkback", 1, true) ~= nil
-                local displayMatch = false
-                local function checkDisplayName(displayName)
-                    local display = normalizedName(displayName)
-                    if display ~= "" then
-                        if string.find(display, "boss", 1, true) or string.find(display, "barkback", 1, true) then
-                            genericMatch = true
-                        end
-                        if preferred ~= "" and (display == preferred
-                            or string.find(display, preferred, 1, true) ~= nil
-                            or string.find(preferred, display, 1, true) ~= nil) then
-                            displayMatch = true
-                        end
+
+                local function inspectDisplay(value)
+                    if value == nil then return end
+                    local display = normalizedName(value)
+                    local match, strength = matchesPreferred(display)
+                    if match then
+                        displayMatch = true
+                        displayStrength = math.max(displayStrength, strength)
+                    end
+                    if string.find(display, "boss", 1, true) ~= nil
+                        or string.find(display, "barkback", 1, true) ~= nil then
+                        genericMatch = true
                     end
                 end
-                for _, attributeName in ipairs({ "DisplayName", "BossName", "NPCType", "MobType", "EnemyType" }) do
-                    checkDisplayName(inst:GetAttribute(attributeName))
+                for _, attributeName in ipairs({ "DisplayName", "BossName", "NPCType", "MobType", "EnemyType", "MonsterType" }) do
+                    inspectDisplay(inst:GetAttribute(attributeName))
                 end
-                local humanoid = inst:FindFirstChildOfClass("Humanoid")
-                if humanoid and humanoid.DisplayName and humanoid.DisplayName ~= "" then
-                    checkDisplayName(humanoid.DisplayName)
+                local hum = inst:FindFirstChildOfClass("Humanoid")
+                    or inst:FindFirstChildWhichIsA("Humanoid", true)
+                if hum and hum.DisplayName and hum.DisplayName ~= "" then
+                    inspectDisplay(hum.DisplayName)
                 end
-                if namedMatch or displayMatch or genericMatch then
-                    local hp = modelHealth(inst)
-                    local targetRoot = modelRootPart(inst)
-                    if (hp == nil or hp > 0) and targetRoot then
-                        local distance = playerRoot and (targetRoot.Position - playerRoot.Position).Magnitude or 1000
-                        local score = (namedMatch and 10000 or 0) + (displayMatch and 8000 or 0) + (genericMatch and 3000 or 0) - distance
-                        local boxOk, boxSize = pcall(function()
-                            local _, size = inst:GetBoundingBox()
-                            return size
-                        end)
-                        if boxOk and boxSize then
-                            score += math.min(boxSize.Magnitude, 500) * 0.05
-                        end
-                        if score > bestScore then
-                            bestModel, bestScore = inst, score
-                        end
-                    end
+
+                if namedMatch then
+                    consider(inst, "name", nameStrength == 2 and 20000 or 16000)
+                elseif displayMatch then
+                    consider(inst, "display", displayStrength == 2 and 18000 or 15000)
+                elseif genericMatch and preferred == "" then
+                    -- Only use generic Boss/Barkback names when the HUD has not
+                    -- supplied an identifying name. If it has, substring-only
+                    -- generic matches tend to hit unrelated props and nameplates.
+                    consider(inst, "generic", 6000)
+                elseif genericMatch and (hum ~= nil) then
+                    -- A properly-rigged generic BossNPC is a fallback when the
+                    -- HUD gives a specific name that the rig does not expose.
+                    consider(inst, "generic-rig", 5500)
                 end
             elseif (inst:IsA("TextLabel") or inst:IsA("TextButton")) and preferred ~= "" then
-                -- A world-space BillboardGui can show the boss's display name even
-                -- when the underlying rig is named generically. Walk up from that
-                -- label to its owning Model so the visual HUD and rig stay linked.
-                local labelName = normalizedName(inst.Text)
-                local labelMatch = labelName ~= "" and (labelName == preferred
-                    or string.find(labelName, preferred, 1, true) ~= nil
-                    or string.find(preferred, labelName, 1, true) ~= nil)
+                -- World-space boss name tags often live under the model rather
+                -- than using the same name. Follow the tag upward and accept the
+                -- nearest ancestor that is genuinely an NPC rig, never a shed or
+                -- arbitrary map model that merely contains the label.
+                local labelMatch = matchesPreferred(inst.Text)
                 if labelMatch then
                     local ancestor = inst.Parent
                     while ancestor and ancestor ~= workspace do
                         if ancestor:IsA("Model") and ancestor ~= LocalPlayer.Character then
-                            local targetRoot = modelRootPart(ancestor)
-                            local hp = modelHealth(ancestor)
-                            if targetRoot and (hp == nil or hp > 0) then
-                                local distance = playerRoot and (targetRoot.Position - playerRoot.Position).Magnitude or 1000
-                                local score = 12000 - distance
-                                if score > bestScore then
-                                    bestModel, bestScore = ancestor, score
-                                end
+                            local rootPart, humanoid = explicitRigRoot(ancestor)
+                            if (rootPart or humanoid) and not isUiOrEffectModel(ancestor.Name) then
+                                consider(ancestor, "world-name-tag", 17000)
+                                break
                             end
-                            break
                         end
                         ancestor = ancestor.Parent
                     end
                 end
             end
         end
+
         return bestModel
     end
 
@@ -1325,33 +1411,11 @@ xpcall(function()
                 r.CFrame = CFrame.lookAt(standAt, Vector3.new(base.Position.X, standAt.Y, base.Position.Z))
             end
 
-            local usedFlame = false
-            if Flags.SmartWeapons then
-                if os.clock() - Game.lastFlameUse >= 12 then
-                    local flame = equipTool("Flamethrower")
-                    if flame then
-                        Game.status = "Flaming " .. tostring(tree:GetAttribute("TreeType") or "Tree")
-                        VirtualUser:CaptureController()
-                        VirtualUser:ClickButton1(Vector2.new(800, 400))
-                        Game.lastFlameUse = os.clock()
-                        task.wait(1.5)
-                        usedFlame = true
-                    end
-                end
-            end
-
-            if not usedFlame then
-                if Flags.SmartWeapons then
-                    equipTool("Axe")
-                    Game.status = "Chopping " .. tostring(tree:GetAttribute("TreeType") or "Tree")
-                else
-                    Game.status = "Chopping " .. tostring(tree:GetAttribute("TreeType") or "Tree")
-                end
-                
-                Game.hitSeq += 1
-                Remotes.Chop:FireServer(tree, base.Position + Vector3.new(1, 1, 0), 1, Game.hitSeq)
-                task.wait(math.max(0.1, Flags.ChopDelay))
-            end
+            -- Standard chopping only; no automatic tool switching.
+            Game.status = "Chopping " .. tostring(tree:GetAttribute("TreeType") or "Tree")
+            Game.hitSeq += 1
+            Remotes.Chop:FireServer(tree, base.Position + Vector3.new(1, 1, 0), 1, Game.hitSeq)
+            task.wait(math.max(0.1, Flags.ChopDelay))
 
             local hp = tonumber(tree:GetAttribute("HP")) or 0
             if hp < lastHp then
@@ -1537,10 +1601,11 @@ xpcall(function()
     local function runBossEncounter(boss, areaKey)
         local bossName = boss and boss.Name or Game.areaBossName or "Boss"
         Game.status = "Fighting " .. tostring(bossName) .. " with Gun"
-        notify("Boss encounter started: " .. tostring(bossName) .. "; selecting slot 5 and holding fire.")
+        notify("Boss encounter started: " .. tostring(bossName) .. "; selecting slot 5 and waiting for the top boss bar.")
 
         local lastMissingTargetWarning = 0
         local bossMissingSince = nil
+        local bossBarMissingSince = nil
         local outcome = "stopped"
         local orbitIndex = 0
         local nextOrbitAt = 0
@@ -1550,61 +1615,85 @@ xpcall(function()
         end
         Game.pressWeaponSlot(5)
         task.wait(0.15)
-        Game.setAttackMouseDown(true)
+        -- Wait for a visible top boss bar and a matching model before firing.
+        Game.setAttackMouseDown(false)
 
         local loopOk, loopErr = pcall(function()
             while not unloaded and Flags.AutoChop and Game.areaCompleteKey == areaKey do
                 local currentState = readAreaHudState()
-                if currentState.bossName and currentState.bossName ~= "" then
-                    Game.areaBossName = currentState.bossName
-                end
                 if currentState.key ~= areaKey
                     or (currentState.percent ~= nil and currentState.percent < 99.9) then
                     outcome = "area-changed"
                     break
                 end
-                if currentState.bossHealth ~= nil and currentState.bossHealth <= 0 then
-                    outcome = "defeated"
-                    break
-                end
 
-                local preferred = Game.areaBossName or bossName
-                local liveBoss = findActiveBoss(preferred)
-                if not liveBoss then
-                    -- Allow brief reparenting/streaming delays, but do not remain
-                    -- stuck forever after the boss disappears or reaches zero HP.
-                    bossMissingSince = bossMissingSince or os.clock()
-                    if os.clock() - bossMissingSince >= 1.8 then
-                        outcome = "defeated"
-                        break
-                    end
-                    task.wait(0.15)
-                else
-                    bossMissingSince = nil
-                    boss = liveBoss
-                    bossName = boss.Name
-                    local hp = modelHealth(boss)
-                    if hp ~= nil and hp <= 0 then
-                        outcome = "defeated"
-                        break
-                    end
-                    local _, root = getRoot()
-                    local targetRoot = modelRootPart(boss)
-                    if not root or not targetRoot then
-                        if os.clock() - lastMissingTargetWarning > 3 then
-                            lastMissingTargetWarning = os.clock()
-                            warn("[TheForest] Boss model found but its root is unavailable; keeping fire held while retrying.")
-                        end
-                        task.wait(0.15)
-                    else
-                        if os.clock() >= nextOrbitAt then
-                            orbitIndex = orbitIndex % 4 + 1
-                            Game.placeAtBossWeakpoint(boss, orbitIndex)
-                            nextOrbitAt = os.clock() + 0.35
+                -- The top health bar is authoritative. Release fire immediately
+                -- whenever it disappears; don't keep shooting/teleporting at a
+                -- stale model, nameplate, stump, or building.
+                if not currentState.bossBarPresent or not currentState.bossName then
+                    Game.setAttackMouseDown(false)
+                    bossBarMissingSince = bossBarMissingSince or os.clock()
+                    if os.clock() - bossBarMissingSince >= 1.8 then
+                        local stillTracked = findActiveBoss(Game.areaBossName or bossName)
+                        local trackedHp = stillTracked and modelHealth(stillTracked) or nil
+                        if not stillTracked or (trackedHp ~= nil and trackedHp <= 0) then
+                            outcome = "defeated"
                         else
-                            Game.aimCameraAt(Game.bossAimPoint or targetRoot.Position)
+                            outcome = "boss-bar-lost"
                         end
-                        task.wait(0.08)
+                        break
+                    end
+                    task.wait(0.12)
+                else
+                    bossBarMissingSince = nil
+                    Game.areaBossName = currentState.bossName
+                    if currentState.bossHealth ~= nil and currentState.bossHealth <= 0 then
+                        Game.setAttackMouseDown(false)
+                        outcome = "defeated"
+                        break
+                    end
+
+                    local liveBoss = findActiveBoss(currentState.bossName)
+                    if not liveBoss then
+                        Game.setAttackMouseDown(false)
+                        bossMissingSince = bossMissingSince or os.clock()
+                        if os.clock() - bossMissingSince >= 1.8 then
+                            outcome = "boss-target-missing"
+                            break
+                        end
+                        task.wait(0.12)
+                    else
+                        bossMissingSince = nil
+                        boss = liveBoss
+                        bossName = currentState.bossName
+                        local hp = modelHealth(boss)
+                        if hp ~= nil and hp <= 0 then
+                            Game.setAttackMouseDown(false)
+                            outcome = "defeated"
+                            break
+                        end
+                        local _, root = getRoot()
+                        local targetRoot = modelRootPart(boss)
+                        if not root or not targetRoot then
+                            Game.setAttackMouseDown(false)
+                            if os.clock() - lastMissingTargetWarning > 3 then
+                                lastMissingTargetWarning = os.clock()
+                                warn("[TheForest] Boss bar is visible, but its matching world model/root could not be found. Firing is paused to avoid attacking unrelated objects.")
+                            end
+                            task.wait(0.15)
+                        else
+                            -- Hold fire only while both the live bar and the
+                            -- corresponding model are present in the current scan.
+                            Game.setAttackMouseDown(true)
+                            if os.clock() >= nextOrbitAt then
+                                orbitIndex = orbitIndex % 4 + 1
+                                Game.placeAtBossWeakpoint(boss, orbitIndex)
+                                nextOrbitAt = os.clock() + 0.35
+                            else
+                                Game.aimCameraAt(Game.bossAimPoint or targetRoot.Position)
+                            end
+                            task.wait(0.08)
+                        end
                     end
                 end
             end
@@ -1843,10 +1932,16 @@ xpcall(function()
                 Game.cachedBoss = nil
                 Game.lastBossScanAt = 0
                 Game.lastBossNotice = nil
-                Game.areaBossName = areaState.bossName
+                Game.areaBossName = areaState.bossName or areaState.bossHintName
                 Game.bossSearchWarningShown = false
-            elseif areaState.bossName then
+            elseif areaState.bossBarPresent and areaState.bossName then
+                if Game.areaBossName ~= areaState.bossName then
+                    Game.cachedBoss = nil
+                    Game.lastBossScanAt = 0
+                end
                 Game.areaBossName = areaState.bossName
+            elseif areaState.bossHintName and not Game.areaBossName then
+                Game.areaBossName = areaState.bossHintName
             end
 
             -- A real progress percentage is the primary gate. If the HUD doesn't
@@ -1889,18 +1984,28 @@ xpcall(function()
                     return
                 end
 
-                if os.clock() - Game.lastBossScanAt >= 0.5 then
-                    Game.lastBossScanAt = os.clock()
-                    Game.cachedBoss = findActiveBoss(Game.areaBossName)
-                elseif Game.cachedBoss and not Game.cachedBoss.Parent then
+                -- Never lock onto a model from the area objective hint alone.
+                -- The live top-screen boss name + HP bar must be present first.
+                if not areaState.bossBarPresent or not areaState.bossName then
                     Game.cachedBoss = nil
+                else
+                    Game.areaBossName = areaState.bossName
+                    if os.clock() - Game.lastBossScanAt >= 0.5 then
+                        Game.lastBossScanAt = os.clock()
+                        Game.cachedBoss = findActiveBoss(areaState.bossName)
+                    elseif Game.cachedBoss and not Game.cachedBoss.Parent then
+                        Game.cachedBoss = nil
+                    end
                 end
 
                 local boss = Game.cachedBoss
                 if boss then
                     if Game.lastBossNotice ~= boss then
                         Game.lastBossNotice = boss
-                        notify("Boss detected: " .. tostring(boss.Name) .. ". Starting gun encounter (slot 5).")
+                        local targetRoot = modelRootPart(boss)
+                        local where = targetRoot and string.format(" (target %.1f, %.1f, %.1f)", targetRoot.Position.X, targetRoot.Position.Y, targetRoot.Position.Z) or ""
+                        notify("Boss target locked: " .. tostring(boss.Name) .. where .. ". Starting gun encounter (slot 5).")
+                        warn("[TheForest] Boss target locked to model '" .. tostring(boss.Name) .. "'" .. where)
                     end
                     local outcome = runBossEncounter(boss, areaKey)
                     if outcome == "defeated" then
@@ -1915,6 +2020,14 @@ xpcall(function()
                         end
                     elseif outcome == "area-changed" then
                         Game.cachedBoss = nil
+                    elseif outcome == "boss-bar-lost" then
+                        Game.cachedBoss = nil
+                        Game.status = "Boss bar missing; firing stopped, waiting for bar"
+                        warn("[TheForest] Boss health bar disappeared from the top HUD; released fire and paused boss targeting.")
+                    elseif outcome == "boss-target-missing" then
+                        Game.cachedBoss = nil
+                        Game.status = "Boss bar visible, but matching world model not found"
+                        warn("[TheForest] Boss bar is visible but no matching boss rig was found. Firing stayed released to avoid targeting unrelated objects.")
                     elseif outcome == "stopped" then
                         Game.status = "Boss encounter paused"
                     end
@@ -3319,7 +3432,6 @@ xpcall(function()
         ["Auto Sell Logs"] = "AutoSell",
         ["Auto Pick Up Coins"] = "AutoCoins",
         ["Auto Chop Trees"] = "AutoChop",
-        ["Smart Weapon Swapping"] = "SmartWeapons",
         ["Auto Join"] = "AutoJoin",
         ["Auto Claim Daily Rewards"] = "AutoDaily",
         ["Auto Buy Classes"] = "AutoClasses",
@@ -3777,10 +3889,6 @@ xpcall(function()
     addToggle(chopping, "Auto Advance Zone After Boss", Flags.AutoAdvanceZone, function(v)
         Flags.AutoAdvanceZone = v == true
         saveConfig()
-    end)
-    addToggle(chopping, "Smart Weapon Swapping", Flags.SmartWeapons, function(v) 
-        Flags.SmartWeapons = v
-        saveConfig() 
     end)
     addSlider(chopping, "Chop Delay", 0.1, 1.5, Flags.ChopDelay, 0.01, function(v) return string.format("%.2f", v) end, function(v) Flags.ChopDelay = v; saveConfig() end)
 
