@@ -20,18 +20,13 @@ task.wait(1)
 local TOGGLE_KEY = Enum.KeyCode.F7
 local KILL_KEY   = Enum.KeyCode.Equals
 
--- Fall Freeze
+-- Fall Freeze (original v2 values, unchanged)
 local FALL_SPEED   = -40
 local MOVE_RELEASE = 6
 local SETTLE_AFTER = 2.5
 local RETRY_AFTER  = 5
-local RAY_START    = 90    -- how far above the HRP the ray begins
-local RAY_DOWN     = 400   -- how far below the HRP to search
-local FLOOR_NORMAL_MIN = 0.5   -- min upward-facing normal to count as floor
-local FLOOR_MAX_HOPS   = 6     -- max surfaces to skip past before giving up
-local FALLBACK_AFTER_TRIES = 5 -- ray attempts before the last-mob fallback kicks in
-local FALLBACK_Y_OFFSET = 20   -- teleport this far above the last mob
-local FALLBACK_MAX_AGE  = 60   -- last-mob fallback expires after this many seconds
+local RAY_UP       = 80
+local RAY_DOWN     = 400
 local FREEZE_LOG_LINES = 5
 
 -- Activity Log
@@ -72,7 +67,6 @@ local freezeEnabled = true
 local anchored, lastPos, frozenAt = false, nil, 0
 local catches, settles = 0, 0
 local freezeLines = {}
-local failedSettleTries = 0
 
 local logRunning     = true
 local logBuffer      = {}
@@ -91,10 +85,6 @@ local autoRecovers     = 0
 local lastGoodPos      = nil
 local lastGoodTime     = 0
 local lastActivityTime = os.clock()
-
--- Last mob we were near, used as a fallback floor if the ray keeps failing.
-local lastMobPos  = nil
-local lastMobTime = 0
 
 local wLastPos, wLastMoveCheckPos, wLastMoveTime = nil, nil, os.clock()
 local wLastStuckLog = 0
@@ -362,90 +352,26 @@ local function isBlacklisted(model)
     return false
 end
 
--- FALL FREEZE LOGIC
+-- FALL FREEZE LOGIC (original v2, unchanged)
 local function release(r)
     if r then r.Anchored = false end
     anchored = false
-    failedSettleTries = 0
-end
-
--- Walk down the column from +RAY_START and skip past any surface that
--- is not a real floor (ceilings, walls, geometry above the player).
--- Accepts the first hit that is strictly below the player and roughly
--- horizontal.
-local function findFloorBelow(r)
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Exclude
-    params.FilterDescendantsInstances = { lp.Character }
-
-    local myY   = r.Position.Y
-    local stopY = myY - RAY_DOWN
-    local x, z  = r.Position.X, r.Position.Z
-    local originY = myY + RAY_START
-
-    for hop = 1, FLOOR_MAX_HOPS do
-        local remaining = originY - stopY
-        if remaining <= 0.1 then break end
-
-        local origin = Vector3.new(x, originY, z)
-        local hit = workspace:Raycast(origin, Vector3.new(0, -remaining, 0), params)
-        if not hit then
-            break
-        end
-
-        local isBelow = hit.Position.Y < myY - 0.5
-        local isFloor = hit.Normal.Y >= FLOOR_NORMAL_MIN
-
-        if isBelow and isFloor then
-            return hit
-        end
-
-        pushFreezeLog(string.format("skipped: %s y=%.1f (normal %.2f)",
-            hit.Instance.Name, hit.Position.Y, hit.Normal.Y))
-        originY = hit.Position.Y - 0.5
-
-        if originY <= stopY then break end
-    end
-
-    return nil
 end
 
 local function settleOnFloor(r)
-    local hit = findFloorBelow(r)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { lp.Character }
+    local origin = r.Position + Vector3.new(0, RAY_UP, 0)
+    local hit = workspace:Raycast(origin, Vector3.new(0, -(RAY_UP + RAY_DOWN), 0), params)
     if hit then
         r.CFrame = CFrame.new(hit.Position + Vector3.new(0, 3.2, 0)) * (r.CFrame - r.CFrame.Position)
         r.AssemblyLinearVelocity = Vector3.zero
         settles = settles + 1
-        failedSettleTries = 0
-        pushFreezeLog(string.format("floor: %s y=%.1f (%.1f below)",
-            hit.Instance.Name, hit.Position.Y, r.Position.Y - hit.Position.Y))
+        pushFreezeLog(string.format("floor: %s y=%.1f", hit.Instance.Name, hit.Position.Y))
         return true
     end
-
-    failedSettleTries = failedSettleTries + 1
-
-    -- Only try the last-mob fallback after enough failed tries.
-    if failedSettleTries >= FALLBACK_AFTER_TRIES then
-        if lastMobPos and (os.clock() - lastMobTime) < FALLBACK_MAX_AGE then
-            local landing = lastMobPos + Vector3.new(0, FALLBACK_Y_OFFSET, 0)
-            r.CFrame = CFrame.new(landing)
-            r.AssemblyLinearVelocity = Vector3.zero
-            settles = settles + 1
-            failedSettleTries = 0
-            pushFreezeLog(string.format(
-                "no floor after %d tries -> fallback to last mob %s (%.0fs ago)",
-                FALLBACK_AFTER_TRIES, fmtV(lastMobPos), os.clock() - lastMobTime))
-            return true
-        else
-            pushFreezeLog(string.format(
-                "no floor after %d tries, but no recent mob to fall back to",
-                failedSettleTries))
-            return false
-        end
-    end
-
-    pushFreezeLog(string.format("no floor under you, staying frozen (try %d/%d)",
-        failedSettleTries, FALLBACK_AFTER_TRIES))
+    pushFreezeLog("no floor under you, staying frozen")
     return false
 end
 
@@ -474,7 +400,6 @@ conns[#conns + 1] = RunService.Heartbeat:Connect(function()
         r.Anchored = true
         anchored = true
         frozenAt = os.clock()
-        failedSettleTries = 0
         catches = catches + 1
         pushFreezeLog(string.format("caught fall #%d at y=%.1f", catches, pos.Y))
     end
@@ -483,7 +408,6 @@ end)
 
 conns[#conns + 1] = lp.CharacterAdded:Connect(function()
     anchored, lastPos = false, nil
-    failedSettleTries = 0
     pushFreezeLog("character respawned")
 end)
 
@@ -615,12 +539,6 @@ conns[#conns + 1] = RunService.Heartbeat:Connect(function()
     if gm and gd < GOODPOS_MIN_DIST then
         lastGoodPos  = pos
         lastGoodTime = os.clock()
-    end
-
-    -- Remember the last mob we were fighting, for the freeze fallback.
-    if gm and gd and gd < 40 then
-        lastMobPos  = gm.root.Position
-        lastMobTime = os.clock()
     end
 
     if not wLastMoveCheckPos or (pos - wLastMoveCheckPos).Magnitude > STUCK_MOVE then
