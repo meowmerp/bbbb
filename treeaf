@@ -1,7 +1,7 @@
 --!nonstrict
 --=============================================================================
 -- Chop A Forest automation script + GUI
--- v3.5 (multi-path Axe swing input, recovery retries, config persistence)
+-- v4.3 (clear unused variable warnings; preserve custom hotbar combat)
 --=============================================================================
 
 local Players            = game:GetService("Players")
@@ -22,7 +22,7 @@ if not game:IsLoaded() then
     game.Loaded:Wait() 
 end
 
-local SCRIPT_VERSION = "v3.5"
+local SCRIPT_VERSION = "v4.3"
 local GAME_NAME      = "The Forest"
 local CONFIG_FILE    = "ForestConfig.json"
 
@@ -110,6 +110,9 @@ xpcall(function()
         bossRecoveryAttackRunning = false,
         bossMeleeInputMode = nil,
         bossMeleePoint = nil,
+        bossSlot2Selected = false,
+        bossSlot2Tool = nil,
+        lastBossAttackDiagnostic = 0,
     }
 
     --=============================================================================
@@ -401,6 +404,7 @@ xpcall(function()
         Game.bossReturnMonitorRunning = true
         task.spawn(function()
             local aliveSince = nil
+            local recoverySlotSelected = false
             while not unloaded and Game.bossRespawnTeleportPending do
                 local character = LocalPlayer.Character
                 local humanoid = character and character:FindFirstChildOfClass("Humanoid")
@@ -424,16 +428,19 @@ xpcall(function()
                                     -- while the player is awake and the game accepts input.
                                     -- Repeating short taps is robust against slot-key input canceling
                                     -- a continuous mouse hold.
-                                    if Game.pressWeaponSlot then
-                                        pcall(Game.pressWeaponSlot, 2)
+                                    if not recoverySlotSelected then
+                                        recoverySlotSelected = true
+                                        if Game.pressWeaponSlot then
+                                            pcall(Game.pressWeaponSlot, 2)
+                                        end
+                                        task.wait(0.12)
+                                        Game.bossSlot2Selected = true
+                                        Game.bossSlot2Tool = nil
                                     end
-                                    task.wait(0.12)
-                                    local preTeleportAxe = nil
                                     if equipAxe then
-                                        local equipOk, equipped = pcall(equipAxe)
-                                        if equipOk then preTeleportAxe = equipped end
+                                        pcall(equipAxe)
                                     end
-                                    if isAxeTool(preTeleportAxe) and Game.clickAttack then
+                                    if Game.bossSlot2Selected and Game.clickAttack then
                                         -- Send a discrete Axe swing while alive before teleporting.
                                         -- A short press/release is more reliable than a held click
                                         -- because slot-key input can interrupt executor mouse holds.
@@ -474,31 +481,20 @@ xpcall(function()
                                 Game.cachedBoss = nil
                                 Game.lastBossNotice = nil
 
-                                -- Respawning may clear the selected hotbar tool. Re-select
-                                -- slot 2 and explicitly equip the Axe from the Backpack.
-                                if Game.pressWeaponSlot then
-                                    pcall(Game.pressWeaponSlot, 2)
-                                end
+                                -- Slot 2 was already selected once after waking, before teleport.
+                                -- Do not send another keypress: it can cancel the mouse hold.
                                 task.wait(0.2)
-                                local axe = nil
                                 if equipAxe then
-                                    local equipOk, equipped = pcall(equipAxe)
-                                    if equipOk then axe = equipped end
+                                    pcall(equipAxe)
                                 end
-                                if axe then
-                                    Game.status = "Returned to boss area; Axe equipped; repeated swings active"
-                                    if Game.clickAttack then
-                                        local swingOk, swingResult = pcall(Game.clickAttack)
-                                        if swingOk and swingResult then
-                                            notify("Returned to the boss area; repeated Axe swings are active.")
-                                            warn("[TheForest] Recovery: sent the first discrete Axe swing after teleport.")
-                                        else
-                                            warn("[TheForest] Recovery: first post-teleport swing failed; attack watcher will retry.")
-                                        end
-                                    end
+                                if Game.bossSlot2Selected then
+                                    Game.status = "Returned to boss area; clicking Axe to swing"
+                                    if Game.setBossMeleeHeld then pcall(Game.setBossMeleeHeld, false) end
+                                    notify("Returned to boss area; restarting repeated Axe clicks.")
+                                    warn("[TheForest] Recovery: restarting repeated Axe clicks after teleport.")
                                 else
                                     Game.status = "Returned to boss area; retrying Axe equip"
-                                    warn("[TheForest] Returned to the boss area, but the Axe could not yet be confirmed as equipped. The recovery attack watcher will keep retrying slot 2, equip, and Axe swings.")
+                                    warn("[TheForest] Returned to the boss area, but the Axe could not yet be confirmed as equipped. The recovery attack watcher will retry equipping and Axe swings without repeating slot 2.")
                                 end
 
                                 -- Repeatedly send multi-path Axe attack pulses while waiting for
@@ -514,22 +510,19 @@ xpcall(function()
                                             local recoveryCharacter = LocalPlayer.Character
                                             local recoveryHumanoid = recoveryCharacter and recoveryCharacter:FindFirstChildOfClass("Humanoid")
                                             if recoveryHumanoid and recoveryHumanoid.Health > 0 then
-                                                local recoveryAxe = nil
                                                 if equipAxe then
-                                                    local equipOk, equipped = pcall(equipAxe)
-                                                    if equipOk then recoveryAxe = equipped end
+                                                    pcall(equipAxe)
                                                 end
-                                                if isAxeTool(recoveryAxe) then
-                                                    if os.clock() >= nextRecoveryActivate and Game.clickAttack then
-                                                        local attackOk, attackResult = pcall(Game.clickAttack)
-                                                        if not (attackOk and attackResult) then
-                                                            -- Keep retrying on the next pulse if the input was rejected.
-                                                        end
-                                                        nextRecoveryActivate = os.clock() + 0.22
+                                                if Game.bossSlot2Selected then
+                                                    -- Click again every cycle after respawn, with no
+                                                    -- additional hotbar presses or continuous hold.
+                                                    if os.clock() >= nextRecoveryActivate then
+                                                        if Game.clickAttack then pcall(Game.clickAttack) end
+                                                        nextRecoveryActivate = os.clock() + 0.23
                                                     end
                                                 else
                                                     if Game.setBossMeleeHeld then pcall(Game.setBossMeleeHeld, false) end
-                                                    if Game.pressWeaponSlot then pcall(Game.pressWeaponSlot, 2) end
+                                                    -- No repeated hotbar input during recovery.
                                                 end
                                             end
                                             task.wait(0.12)
@@ -554,6 +547,8 @@ xpcall(function()
     end
 
     local function markBossPlayerDowned(reason)
+        Game.bossSlot2Selected = false
+        Game.bossSlot2Tool = nil
         -- Clear any stale simulated mouse hold immediately while the player is down.
         if Game.setBossMeleeHeld then
             pcall(Game.setBossMeleeHeld, false)
@@ -1583,33 +1578,7 @@ xpcall(function()
         return Flags.AutoChop or Flags.AutoPickup or Flags.AutoSell 
     end
 
-    local function equipTool(name)
-        local humanoid, root = getRoot()
-        local character = LocalPlayer.Character
-        if not character or not humanoid or not root then
-            return nil
-        end
 
-        local tool = character:FindFirstChild(name)
-        if tool and tool:IsA("Tool") then
-            return tool
-        end
-
-        local backpack = LocalPlayer:FindFirstChild("Backpack")
-        tool = backpack and backpack:FindFirstChild(name)
-        if tool and tool:IsA("Tool") then
-            local equipped = pcall(function()
-                humanoid:EquipTool(tool)
-            end)
-            if not equipped then
-                return nil
-            end
-            task.wait(0.3)
-            local current = character:FindFirstChild(name)
-            return current and current:IsA("Tool") and current or nil
-        end
-        return nil
-    end
 
     local function sellLogs()
         if carried() <= 0 or not Remotes then 
@@ -1723,6 +1692,13 @@ xpcall(function()
 
     isAxeTool = function(tool)
         if not tool or not tool:IsA("Tool") then return false end
+        -- Some experiences rename their hotbar tools internally. Trust the
+        -- tool captured immediately after the ONE slot-2 selection, but never
+        -- an explicitly named firearm.
+        local loweredName = string.lower(tool.Name)
+        local firearm = loweredName:find("gun", 1, true) or loweredName:find("rifle", 1, true)
+            or loweredName:find("pistol", 1, true) or loweredName:find("shotgun", 1, true)
+        if Game.bossSlot2Tool == tool and not firearm then return true end
         local candidates = { tool.Name, tool.ToolTip }
         for _, attributeName in ipairs({ "DisplayName", "ItemName", "ToolName", "WeaponName" }) do
             local ok, value = pcall(function() return tool:GetAttribute(attributeName) end)
@@ -1749,6 +1725,16 @@ xpcall(function()
         if isAxeTool(heldTool) then
             return heldTool
         end
+        -- Never unequip an unidentified tool immediately after selecting slot 2;
+        -- that was preventing ALL attacks when the Axe has a custom Tool name.
+        if Game.bossSlot2Selected and heldTool and heldTool:IsA("Tool") then
+            local n = string.lower(heldTool.Name)
+            if not (n:find("gun", 1, true) or n:find("rifle", 1, true)
+                or n:find("pistol", 1, true) or n:find("shotgun", 1, true)) then
+                Game.bossSlot2Tool = heldTool
+                return heldTool
+            end
+        end
 
         local backpack = LocalPlayer:FindFirstChild("Backpack")
         if backpack then
@@ -1763,18 +1749,10 @@ xpcall(function()
             end
         end
 
-        -- Fall back to the game's Axe hotbar slot, then verify the held tool
-        -- instead of assuming that the keypress succeeded.
-        Game.pressWeaponSlot(2)
-        task.wait(0.16)
-        heldTool = character:FindFirstChildOfClass("Tool")
-        if isAxeTool(heldTool) then return heldTool end
-
-        -- If slot 2 failed to switch and the old weapon is still equipped,
-        -- put it away instead of ever activating it as a supposed Axe.
-        if heldTool then
-            pcall(function() humanoid:UnequipTools() end)
-        end
+        -- Slot 2 is pressed once at encounter start / once after respawn.
+        -- Never press 2 in this frequently-called helper: it interrupts attacks.
+        -- A custom slot-2 hotbar may not create any Roblox Tool instance.
+        -- Do not unequip anything just because the Tool search returned nil.
         return nil
     end
 
@@ -1870,13 +1848,44 @@ xpcall(function()
         return releaseOk
     end
 
+    -- A keyboard event or character respawn can silently interrupt a simulated
+    -- held mouse input without updating bossMeleeHeld. Periodically re-press it.
+    Game.refreshBossMeleeHold = function(force)
+        local character = LocalPlayer.Character
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        local equipped = character and character:FindFirstChildOfClass("Tool")
+        if not humanoid or humanoid.Health <= 0 or not isAxeTool(equipped)
+            or isKnockedDownScreenVisible() or Game.bossRespawnTeleportPending
+            or Game.bossPlayerDied then
+            if Game.setBossMeleeHeld then Game.setBossMeleeHeld(false) end
+            return false
+        end
+        if force or not Game.bossMeleeHeld then
+            Game.setBossMeleeHeld(false)
+            local held = Game.setBossMeleeHeld(true)
+            if held then Game.bossMeleeLastPressedAt = os.clock() end
+            return held
+        end
+        -- Keep the existing MouseButton1 hold uninterrupted until combat ends.
+        return true
+    end
+
     Game.clickAttack = function()
         -- Axe-only attack pulse. Do not treat pcall() success as proof that an
         -- input reached the game: executor mouse APIs can exist yet silently do
         -- nothing after a respawn. Try independent attack paths every pulse.
         local character = LocalPlayer.Character
         local heldTool = character and character:FindFirstChildOfClass("Tool")
-        if not isAxeTool(heldTool) then
+        -- This game can equip slot-2 weapons through its own hotbar without
+        -- parenting a Roblox Tool into Character. NONE must not block clicks.
+        local heldName = heldTool and string.lower(heldTool.Name) or ""
+        local isFirearm = heldName:find("gun", 1, true) or heldName:find("rifle", 1, true)
+            or heldName:find("pistol", 1, true) or heldName:find("shotgun", 1, true)
+        if isFirearm or not Game.bossSlot2Selected then
+            if os.clock() - (Game.lastBossAttackDiagnostic or 0) > 4 then
+                Game.lastBossAttackDiagnostic = os.clock()
+                warn("[TheForest] v4.3 attack blocked: firearm or slot 2 not selected; Tool=" .. tostring(heldTool and heldTool.Name or "NONE"))
+            end
             return false
         end
 
@@ -1888,10 +1897,13 @@ xpcall(function()
         -- Tool activation works for tools that listen to Tool.Activated rather
         -- than UserInputService mouse state. A short pulse avoids leaving the
         -- activation held when slot keys or a teleport occur.
-        local activateOk = pcall(function() heldTool:Activate() end)
-        attempted = attempted or activateOk
-        task.wait(0.045)
-        pcall(function() heldTool:Deactivate() end)
+        local activateOk = false
+        if heldTool then
+            activateOk = pcall(function() heldTool:Activate() end)
+            attempted = attempted or activateOk
+            task.wait(0.045)
+            pcall(function() heldTool:Deactivate() end)
+        end
 
         -- Attempt executor click even if pcall reports success elsewhere; a
         -- successful Lua call does not guarantee the client generated an input.
@@ -1922,6 +1934,12 @@ xpcall(function()
                 virtualInput:SendMouseButtonEvent(point.X, point.Y, 0, false, game, 0)
             end)
             attempted = attempted or downOk or upOk
+        end
+        if os.clock() - (Game.lastBossAttackDiagnostic or 0) > 4 then
+            Game.lastBossAttackDiagnostic = os.clock()
+            warn("[TheForest] v4.3 Axe swing attempt: equipped=" .. (heldTool and heldTool.Name or "CUSTOM HOTBAR / NO TOOL")
+                .. ", Tool:Activate=" .. tostring(activateOk)
+                .. ", inputAttempted=" .. tostring(attempted))
         end
         return attempted
     end
@@ -2061,7 +2079,7 @@ xpcall(function()
     end
 
     local function runBossEncounter(boss, areaKey)
-        -- Clear any stale mouse hold from a prior run; boss combat uses repeated Axe attack pulses.
+        -- Release any stale hold; boss combat uses separate left-click pulses.
         if Game.setBossMeleeHeld and not Game.bossRecoveryActive and not Game.bossRecoveryAttackRunning then
             pcall(Game.setBossMeleeHeld, false)
         end
@@ -2071,7 +2089,6 @@ xpcall(function()
         warn("[TheForest] Boss Axe combat enabled: staying at melee range in front at head level without falling.")
 
         local lastMissingTargetWarning = 0
-        local bossMissingSince = nil
         local bossBarMissingSince = nil
         local nextAxeAttackAt = 0
         local nextKnockdownCheckAt = 0
@@ -2101,11 +2118,14 @@ xpcall(function()
         end
         -- The boss fight is melee-only: equip the Axe in hotbar slot 2.
         -- Do not select or depend on the gun at any point in this encounter.
+        Game.bossSlot2Tool = nil
+        Game.bossSlot2Selected = true
         Game.pressWeaponSlot(2)
         task.wait(0.15)
         equipAxe()
         -- Wait for a visible top boss bar and a matching model before attacking.
 
+        warn("[TheForest] v4.3 entering boss attack loop: area=" .. tostring(areaKey))
         local loopOk, loopErr = pcall(function()
             while not unloaded and Flags.AutoChop and Game.areaCompleteKey == areaKey do
                 if os.clock() >= nextKnockdownCheckAt then
@@ -2119,50 +2139,44 @@ xpcall(function()
                     break
                 end
                 local currentState = readAreaHudState()
-                if currentState.key ~= areaKey
-                    or (currentState.percent ~= nil and currentState.percent < 99.9) then
+                if currentState.key ~= areaKey and not Game.bossRecoveryActive then
                     outcome = "area-changed"
                     break
                 end
 
-                -- The top health bar is authoritative. Stop attacking immediately
-                -- whenever it disappears; don't keep swinging/teleporting at a
-                -- stale model, nameplate, stump, or building.
-                if not currentState.bossBarPresent or not currentState.bossName then
-                    if Game.setBossMeleeHeld then pcall(Game.setBossMeleeHeld, false) end
+                -- v4.1: A boss model was verified before entering this encounter.
+                -- A temporary loss of the top HUD bar must not suppress all attacks.
+                -- Only use the already-locked living boss (or re-find that same boss).
+                local hudHasBoss = currentState.bossBarPresent and currentState.bossName ~= nil
+                if hudHasBoss and currentState.bossHealth ~= nil and currentState.bossHealth <= 0 then
+                    outcome = "defeated"
+                    break
+                end
+                local requestedBossName = hudHasBoss and currentState.bossName or bossName
+                local liveBoss = nil
+                if boss and boss.Parent and modelRootPart(boss) then
+                    liveBoss = boss
+                else
+                    liveBoss = findActiveBoss(requestedBossName)
+                end
+                if not hudHasBoss and os.clock() - (Game.lastBossAttackDiagnostic or 0) > 4 then
+                    Game.lastBossAttackDiagnostic = os.clock()
+                    warn("[TheForest] v4.3 HUD bar temporarily unavailable; locked boss="
+                        .. tostring(bossName) .. "; model=" .. tostring(liveBoss and liveBoss.Name or "NONE")
+                        .. "; continuing only if locked boss model is alive")
+                end
+                if not liveBoss then
                     bossBarMissingSince = bossBarMissingSince or os.clock()
-                    if os.clock() - bossBarMissingSince >= 1.8 then
-                        local stillTracked = findActiveBoss(Game.areaBossName or bossName)
-                        local trackedHp = stillTracked and modelHealth(stillTracked) or nil
-                        if not stillTracked or (trackedHp ~= nil and trackedHp <= 0) then
-                            outcome = "defeated"
-                        else
-                            outcome = "boss-bar-lost"
-                        end
+                    if os.clock() - bossBarMissingSince >= 2.5 then
+                        outcome = "boss-target-missing"
                         break
                     end
                     task.wait(0.12)
                 else
                     bossBarMissingSince = nil
-                    Game.areaBossName = currentState.bossName
-                    if currentState.bossHealth ~= nil and currentState.bossHealth <= 0 then
-                        outcome = "defeated"
-                        break
-                    end
-
-                    local liveBoss = findActiveBoss(currentState.bossName)
-                    if not liveBoss then
-                        if Game.setBossMeleeHeld then pcall(Game.setBossMeleeHeld, false) end
-                        bossMissingSince = bossMissingSince or os.clock()
-                        if os.clock() - bossMissingSince >= 1.8 then
-                            outcome = "boss-target-missing"
-                            break
-                        end
-                        task.wait(0.12)
-                    else
-                        bossMissingSince = nil
-                        boss = liveBoss
-                        bossName = currentState.bossName
+                    if hudHasBoss then Game.areaBossName = currentState.bossName end
+                    boss = liveBoss
+                        bossName = requestedBossName
                         local hp = modelHealth(boss)
                         if hp ~= nil and hp <= 0 then
                             outcome = "defeated"
@@ -2174,7 +2188,7 @@ xpcall(function()
                             if Game.setBossMeleeHeld then pcall(Game.setBossMeleeHeld, false) end
                             if os.clock() - lastMissingTargetWarning > 3 then
                                 lastMissingTargetWarning = os.clock()
-                                warn("[TheForest] Boss bar is visible, but its matching world model/root could not be found. Axe attacks are paused to avoid attacking unrelated objects.")
+                                warn("[TheForest] Boss locked but a live character root or boss model root could not be found. Axe attacks are paused to avoid attacking unrelated objects.")
                             end
                             task.wait(0.15)
                         else
@@ -2184,28 +2198,35 @@ xpcall(function()
                             -- click/activate the wrong tool.
                             Game.placeAtBossWeakpoint(boss, false)
                             local axe = equipAxe()
-                            if isAxeTool(axe) then
-                                -- Use repeated independent attack pulses instead of a continuous hold.
-                                -- clickAttack now tries Tool activation, executor click, VirtualUser,
-                                -- and balanced VirtualInputManager mouse events on every pulse.
-                                if os.clock() >= nextAxeAttackAt then
-                                    local attackOk, attackResult = pcall(Game.clickAttack)
-                                    if attackOk and attackResult and Game.bossRecoveryActive then
-                                        Game.bossRecoveryActive = false
-                                        notify("Axe swings resumed after returning to the boss area.")
-                                        warn("[TheForest] Repeated Axe swing input resumed after recovery.")
-                                    end
-                                    nextAxeAttackAt = os.clock() + 0.22
+                            if Game.bossSlot2Selected then
+                                -- Repeated discrete left-clicks instead of holding MouseButton1.
+                                -- The hotbar is selected once at encounter start; never here.
+                                if Game.bossMeleeHeld and Game.setBossMeleeHeld then
+                                    pcall(Game.setBossMeleeHeld, false)
                                 end
-                                Game.status = "Boss: repeatedly swinging Axe"
+                                if os.clock() >= nextAxeAttackAt then
+                                    if Game.clickAttack then pcall(Game.clickAttack) end
+                                    nextAxeAttackAt = os.clock() + 0.23
+                                end
+                                if Game.bossRecoveryActive then
+                                    Game.bossRecoveryActive = false
+                                    notify("Repeated Axe clicks resumed after returning to the boss area.")
+                                    warn("[TheForest] Boss Axe click attacks resumed after recovery.")
+                                end
+                                Game.status = "Boss: repeatedly clicking Axe attack"
                             else
                                 if Game.setBossMeleeHeld then pcall(Game.setBossMeleeHeld, false) end
                                 Game.status = "Boss: waiting for Axe in slot 2"
-                                Game.pressWeaponSlot(2)
+                                if os.clock() - (Game.lastBossAttackDiagnostic or 0) > 4 then
+                                    Game.lastBossAttackDiagnostic = os.clock()
+                                    local held = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Tool")
+                                    warn("[TheForest] v4.3 attack gate: tool=" .. tostring(held and held.Name or "NONE")
+                                        .. "; equipAxe=" .. tostring(axe and axe.Name or "NONE"))
+                                end
+                                -- Do not spam slot 2; it was selected at encounter start.
                             end
                             task.wait(0.08)
                         end
-                    end
                 end
             end
         end)
@@ -2237,8 +2258,6 @@ xpcall(function()
             Game.bossRecoveryActive = false
         end
         if outcome == "defeated" then
-            Game.pressWeaponSlot(2)
-            task.wait(0.12)
             notify(tostring(bossName) .. " defeated; stopped attacking and kept Axe equipped (slot 2).")
         end
         return outcome
