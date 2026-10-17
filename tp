@@ -25,10 +25,10 @@ local FALL_SPEED   = -40
 local MOVE_RELEASE = 6
 local SETTLE_AFTER = 2.5
 local RETRY_AFTER  = 5
-local RAY_UP       = 80    -- retained for search depth (RAY_UP + RAY_DOWN)
-local RAY_DOWN     = 400
-local RAY_START    = 5     -- NEW: how far above the HRP the ray begins
-local FLOOR_NORMAL_MIN = 0.5  -- NEW: reject surfaces facing sideways/down
+local RAY_START    = 90    -- how far above the HRP the ray begins
+local RAY_DOWN     = 400   -- how far below the HRP to search
+local FLOOR_NORMAL_MIN = 0.5  -- min upward-facing normal to count as floor
+local FLOOR_MAX_HOPS   = 6    -- max surfaces to skip past before giving up
 local FREEZE_LOG_LINES = 5
 
 -- Activity Log
@@ -360,39 +360,51 @@ local function release(r)
     anchored = false
 end
 
--- Find a real floor under the character. Only accepts hits that are:
---   (a) actually below the character's current Y, and
---   (b) roughly horizontal (surface normal points up).
--- This prevents the freeze from teleporting onto an invisible ceiling
--- or wall directly above the player, which is what RAY_UP = 80 caused.
+-- Walk down the column from +RAY_START and skip past any surface that
+-- is not a real floor (ceilings, walls, geometry above the player).
+-- Accepts the first hit that is strictly below the player and roughly
+-- horizontal.
 local function settleOnFloor(r)
     local params = RaycastParams.new()
     params.FilterType = Enum.RaycastFilterType.Exclude
     params.FilterDescendantsInstances = { lp.Character }
 
-    local origin = r.Position + Vector3.new(0, RAY_START, 0)
-    local dir    = Vector3.new(0, -(RAY_UP + RAY_DOWN), 0)
-    local hit    = workspace:Raycast(origin, dir, params)
+    local myY   = r.Position.Y
+    local stopY = myY - RAY_DOWN
+    local x, z  = r.Position.X, r.Position.Z
+    local originY = myY + RAY_START
 
-    local belowBy = hit and (r.Position.Y - hit.Position.Y) or 0
+    for hop = 1, FLOOR_MAX_HOPS do
+        local remaining = originY - stopY
+        if remaining <= 0.1 then break end
 
-    if hit and hit.Position.Y < r.Position.Y - 0.5
-        and hit.Normal.Y >= FLOOR_NORMAL_MIN then
-        r.CFrame = CFrame.new(hit.Position + Vector3.new(0, 3.2, 0)) * (r.CFrame - r.CFrame.Position)
-        r.AssemblyLinearVelocity = Vector3.zero
-        settles = settles + 1
-        pushFreezeLog(string.format("floor: %s y=%.1f (%.1f below)",
-            hit.Instance.Name, hit.Position.Y, belowBy))
-        return true
+        local origin = Vector3.new(x, originY, z)
+        local hit = workspace:Raycast(origin, Vector3.new(0, -remaining, 0), params)
+        if not hit then
+            break
+        end
+
+        local isBelow = hit.Position.Y < myY - 0.5
+        local isFloor = hit.Normal.Y >= FLOOR_NORMAL_MIN
+
+        if isBelow and isFloor then
+            r.CFrame = CFrame.new(hit.Position + Vector3.new(0, 3.2, 0)) * (r.CFrame - r.CFrame.Position)
+            r.AssemblyLinearVelocity = Vector3.zero
+            settles = settles + 1
+            pushFreezeLog(string.format("floor: %s y=%.1f (%.1f below)",
+                hit.Instance.Name, hit.Position.Y, myY - hit.Position.Y))
+            return true
+        end
+
+        -- Rejected. Advance past this surface and try again.
+        pushFreezeLog(string.format("skipped: %s y=%.1f (normal %.2f)",
+            hit.Instance.Name, hit.Position.Y, hit.Normal.Y))
+        originY = hit.Position.Y - 0.5
+
+        if originY <= stopY then break end
     end
 
-    if hit then
-        -- Something was hit but it's not a usable floor. Log it so we can see why.
-        pushFreezeLog(string.format("rejected surface: %s y=%.1f (%.1f above, normal %.2f)",
-            hit.Instance.Name, hit.Position.Y, -belowBy, hit.Normal.Y))
-    else
-        pushFreezeLog("no floor under you, staying frozen")
-    end
+    pushFreezeLog("no floor under you, staying frozen")
     return false
 end
 
