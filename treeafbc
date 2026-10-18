@@ -2,7 +2,7 @@ if not game:IsLoaded() then
     game.Loaded:Wait()
 end
 
-local SCRIPT_VERSION = "v1.9"
+local SCRIPT_VERSION = "v2.0"
 local GAME_NAME = "Deforestation"
 local GAME_KEY = "TheForest"
 local DISCORD_INVITE = "https://discord.gg/synapsex"
@@ -280,16 +280,26 @@ local function capacity()
 end
 
 -- Per-zone selling targets, set by the dropdowns in the Main tab.
-local SELL_OPTIONS = {"40", "60", "80", "100", "150", "999"}
+local SELL_OPTIONS = {"40", "60", "80", "100", "150", "999", "Don't Pick Up Logs"}
 local sellByZone = {}
-local function sellThreshold()
-    -- Prefer the HUD's current area number; it updates as the player advances.
+local function currentSellZone()
     local areaNumber = Game.sellAreaNumber
     local order = Config and Config.Forest and Config.Forest.Areas and Config.Forest.Areas.Order or {}
-    local zone = (areaNumber and order[areaNumber]) or Flags.Zone
+    return (areaNumber and order[areaNumber]) or Flags.Zone
+end
+
+local function pickupDisabledForZone()
+    return sellByZone[currentSellZone()] == "Don't Pick Up Logs"
+end
+
+local function sellThreshold()
+    local zone = currentSellZone()
     local value = tonumber(sellByZone[zone])
     if value then return value end
-    -- Defaults if this zone has not been configured yet.
+    -- The no-pickup choice is handled separately; this fallback keeps
+    -- other numerical comparisons safe if the player already has logs.
+    if pickupDisabledForZone() then return 999 end
+    local order = Config and Config.Forest and Config.Forest.Areas and Config.Forest.Areas.Order or {}
     return (zone == order[1]) and 60 or 100
 end
 
@@ -1115,7 +1125,7 @@ local function pickupLogs()
     local limit = sellThreshold()
     local picked = false
     for _, log in ipairs(groundLogs()) do
-        if unloaded or Game.bossPhase or not Flags.AutoPickup or carried() >= limit then
+        if unloaded or Game.bossPhase or not Flags.AutoPickup or pickupDisabledForZone() or carried() >= limit then
             break
         end
         local wood = log:FindFirstChild("Wood")
@@ -1124,7 +1134,7 @@ local function pickupLogs()
             local before = carried()
             teleport(wood.Position + Vector3.new(0, 3, 0))
             task.wait(0.15)
-            if unloaded or Game.bossPhase then break end
+            if unloaded or Game.bossPhase or pickupDisabledForZone() then break end
             Remotes.PickUpLog:FireServer(log)
             task.wait(0.2)
             if carried() > before or not log.Parent then
@@ -1211,11 +1221,11 @@ local function stepFarm()
             end
         end
         local full = carried() >= sellThreshold()
-        if Flags.AutoSell and (full or (carried() > 0 and not Flags.AutoChop and not (Flags.AutoPickup and #groundLogs() > 0))) then
+        if Flags.AutoSell and (full or (carried() > 0 and not Flags.AutoChop and not (Flags.AutoPickup and not pickupDisabledForZone() and #groundLogs() > 0))) then
             sellLogs()
             return
         end
-        if Flags.AutoPickup and not full and #groundLogs() > 0 then
+        if Flags.AutoPickup and not pickupDisabledForZone() and not full and #groundLogs() > 0 then
             pickupLogs()
             return
         end
@@ -1739,7 +1749,7 @@ local function overviewRows()
     return {
         { Text = "Status", Value = Game.status },
         { Text = "Cash", Value = "$" .. short(cashValue()) .. "  Gems " .. short(gemsValue()) },
-        { Text = "Logs", Value = tostring(carried()) .. (Flags.AutoSell and ("  (sell at " .. tostring(sellThreshold()) .. ")") or (" / " .. tostring(capacity()) .. " normal cap")) },
+        { Text = "Logs", Value = tostring(carried()) .. (Flags.AutoSell and (pickupDisabledForZone() and "  (pickup disabled)" or ("  (sell at " .. tostring(sellThreshold()) .. ")")) or (" / " .. tostring(capacity()) .. " normal cap")) },
         { Text = "Zone", Value = zoneLabel(Flags.Zone) .. (zoneUnlocked(Flags.Zone) and "" or " (locked)") },
         { Text = "Cycle", Value = Game.dayNight },
         { Text = "Session", Value = Game.trees .. " trees, " .. Game.sells .. " sells, " .. Game.bought .. " buys" },
