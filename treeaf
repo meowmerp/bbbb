@@ -11,7 +11,7 @@ do
     end
 end
 
-local SCRIPT_VERSION = "v2.6"
+local SCRIPT_VERSION = "v2.8"
 local GAME_NAME = "Deforestation"
 local GAME_KEY = "TheForest"
 local DISCORD_INVITE = "https://discord.gg/synapsex"
@@ -28,6 +28,12 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local StarterGui = game:GetService("StarterGui")
 
 local LocalPlayer = Players.LocalPlayer
+
+-- The main game's lobby place. A forest run uses a different PlaceId.
+local LOBBY_PLACE_ID = 103363457515322
+local function isLobbyPlace()
+    return game.PlaceId == LOBBY_PLACE_ID
+end
 
 local unloaded = false
 local connections = {}
@@ -136,6 +142,8 @@ local Game = {
     treeSearchLastArea = nil,
     finalSequence = false,
     finalDone = false,
+    finalGuiHidden = false,
+    finalReturnClickedAt = nil,
     finalStage = nil,
     finalStartedAt = nil,
     finalNextAction = 0,
@@ -1063,13 +1071,14 @@ local function finalGuiState()
     for _, node in ipairs(gui:GetDescendants()) do
         if (node:IsA("TextLabel") or node:IsA("TextButton")) and visibleFinalGui(node) then
             local content = tostring(node.Text or ""):lower():gsub("<[^>]->", "")
-            table.insert(labels, content)
+            table.insert(labels, {node = node, text = content})
             if node:IsA("TextButton") then
                 table.insert(buttons, {button = node, text = content})
             end
             local ancestry = node
             while ancestry and ancestry ~= gui do
-                if ancestry.Name:lower():find("dialog") or ancestry.Name:lower():find("conversation") then
+                local name = ancestry.Name:lower()
+                if name:find("dialog", 1, true) or name:find("conversation", 1, true) then
                     state.dialogueVisible = true
                     break
                 end
@@ -1079,17 +1088,51 @@ local function finalGuiState()
             table.insert(buttons, {button = node, text = node.Name:lower()})
         end
     end
-    for _, content in ipairs(labels) do
-        if content:find("forest cleared", 1, true) then state.won = true end
+    for _, label in ipairs(labels) do
+        if label.text:find("forest cleared", 1, true) then state.won = true end
     end
     for _, item in ipairs(buttons) do
         local t = item.text:gsub("^%s+", ""):gsub("%s+$", "")
-        if t:find("return to lobby", 1, true) then
+        if t:find("return to lobby", 1, true) or t:find("returntolobby", 1, true) then
             state.returnButton = item.button
         elseif t == "continue" or t == "next" or t == "okay" or t == "ok" or t == "yes"
             or t == "finish" or t == "thanks" or t == "thank you" or t == "goodbye"
             or t == "proceed" or t == "..." or t == "[next]" then
             state.nextButton = state.nextButton or item.button
+        end
+    end
+    -- Victory UI often puts the visible caption in a TextLabel inside an
+    -- ImageButton. The TextLabel itself is not the clickable surface.
+    if state.won and not state.returnButton then
+        for _, entry in ipairs(labels) do
+            local normalized = entry.text:gsub("%s+", " ")
+            if normalized:find("return to lobby", 1, true) then
+                local ancestor = entry.node
+                while ancestor and ancestor ~= gui do
+                    if ancestor:IsA("GuiButton") and visibleFinalGui(ancestor) then
+                        state.returnButton = ancestor
+                        break
+                    end
+                    ancestor = ancestor.Parent
+                end
+                if not state.returnButton then
+                    -- Some games place the caption beside a GuiButton rather
+                    -- than beneath it. Match a visible button occupying the
+                    -- same on-screen rectangle as the caption.
+                    local center = entry.node.AbsolutePosition + entry.node.AbsoluteSize * 0.5
+                    for _, item in ipairs(buttons) do
+                        local button = item.button
+                        local topLeft, size = button.AbsolutePosition, button.AbsoluteSize
+                        if size.X > 20 and size.Y > 15
+                            and center.X >= topLeft.X and center.X <= topLeft.X + size.X
+                            and center.Y >= topLeft.Y and center.Y <= topLeft.Y + size.Y then
+                            state.returnButton = button
+                            break
+                        end
+                    end
+                end
+                if state.returnButton then break end
+            end
         end
     end
     return state
@@ -1154,6 +1197,16 @@ local function finalBusinessmanStep()
     if unloaded or not Game.finalSequence or Game.finalDone then return end
     local now = os.clock()
     local ui = finalGuiState()
+    -- Hide our overlay as soon as the results screen appears, so it cannot
+    -- obscure/intercept the game's Return to Lobby button.
+    if ui.won and not Game.finalGuiHidden then
+        Game.finalGuiHidden = true
+        if Window then
+            local hidden, err = pcall(function() Window:Toggle(false) end)
+            if not hidden then warn("[Deforestation] Could not hide window: " .. tostring(err)) end
+        end
+        print("[Deforestation] Forest Cleared screen detected; hiding Deforestation GUI")
+    end
     -- The end-of-run screen is authoritative, even if the NPC interaction
     -- has already advanced beyond a visible dialogue panel.
     if ui.won and ui.returnButton then
@@ -1162,8 +1215,9 @@ local function finalBusinessmanStep()
         if now >= Game.finalNextAction then
             Game.finalNextAction = now + 2
             if clickFinalButton(ui.returnButton) then
-                Game.finalDone = true
-                Game.status = "Return to Lobby selected"
+                Game.finalReturnClickedAt = now
+                Game.status = "Return to Lobby clicked; awaiting transition"
+                print("[Deforestation] Clicked Return to Lobby; waiting for game transition")
             else
                 Game.status = "Forest cleared; waiting to click Return to Lobby"
             end
@@ -1393,7 +1447,7 @@ local SEARCH_OFFSETS = {
 }
 
 local function searchForMissingTrees()
-    if unloaded or not Flags.AutoChop or Game.bossPhase then return end
+    if unloaded or isLobbyPlace() or not Flags.AutoChop or Game.bossPhase then return end
     if os.clock() < (Game.treeSearchNextAt or 0) then return end
 
     -- Don't roam after the area is fully cleared or when the boss bar is visible.
@@ -1424,13 +1478,13 @@ local function searchForMissingTrees()
     Game.status = string.format("Searching %s for trees (%d/%d)", zoneLabel(Flags.Zone), step, #SEARCH_OFFSETS)
     -- Allow the nearby portion of the map to stream in after repositioning.
     -- Keep the player at their current height; never move if boss combat started.
-    if not Game.bossPhase and Flags.AutoChop then
+    if not isLobbyPlace() and not Game.bossPhase and Flags.AutoChop then
         root.AssemblyLinearVelocity = Vector3.zero
         root.CFrame = CFrame.new(destination)
     end
     Game.treeSearchNextAt = os.clock() + 0.8
     task.wait(0.5)
-    if not Game.bossPhase and Flags.AutoChop then
+    if not isLobbyPlace() and not Game.bossPhase and Flags.AutoChop then
         local tree = nearestTree()
         if tree then
             Game.status = "Tree found in " .. zoneLabel(Flags.Zone)
@@ -1605,6 +1659,13 @@ local function chopTree(tree)
 end
 
 local function stepFarm()
+    -- Never roam, chop, pick up or sell in the lobby; preserve lobby-only workers.
+    if isLobbyPlace() then
+        Game.treeSearchStep = 0
+        Game.treeSearchAnchor = nil
+        Game.status = "In lobby; forest farming paused"
+        return
+    end
     if Game.bossPhase or not Remotes or not farmActive() or Game.busy then
         return
     end
