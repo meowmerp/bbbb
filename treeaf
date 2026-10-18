@@ -2,7 +2,7 @@ if not game:IsLoaded() then
     game.Loaded:Wait()
 end
 
-local SCRIPT_VERSION = "v2.3"
+local SCRIPT_VERSION = "v2.4"
 local GAME_NAME = "Deforestation"
 local GAME_KEY = "TheForest"
 local DISCORD_INVITE = "https://discord.gg/synapsex"
@@ -816,28 +816,48 @@ local function goldenAspensCheckVisible()
     local camera = workspace.CurrentCamera
     local viewport = camera and camera.ViewportSize or Vector2.new(1920, 1080)
     local labels = {}
+    -- The end-of-area records are in the top-right portion of the game HUD.
+    -- They may consist of several TextLabels and an ImageLabel checkmark.
     for _, node in ipairs(gui:GetDescendants()) do
         if (node:IsA("TextLabel") or node:IsA("TextButton")) and visibleHudLabel(node) then
             local pos = node.AbsolutePosition
-            if pos.X >= viewport.X * 0.43 and pos.Y <= viewport.Y * 0.44 then
-                local text = cleanAreaHudText(node.Text):lower()
-                if text ~= "" then
-                    local marked = text:find("✓", 1, true) or text:find("✔", 1, true)
-                        or text:find("☑", 1, true)
-                    if text:find("golden aspens", 1, true) and marked then
-                        return true
-                    end
-                    table.insert(labels, {text=text, pos=pos, marked=marked ~= nil})
+            if pos.X >= viewport.X * 0.35 and pos.Y <= viewport.Y * 0.48 then
+                local content = cleanAreaHudText(node.Text):lower()
+                if content ~= "" then
+                    table.insert(labels, {
+                        text = content,
+                        x = pos.X, y = pos.Y,
+                        parent = node.Parent,
+                    })
                 end
             end
         end
     end
+    local function completedMark(text)
+        return text:find("✓", 1, true) ~= nil
+            or text:find("✔", 1, true) ~= nil
+            or text:find("☑", 1, true) ~= nil
+            or text:find("✅", 1, true) ~= nil
+            or text:find("√", 1, true) ~= nil
+    end
+    local function hasRunTime(text)
+        -- Completed-area record examples: 1:21:00 and -1:54:27.
+        -- Unlike the current-area countdown, these appear on the same
+        -- horizontal row as the zone name.
+        return text:match("%d+:%d%d:%d%d") ~= nil
+    end
     for _, label in ipairs(labels) do
-        if label.text:find("golden aspens", 1, true) then
+        if label.text:find("golden%s*aspens") then
+            -- The zone title at the top of the HUD is not a completion signal.
+            -- Look for either a checkmark or a completed-run time in its row.
+            if completedMark(label.text) or hasRunTime(label.text) then
+                return true
+            end
             for _, other in ipairs(labels) do
-                if other ~= label and other.marked
-                    and math.abs(other.pos.Y - label.pos.Y) <= 25
-                    and math.abs(other.pos.X - label.pos.X) <= 280 then
+                if other ~= label
+                    and math.abs(other.y - label.y) <= 22
+                    and math.abs(other.x - label.x) <= 320
+                    and (completedMark(other.text) or hasRunTime(other.text)) then
                     return true
                 end
             end
@@ -865,7 +885,7 @@ local function monitorBossAndAdvance()
     -- The final-area checkmark is authoritative: begin the Businessman flow
     -- even when the boss HUD or regular day/night timer has disappeared.
     if not Game.finalSequence and not Game.finalDone
-        and (zone == "GoldenAspens" or state.marker == "8/8" or Game.bossAreaMarker == "8/8")
+        and (zone == "GoldenAspens" or state.marker == "8/8" or Game.bossAreaMarker == "8/8" or Game.sellAreaNumber == 8)
         and goldenAspensCheckVisible() then
         beginFinalBusinessman("Golden Aspens checkmark detected")
         return
