@@ -2,7 +2,7 @@ if not game:IsLoaded() then
     game.Loaded:Wait()
 end
 
-local SCRIPT_VERSION = "v2.0"
+local SCRIPT_VERSION = "v2.1"
 local GAME_NAME = "Deforestation"
 local GAME_KEY = "TheForest"
 local DISCORD_INVITE = "https://discord.gg/synapsex"
@@ -120,6 +120,11 @@ local Game = {
     bossEndConfirmedAt = nil,
     bossAreaMarker = nil,
     sellAreaNumber = nil,
+    treeSearchZone = nil,
+    treeSearchAnchor = nil,
+    treeSearchStep = 0,
+    treeSearchNextAt = 0,
+    treeSearchLastArea = nil,
 }
 local WORKER_STEPS
 
@@ -1034,6 +1039,63 @@ local function nearestTree()
     return best
 end
 
+-- Explore nearby points when the currently streamed/eligible tree list is empty.
+-- This runs at ANY unfinished progress value, not only at high percentages.
+local SEARCH_OFFSETS = {
+    Vector3.new(45, 0, 0), Vector3.new(0, 0, 45),
+    Vector3.new(-45, 0, 0), Vector3.new(0, 0, -45),
+    Vector3.new(90, 0, 45), Vector3.new(-90, 0, 45),
+    Vector3.new(-90, 0, -45), Vector3.new(90, 0, -45),
+    Vector3.new(0, 0, 115), Vector3.new(115, 0, 0),
+    Vector3.new(0, 0, -115), Vector3.new(-115, 0, 0),
+}
+
+local function searchForMissingTrees()
+    if unloaded or not Flags.AutoChop or Game.bossPhase then return end
+    if os.clock() < (Game.treeSearchNextAt or 0) then return end
+
+    -- Don't roam after the area is fully cleared or when the boss bar is visible.
+    local hud = readBossProgress()
+    if hud.name ~= nil or (hud.progress ~= nil and hud.progress >= 99.9) then
+        Game.status = "Waiting for boss / area transition"
+        return
+    end
+    local _, root = getRoot()
+    if not root then return end
+    local areaId = tostring(Flags.Zone) .. "|" .. tostring(hud.marker or "")
+    if Game.treeSearchZone ~= Flags.Zone or Game.treeSearchLastArea ~= areaId then
+        Game.treeSearchZone = Flags.Zone
+        Game.treeSearchLastArea = areaId
+        Game.treeSearchAnchor = root.Position
+        Game.treeSearchStep = 0
+    end
+    -- A new sweep retries trees marked unresponsive on an earlier pass.
+    local step = (Game.treeSearchStep or 0) + 1
+    if step > #SEARCH_OFFSETS then
+        step = 1
+        Game.treeSearchAnchor = root.Position
+        table.clear(Game.badTrees)
+    end
+    Game.treeSearchStep = step
+    local anchor = Game.treeSearchAnchor or root.Position
+    local destination = anchor + SEARCH_OFFSETS[step]
+    Game.status = string.format("Searching %s for trees (%d/%d)", zoneLabel(Flags.Zone), step, #SEARCH_OFFSETS)
+    -- Allow the nearby portion of the map to stream in after repositioning.
+    -- Keep the player at their current height; never move if boss combat started.
+    if not Game.bossPhase and Flags.AutoChop then
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.CFrame = CFrame.new(destination)
+    end
+    Game.treeSearchNextAt = os.clock() + 0.8
+    task.wait(0.5)
+    if not Game.bossPhase and Flags.AutoChop then
+        local tree = nearestTree()
+        if tree then
+            Game.status = "Tree found in " .. zoneLabel(Flags.Zone)
+        end
+    end
+end
+
 local function groundLogs()
     local folder = workspace:FindFirstChild("Logs")
     local out = {}
@@ -1240,9 +1302,12 @@ local function stepFarm()
             end
             local tree = nearestTree()
             if tree then
+                Game.treeSearchStep = 0
+                Game.treeSearchAnchor = nil
+                Game.treeSearchNextAt = 0
                 chopTree(tree)
             else
-                Game.status = "No trees in " .. zoneLabel(Flags.Zone)
+                searchForMissingTrees()
             end
             return
         end
