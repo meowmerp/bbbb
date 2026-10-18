@@ -1,4 +1,4 @@
--- Pixel Blade v0.18 - standalone FlowAuth-free entrypoint (Luau type-check fixes)
+-- Pixel Blade v0.18 
 -- Original Pixel Blade functionality retained.
 
 if not game:IsLoaded() then
