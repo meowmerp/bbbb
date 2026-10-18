@@ -1,8 +1,17 @@
-if not game:IsLoaded() then
-    game.Loaded:Wait()
+-- Safe game-ready gate with an explicit failure message for executor compatibility.
+do
+    local ok, loaded = pcall(function() return game:IsLoaded() end)
+    if not ok then
+        warn("[Deforestation] Startup: game:IsLoaded() failed: " .. tostring(loaded))
+    elseif not loaded then
+        local waitOk, waitErr = pcall(function() game.Loaded:Wait() end)
+        if not waitOk then
+            warn("[Deforestation] Startup: game.Loaded:Wait() failed: " .. tostring(waitErr))
+        end
+    end
 end
 
-local SCRIPT_VERSION = "v2.1"
+local SCRIPT_VERSION = "v2.6"
 local GAME_NAME = "Deforestation"
 local GAME_KEY = "TheForest"
 local DISCORD_INVITE = "https://discord.gg/synapsex"
@@ -125,6 +134,14 @@ local Game = {
     treeSearchStep = 0,
     treeSearchNextAt = 0,
     treeSearchLastArea = nil,
+    finalSequence = false,
+    finalDone = false,
+    finalStage = nil,
+    finalStartedAt = nil,
+    finalNextAction = 0,
+    finalTalkAttempts = 0,
+    finalTarget = nil,
+    goldenAspensChecked = false,
 }
 local WORKER_STEPS
 
@@ -219,7 +236,7 @@ local function startWorker(key, interval, step)
     workers[key] = true
     task.spawn(function()
         while workers[key] and not unloaded do
-            if Game.bossPhase and BOSS_PAUSED_WORKERS[key] then
+            if (Game.bossPhase or Game.finalSequence) and BOSS_PAUSED_WORKERS[key] then
                 task.wait(interval)
                 continue
             end
@@ -745,7 +762,7 @@ local bossLastPosition = 0
 local bossNextAttack = 0
 local bossCombatRunning = false
 local function bossCombatStep()
-    if unloaded or not Flags.AutoChop or not Game.bossPhase or Game.bossDefeated then return end
+    if unloaded or not Flags.AutoChop or not Game.bossPhase or Game.bossDefeated or Game.finalSequence then return end
     if bossCombatRunning then return end
     bossCombatRunning = true
     local ok, err = pcall(function()
@@ -800,10 +817,88 @@ local function bossCombatStep()
     end
 end
 
+-- End-of-run objective: a checkmark next to Golden Aspens in the upper-right HUD.
+-- Also accept the checkmark as a neighboring label in the same HUD row.
+local function goldenAspensCheckVisible()
+    local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not gui then return false end
+    local camera = workspace.CurrentCamera
+    local viewport = camera and camera.ViewportSize or Vector2.new(1920, 1080)
+    local labels = {}
+    -- The end-of-area records are in the top-right portion of the game HUD.
+    -- They may consist of several TextLabels and an ImageLabel checkmark.
+    for _, node in ipairs(gui:GetDescendants()) do
+        if (node:IsA("TextLabel") or node:IsA("TextButton")) and visibleHudLabel(node) then
+            local pos = node.AbsolutePosition
+            if pos.X >= viewport.X * 0.35 and pos.Y <= viewport.Y * 0.48 then
+                local content = cleanAreaHudText(node.Text):lower()
+                if content ~= "" then
+                    table.insert(labels, {
+                        text = content,
+                        x = pos.X, y = pos.Y,
+                        parent = node.Parent,
+                    })
+                end
+            end
+        end
+    end
+    local function completedMark(text)
+        return text:find("✓", 1, true) ~= nil
+            or text:find("✔", 1, true) ~= nil
+            or text:find("☑", 1, true) ~= nil
+            or text:find("✅", 1, true) ~= nil
+            or text:find("√", 1, true) ~= nil
+    end
+    local function hasRunTime(text)
+        -- Completed-area record examples: 1:21:00 and -1:54:27.
+        -- Unlike the current-area countdown, these appear on the same
+        -- horizontal row as the zone name.
+        return text:match("%d+:%d%d:%d%d") ~= nil
+    end
+    for _, label in ipairs(labels) do
+        if label.text:find("golden%s*aspens") then
+            -- The zone title at the top of the HUD is not a completion signal.
+            -- Look for either a checkmark or a completed-run time in its row.
+            if completedMark(label.text) or hasRunTime(label.text) then
+                return true
+            end
+            for _, other in ipairs(labels) do
+                if other ~= label
+                    and math.abs(other.y - label.y) <= 22
+                    and math.abs(other.x - label.x) <= 320
+                    and (completedMark(other.text) or hasRunTime(other.text)) then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+local function beginFinalBusinessman(reason)
+    if Game.finalSequence or Game.finalDone then return end
+    Game.finalSequence = true
+    Game.bossPhase = true -- immediately pause ongoing farming, pickup and selling
+    Game.goldenAspensChecked = true
+    Game.finalStartedAt = os.clock()
+    Game.finalStage = "FindBusinessman"
+    Game.finalNextAction = 0
+    Game.status = "Golden Aspens cleared; visiting Businessman"
+    print("[Deforestation] " .. reason .. "; starting Businessman interaction")
+end
+
 local function monitorBossAndAdvance()
     if not Flags.AutoChop and not Flags.AutoSell and not Flags.AutoPickup then return end
     local zone = Flags.Zone
     local state = readBossProgress()
+    -- The final-area checkmark is authoritative: begin the Businessman flow
+    -- even when the boss HUD or regular day/night timer has disappeared.
+    if not Game.finalSequence and not Game.finalDone
+        and (zone == "GoldenAspens" or state.marker == "8/8" or Game.bossAreaMarker == "8/8" or Game.sellAreaNumber == 8)
+        and goldenAspensCheckVisible() then
+        beginFinalBusinessman("Golden Aspens checkmark detected")
+        return
+    end
     -- Area number is authoritative for log selling when the top-right HUD is present.
     -- Keep the last number while the HUD temporarily disappears for boss animations.
     if state.marker then
@@ -811,6 +906,7 @@ local function monitorBossAndAdvance()
         if currentArea then Game.sellAreaNumber = currentArea end
     end
     if not Flags.AutoChop then return end
+    if Game.finalSequence then return end
     -- A disappearing area label during the defeat animation is not a new area.
     local areaKey = tostring(zone) .. "|" .. tostring(state.marker or (Game.bossPhase and Game.bossAreaMarker) or "")
     if Game.bossAreaKey ~= areaKey then
@@ -860,6 +956,12 @@ local function monitorBossAndAdvance()
         end
         return
     end
+    -- The last boss ends the forest run; finish at the Businessman instead
+    -- of trying to advance beyond Golden Aspens.
+    if zone == "GoldenAspens" or Game.bossAreaMarker == "8/8" or state.marker == "8/8" then
+        beginFinalBusinessman("Golden Aspens boss defeat confirmed")
+        return
+    end
     if not Flags.AutoAdvanceZone then
         Game.status = "Boss defeated; auto advance disabled"
         return
@@ -895,6 +997,246 @@ local function monitorBossAndAdvance()
         end
     end
     Game.status = "Boss defeated; waiting for next zone unlock"
+end
+
+-- Final Golden Aspens interaction.  The businessman position shown in the
+-- user's screenshot is a fallback, not a guarantee of where the NPC is.
+local BUSINESSMAN_FALLBACK = Vector3.new(330.1, 3.2, 181.9)
+local finalNpcScanAt = 0
+
+local function visibleFinalGui(node)
+    if not node or not node:IsA("GuiObject") then return false end
+    local current = node
+    while current do
+        if current:IsA("GuiObject") and not current.Visible then return false end
+        if current:IsA("ScreenGui") and not current.Enabled then return false end
+        current = current.Parent
+    end
+    return true
+end
+
+local finalLastDialogueSnapshot = nil
+local function logBusinessmanDialogue()
+    local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not gui then return end
+    local entries = {}
+    local seen = {}
+    for _, node in ipairs(gui:GetDescendants()) do
+        if (node:IsA("TextLabel") or node:IsA("TextButton") or node:IsA("TextBox"))
+            and visibleFinalGui(node) then
+            local inDialogue = false
+            local cursor = node
+            while cursor and cursor ~= gui do
+                local name = cursor.Name:lower()
+                if name:find("dialog", 1, true) or name:find("conversation", 1, true) then
+                    inDialogue = true
+                    break
+                end
+                cursor = cursor.Parent
+            end
+            if inDialogue then
+                local content = tostring(node.Text or ""):gsub("<[^>]->", "")
+                    :gsub("%s+", " "):match("^%s*(.-)%s*$")
+                if content and content ~= "" and not seen[content] then
+                    seen[content] = true
+                    table.insert(entries, (node:IsA("TextButton") and "[CHOICE] " or "")
+                        .. content:sub(1, 220))
+                end
+            end
+        end
+    end
+    if #entries == 0 then return end
+    local maxEntries = math.min(#entries, 20)
+    local snapshot = table.concat(entries, " | ", 1, maxEntries)
+    if snapshot ~= finalLastDialogueSnapshot then
+        finalLastDialogueSnapshot = snapshot
+        print("[Deforestation][Businessman dialogue] " .. snapshot)
+    end
+end
+
+local function finalGuiState()
+    local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local state = {won = false, returnButton = nil, dialogueVisible = false, nextButton = nil}
+    if not gui then return state end
+    local labels = {}
+    local buttons = {}
+    for _, node in ipairs(gui:GetDescendants()) do
+        if (node:IsA("TextLabel") or node:IsA("TextButton")) and visibleFinalGui(node) then
+            local content = tostring(node.Text or ""):lower():gsub("<[^>]->", "")
+            table.insert(labels, content)
+            if node:IsA("TextButton") then
+                table.insert(buttons, {button = node, text = content})
+            end
+            local ancestry = node
+            while ancestry and ancestry ~= gui do
+                if ancestry.Name:lower():find("dialog") or ancestry.Name:lower():find("conversation") then
+                    state.dialogueVisible = true
+                    break
+                end
+                ancestry = ancestry.Parent
+            end
+        elseif node:IsA("ImageButton") and visibleFinalGui(node) then
+            table.insert(buttons, {button = node, text = node.Name:lower()})
+        end
+    end
+    for _, content in ipairs(labels) do
+        if content:find("forest cleared", 1, true) then state.won = true end
+    end
+    for _, item in ipairs(buttons) do
+        local t = item.text:gsub("^%s+", ""):gsub("%s+$", "")
+        if t:find("return to lobby", 1, true) then
+            state.returnButton = item.button
+        elseif t == "continue" or t == "next" or t == "okay" or t == "ok" or t == "yes"
+            or t == "finish" or t == "thanks" or t == "thank you" or t == "goodbye"
+            or t == "proceed" or t == "..." or t == "[next]" then
+            state.nextButton = state.nextButton or item.button
+        end
+    end
+    return state
+end
+
+local function pressFinalInteract()
+    local ok = pcall(function()
+        local input = game:GetService("VirtualInputManager")
+        input:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+        task.wait(0.08)
+        input:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+    end)
+    if not ok and type(keypress) == "function" and type(keyrelease) == "function" then
+        pcall(function()
+            keypress(0x45)
+            task.wait(0.08)
+            keyrelease(0x45)
+        end)
+    end
+end
+
+local function clickFinalButton(button)
+    if not button or not visibleFinalGui(button) or button.AbsoluteSize.Magnitude < 5 then return false end
+    local at = button.AbsolutePosition + button.AbsoluteSize * 0.5
+    local ok = pcall(function()
+        local input = game:GetService("VirtualInputManager")
+        input:SendMouseButtonEvent(math.floor(at.X), math.floor(at.Y), 0, true, game, 0)
+        task.wait(0.06)
+        input:SendMouseButtonEvent(math.floor(at.X), math.floor(at.Y), 0, false, game, 0)
+    end)
+    return ok
+end
+
+local function locateBusinessman()
+    if Game.finalTarget and Game.finalTarget.Parent then
+        return Game.finalTarget
+    end
+    if os.clock() < finalNpcScanAt then return nil end
+    finalNpcScanAt = os.clock() + 3
+    local best, dist = nil, math.huge
+    for _, node in ipairs(workspace:GetDescendants()) do
+        if (node:IsA("Model") or node:IsA("BasePart"))
+            and node.Name:lower():find("businessman", 1, true) then
+            local point
+            if node:IsA("BasePart") then point = node.Position
+            elseif node.PrimaryPart then point = node.PrimaryPart.Position
+            else
+                local ok, pivot = pcall(function() return node:GetPivot() end)
+                if ok then point = pivot.Position end
+            end
+            if point then
+                local d = (point - BUSINESSMAN_FALLBACK).Magnitude
+                if d < dist then best, dist = node, d end
+            end
+        end
+    end
+    Game.finalTarget = best
+    return best
+end
+
+local function finalBusinessmanStep()
+    if unloaded or not Game.finalSequence or Game.finalDone then return end
+    local now = os.clock()
+    local ui = finalGuiState()
+    -- The end-of-run screen is authoritative, even if the NPC interaction
+    -- has already advanced beyond a visible dialogue panel.
+    if ui.won and ui.returnButton then
+        Game.finalStage = "ReturnToLobby"
+        Game.status = "Forest cleared! Selecting Return to Lobby"
+        if now >= Game.finalNextAction then
+            Game.finalNextAction = now + 2
+            if clickFinalButton(ui.returnButton) then
+                Game.finalDone = true
+                Game.status = "Return to Lobby selected"
+            else
+                Game.status = "Forest cleared; waiting to click Return to Lobby"
+            end
+        end
+        return
+    end
+    if ui.won then
+        Game.status = "Forest cleared; waiting for Return to Lobby button"
+        return
+    end
+    if ui.dialogueVisible then
+        logBusinessmanDialogue()
+        Game.finalStage = "Dialogue"
+        Game.status = "Businessman dialogue: advancing"
+        if now >= Game.finalNextAction then
+            Game.finalNextAction = now + 1.2
+            if ui.nextButton then
+                clickFinalButton(ui.nextButton)
+            else
+                -- Games using E-to-advance dialogue may expose no TextButton.
+                pressFinalInteract()
+            end
+        end
+        return
+    end
+    local npc = locateBusinessman()
+    local destination = BUSINESSMAN_FALLBACK
+    if npc then
+        if npc:IsA("BasePart") then destination = npc.Position
+        else
+            local ok, pivot = pcall(function() return npc:GetPivot() end)
+            if ok then destination = pivot.Position end
+        end
+    end
+    local _, root = getRoot()
+    if not root then
+        Game.status = "Waiting for character before Businessman interaction"
+        return
+    end
+    if (root.Position - destination).Magnitude > 11 then
+        -- Stand near the NPC rather than inside the NPC model.
+        Game.status = "Moving to Businessman"
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.CFrame = CFrame.new(destination + Vector3.new(0, 3, 5))
+        Game.finalNextAction = now + 0.8
+        return
+    end
+    Game.status = "Businessman: pressing E / waiting for dialogue"
+    if now >= Game.finalNextAction then
+        Game.finalNextAction = now + 2
+        Game.finalTalkAttempts += 1
+        local nearbyPrompt
+        for _, part in ipairs(workspace:GetPartBoundsInRadius(root.Position, 16)) do
+            for _, node in ipairs(part:GetDescendants()) do
+                if node:IsA("ProximityPrompt") and node.Enabled then
+                    local text = (node.ActionText .. " " .. node.ObjectText):lower()
+                    if text:find("talk", 1, true) or text:find("businessman", 1, true) then
+                        nearbyPrompt = node
+                        break
+                    end
+                end
+            end
+            if nearbyPrompt then break end
+        end
+        if nearbyPrompt and type(fireproximityprompt) == "function" then
+            pcall(fireproximityprompt, nearbyPrompt)
+        else
+            pressFinalInteract()
+        end
+        if Game.finalTalkAttempts >= 8 then
+            Game.status = "Waiting for Businessman dialogue; check interaction"
+        end
+    end
 end
 
 local function detectCycle()
@@ -2389,30 +2731,49 @@ local function unloadScript()
     end
 end
 
+-- Keep GUI locals inside a separate function scope. The old monolithic
+-- top-level chunk exceeded Luau's 200-register local limit near its end.
+-- Existing gameplay helpers remain captured as upvalues; behavior is unchanged.
+local function initializeGUI()
+
 -- GUI library loaded from the requested GitHub source.
 local UI_SOURCE_URL = "https://raw.githubusercontent.com/meowmerp/bbbb/main/gui"
 local function loadGuiLibrary()
     if type(loadstring) ~= "function" then
         error("GUI loader requires loadstring", 0)
     end
+    print("[Deforestation] Startup: downloading GUI library")
     local source = game:HttpGet(UI_SOURCE_URL)
     if type(source) ~= "string" or source == "" then
         error("GUI library download returned empty content", 0)
     end
+    print("[Deforestation] Startup: compiling GUI library (" .. tostring(#source) .. " bytes)")
     local compiled, compileError = loadstring(source, "=DeforestationGUI")
     if not compiled then
         error("GUI library compilation failed: " .. tostring(compileError), 0)
     end
-    return compiled()
+    print("[Deforestation] Startup: executing GUI library")
+    local runOk, result = xpcall(compiled, function(err)
+        local trace = (debug and type(debug.traceback) == "function")
+            and debug.traceback(tostring(err), 2) or tostring(err)
+        return trace
+    end)
+    if not runOk then
+        error("Downloaded GUI library failed while executing: " .. tostring(result), 0)
+    end
+    return result
 end
 
-local okLibrary, libraryOrErr = pcall(function()
-    return loadGuiLibrary()
+local okLibrary, libraryOrErr = xpcall(loadGuiLibrary, function(err)
+    local trace = (debug and type(debug.traceback) == "function")
+        and debug.traceback(tostring(err), 2) or tostring(err)
+    return trace
 end)
 if not okLibrary or type(libraryOrErr) ~= "table" then
-    error("failed to load UI library: " .. tostring(libraryOrErr), 0)
+    error("[Deforestation] GUI startup failed: " .. tostring(libraryOrErr), 0)
 end
 Library = libraryOrErr
+print("[Deforestation] Startup: GUI loaded successfully")
 
 track(LocalPlayer.CharacterAdded:Connect(bindCharacter))
 if LobbyRemotes then
@@ -2932,6 +3293,7 @@ startWorker("ZoneAndCycle", 0.25, function()
     monitorBossAndAdvance()
 end)
 startWorker("BossCombatV7", 0.18, bossCombatStep)
+startWorker("FinalBusinessman", 0.45, finalBusinessmanStep)
 setupLobbyTab()
 setupShopTab()
 setupPlayerTab()
@@ -2991,3 +3353,6 @@ end
 if readFlag("HideUIOnStart", false) == true then
     Window:Toggle(false)
 end
+
+end -- initializeGUI
+initializeGUI()
