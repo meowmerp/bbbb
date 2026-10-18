@@ -1,0 +1,3261 @@
+-- Pixel Blade v0.18 - standalone FlowAuth-free entrypoint (Luau type-check fixes)
+-- Original Pixel Blade functionality retained.
+
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+
+local SCRIPT_VERSION = "v0.18"
+local GAME_NAME = "Pixel Blade"
+local GAME_KEY = "PixelBlade"
+local DISCORD_INVITE = "https://discord.gg/synapsex"
+local WEBSITE_LINK = "https://ouroboros-hub-rbx.web.app/"
+local UI_SOURCE_URL = "https://raw.githubusercontent.com/joustingmatch/OuroFlow/main/Source.luau"
+local NAMESPACE = "OuroborosPixelBlade"
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local VirtualUser = game:GetService("VirtualUser")
+local TeleportService = game:GetService("TeleportService")
+local GuiService = game:GetService("GuiService")
+local Lighting = game:GetService("Lighting")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CoreGui = game:GetService("CoreGui")
+local HttpService = game:GetService("HttpService")
+
+local LocalPlayer = Players.LocalPlayer
+
+do
+    local env = type(getgenv) == "function" and getgenv() or nil
+    local previous = env and env[NAMESPACE]
+    if type(previous) == "function" then
+        pcall(previous)
+    end
+end
+
+if type(getgc) ~= "function" then
+    error("[PixelBlade] executor is missing getgc", 0)
+end
+
+local Src = ReplicatedStorage:WaitForChild("src", 30)
+if not Src then
+    error("[PixelBlade] ReplicatedStorage.src not found", 0)
+end
+
+local G = {
+    C = require(Src.ecs.components),
+    input = require(Src.client.user_input),
+    net = require(Src.network),
+    ActivationType = require(Src.types.enums.ActivationType),
+    weaponAttrs = require(Src.configs.weapon_stats.weapon_attributes),
+    armorAttrs = require(Src.configs.armor_attributes),
+    cutsceneState = require(Src.cutscene_state_util),
+    armoryGui = require(Src.client.armory_gui_util),
+    upgrade = require(Src.upgrade_util),
+    classUtil = require(Src.class_util),
+    classConfig = require(Src.configs.class_config),
+    shopConfig = require(Src.configs.shop_config),
+    potionConfig = require(Src.configs.potion_config),
+    questUtil = require(Src.quest_util),
+    completedUtil = require(Src.completed_util),
+    clydeUtil = require(Src.clyde_presence_util),
+    npcConfig = require(Src.configs.lobby_npc_config),
+    groupUtil = Src.client:FindFirstChild("group_util"),
+    chestIds = require(Src.types.enums.ChestId),
+    HitboxShape = require(Src.types.enums.HitboxShape),
+    PotionEffectType = require(Src.types.enums.PotionEffectType),
+    inherit = require(Src.ecs.utils.inherit_component),
+    findAncestor = require(Src.ecs.utils.find_first_ancestor_w_component),
+}
+if G.groupUtil then
+    local ok, mod = pcall(require, G.groupUtil)
+    G.groupUtil = ok and mod or nil
+end
+
+local WORLDS = { "Grasslands", "AncientSands", "HauntedTundra", "CrimsonAbyss", "Bootcamp" }
+local DIFFICULTIES = { "Normal", "Heroic", "Nightmare" }
+local SHOP_RARITIES = { "Common", "Rare", "Epic", "Legendary", "Vaulted" }
+local POTIONS = {}
+for id, def in pairs(G.potionConfig) do
+    if type(def) == "table" and id ~= "GodlyPotion" then
+        table.insert(POTIONS, id)
+    end
+end
+table.sort(POTIONS)
+local SHOP_CHESTS = { "DailyChest" }
+for id in pairs(G.shopConfig.daily.chest_cost) do
+    table.insert(SHOP_CHESTS, id)
+end
+table.sort(SHOP_CHESTS)
+local CHESTS = {}
+for id in pairs(G.chestIds) do
+    table.insert(CHESTS, id)
+end
+table.sort(CHESTS)
+local CLASSES = {}
+for id in pairs(G.classConfig.classes) do
+    if id ~= "Townsperson" then
+        table.insert(CLASSES, id)
+    end
+end
+table.sort(CLASSES)
+
+local STAR_VALUE = { One = 1, Two = 2, Three = 3, Four = 4, Five = 5 }
+local RARITY_LIST = { "Vaulted", "Legendary", "Epic", "Rare", "Common" }
+local CHARM_LIST = { "UltimateCharm", "SuperCharm", "Charm" }
+local POSITIONS = { "Below", "Front", "Behind", "Above", "Orbit" }
+local BANNER_LIST = { "Critical Boost", "Life Steal", "Health Boost", "Rage Spirits", "Spirit Capacity", "Flame Element", "Frost Element", "Poison Element", "Element Circle", "Thorns", "Agility", "Stamina", "Recovery" }
+
+local unloaded = false
+local connections = {}
+local workers = {}
+local Library
+local Window
+
+local Flags: any = {
+    AutoFarm = false,
+    FarmPosition = "Above",
+    BossPosition = "Above",
+    FarmDistance = 6,
+    HeightOffset = 0,
+    OrbitSpeed = 3,
+    BossDistance = 6,
+    BossHeightOffset = 0,
+    BossOrbitSpeed = 3,
+    PrioritizeBoss = true,
+    KillShieldersFirst = true,
+    AutoTreeMove = false,
+    TreeMobsFirst = false,
+    AutoCrates = false,
+    IncludeChests = false,
+    AutoSkills = false,
+    SkillOne = true,
+    SkillTwo = true,
+    SkillInterval = 0.5,
+    AutoCards = false,
+    BannerOrder = table.clone(BANNER_LIST),
+    RarityOrder = table.clone(RARITY_LIST),
+    PreferType = "Any",
+    PreferredItems = "",
+    CardTiebreak = "Stars",
+    AutoCharm = false,
+    CharmOrder = table.clone(CHARM_LIST),
+    AutoRetreat = false,
+    RetreatHp = 35,
+    ResumeHp = 80,
+    AutoRetry = false,
+    AutoLeave = false,
+    AutoGiveUp = false,
+    AutoSkipCutscene = false,
+    MobEsp = false,
+    HitboxEsp = false,
+    AutoPotion = false,
+    PotionHp = 50,
+    AutoJoin = false,
+    AutoStart = false,
+    AutoRaid = false,
+    JoinWorld = "Grasslands",
+    JoinDifficulty = "Normal",
+    JoinPlayers = 1,
+    AutoQuests = false,
+    AutoShop = false,
+    ShopRarities = { "Epic", "Legendary", "Vaulted" },
+    ShopChests = {},
+    AutoPotions = false,
+    BuyPotions = {},
+    PotionTarget = 5,
+    AutoEquipBest = false,
+    AutoUpgrade = false,
+    UpgradeRarities = { "Common", "Rare", "Epic", "Legendary", "Vaulted" },
+    UpgradeEquippedOnly = false,
+    UpgradeReserve = 0,
+    AutoChests = false,
+    OpenChests = {},
+    AutoClass = false,
+    AutoFish = false,
+    FishMode = "Perfect",
+    FishCastPower = 100,
+    FishCastDelay = 0.5,
+    FishReelDelay = 0.05,
+    FishAutoRod = true,
+    ClassTargets = {},
+    WalkSpeedEnabled = false,
+    WalkSpeed = 32,
+    InfJump = false,
+    NoClip = false,
+    InstantProximityPrompt = false,
+    Fly = false,
+    FlySpeed = 60,
+    AntiGameplayPause = true,
+    AutoReconnect = false,
+    Disable3DRendering = false,
+    FpsBoost = false,
+    AntiAfk = true,
+}
+
+local Game: any = {
+    status = "Idle",
+    goal = nil,
+    holding = false,
+    orbitAngle = 0,
+    retreating = false,
+    retreatPoint = nil,
+    crateSkip = {},
+    crate = nil,
+    crateStart = 0,
+    lastSkill = 0,
+    nextSkill = 2,
+    cardSig = nil,
+    cardSeenAt = 0,
+    voteSeenAt = 0,
+    voteFiredAt = 0,
+    bannerSig = nil,
+    bannerSeenAt = 0,
+    charmAt = 0,
+    potionFired = {},
+    potionUses = {},
+    stats = { banners = 0, cards = 0, charms = 0, retries = 0 },
+}
+
+local Shell: any = {
+    walkSpeedRestore = {},
+    noclipRestore = {},
+    promptRestore = {},
+    fpsRestore = {},
+    reconnectToken = 0,
+    antiAfkLast = 0,
+}
+
+local function track(conn)
+    if conn then
+        table.insert(connections, conn)
+    end
+    return conn
+end
+
+local function readFlag(name, default)
+    local entry = Library and Library.Flags and Library.Flags[name]
+    if entry == nil then
+        return default
+    end
+    if type(entry) == "table" then
+        if type(entry.Get) == "function" then
+            local ok, value = pcall(entry.Get, entry)
+            if ok then
+                return value
+            end
+        end
+        if entry.Value ~= nil then
+            return entry.Value
+        end
+        return default
+    end
+    return entry
+end
+
+local function firstOption(option)
+    if typeof(option) == "table" then
+        return option[1]
+    end
+    return option
+end
+
+local function listOf(value)
+    local out = {}
+    if type(value) == "table" then
+        for _, v in ipairs(value) do
+            table.insert(out, v)
+        end
+    end
+    return out
+end
+
+local function getRoot()
+    local character = LocalPlayer.Character
+    if not character then
+        return nil, nil
+    end
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    local root = character:FindFirstChild("HumanoidRootPart")
+    if humanoid and humanoid.Health <= 0 then
+        return nil, nil
+    end
+    return humanoid, root
+end
+
+local function startWorker(key, interval, step)
+    local token = {}
+    workers[key] = token
+    task.spawn(function()
+        while workers[key] == token and not unloaded do
+            local ok, err = pcall(step)
+            if not ok then
+                warn("[PixelBlade] " .. key .. ": " .. tostring(err))
+            end
+            task.wait(interval)
+        end
+    end)
+end
+
+local function stopWorker(key)
+    workers[key] = nil
+end
+
+local function setWorker(key, enabled, interval, step)
+    if enabled then
+        if not workers[key] then
+            startWorker(key, interval, step)
+        end
+    else
+        stopWorker(key)
+    end
+end
+
+local Ecs: any = {}
+
+function Ecs.find()
+    local world, state
+    for _, v in ipairs(getgc(true)) do
+        if type(v) == "table" then
+            if not state and rawget(v, "local_player_entity") ~= nil and rawget(v, "replicator") ~= nil then
+                state = v
+            elseif not world and type(rawget(v, "archetypes")) == "table" and rawget(v, "entity_index") ~= nil then
+                world = v
+            end
+            if world and state then
+                break
+            end
+        end
+    end
+    Ecs.world, Ecs.state = world, state
+    return world ~= nil and state ~= nil
+end
+
+function Ecs.ready()
+    if Ecs.world and Ecs.state then
+        return true
+    end
+    if Ecs.nextFind and os.clock() < Ecs.nextFind then
+        return false
+    end
+    Ecs.nextFind = os.clock() + 5
+    return Ecs.find()
+end
+
+function Ecs.get(entity, component)
+    local ok, value = pcall(Ecs.world.get, Ecs.world, entity, component)
+    return ok and value or nil
+end
+
+function Ecs.has(entity, component)
+    local ok, value = pcall(Ecs.world.has, Ecs.world, entity, component)
+    return ok and value == true
+end
+
+function Ecs.me()
+    return Ecs.state and Ecs.state.local_player_entity
+end
+
+function Ecs.each(tagComponent, fn)
+    local ok, err = pcall(function()
+        for entity, model in Ecs.world:query(G.C.Model):with(tagComponent) do
+            if fn(entity, model) == false then
+                break
+            end
+        end
+    end)
+    if not ok then
+        warn("[PixelBlade] query: " .. tostring(err))
+    end
+end
+
+local function alive(entity, model)
+    if typeof(model) ~= "Instance" or not model.Parent then
+        return false
+    end
+    local health = Ecs.get(entity, G.C.Health)
+    if not health or (tonumber(health.value) or 0) <= 0 then
+        return false
+    end
+    return not (Ecs.has(entity, G.C.Dead) or Ecs.has(entity, G.C.Station))
+end
+
+local function modelRoot(model)
+    return model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart or model:FindFirstChild("Primary") or model:FindFirstChildWhichIsA("BasePart")
+end
+
+local function hpPercent()
+    local me = Ecs.me()
+    local health = me and Ecs.get(me, G.C.Health)
+    if health and tonumber(health.max) and health.max > 0 then
+        return health.value / health.max * 100
+    end
+    local humanoid = select(1, getRoot())
+    if humanoid and humanoid.MaxHealth > 0 then
+        return humanoid.Health / humanoid.MaxHealth * 100
+    end
+    return 100
+end
+
+local function friendly(entity)
+    if Ecs.has(entity, G.C.Friendly) or Ecs.has(entity, G.C.RaisedDead) then
+        return true
+    end
+    local ok, owner = pcall(Ecs.world.target, Ecs.world, entity, G.C.SummonedBy)
+    return ok and owner ~= nil and Ecs.has(owner, G.C.Player)
+end
+
+local function aliveEnemies()
+    local list = {}
+    Ecs.each(G.C.Enemy, function(entity, model)
+        if alive(entity, model) and not friendly(entity) then
+            local part = modelRoot(model)
+            if part then
+                table.insert(list, { entity = entity, model = model, part = part })
+            end
+        end
+    end)
+    return list
+end
+
+function Game.shielder(enemies, rootPos)
+    local best, bestDist
+    for _, enemy in ipairs(enemies) do
+        local ok, healer = pcall(Ecs.world.target, Ecs.world, enemy.entity, G.C.HealTetheredBy)
+        if ok and healer and healer ~= enemy.entity then
+            local model = Ecs.get(healer, G.C.Model)
+            if alive(healer, model) and not friendly(healer) then
+                local part = modelRoot(model)
+                if part then
+                    local dist = (part.Position - rootPos).Magnitude
+                    if not best or dist < bestDist then
+                        best, bestDist = { entity = healer, model = model, part = part, shielding = enemy.model }, dist
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+function Game.treeGather()
+    local ok, raid = pcall(Ecs.world.get, Ecs.world, G.C.RaidState, G.C.RaidState)
+    local gather = ok and raid and raid.gather
+    if type(gather) == "table" and typeof(gather.position) == "Vector3" then
+        return gather
+    end
+    return nil
+end
+
+function Game.raidTree()
+    local map = workspace:FindFirstChild("map")
+    local tree = map and map:FindFirstChild("crystal_tree")
+    local hurtbox = tree and tree:FindFirstChild("hurtbox")
+    local trunk = hurtbox and hurtbox:FindFirstChild("trunk")
+    return trunk and trunk:IsA("BasePart") and trunk or nil
+end
+
+local function nearestEnemy(rootPos)
+    local best, bestDist, bestBoss
+    local enemies = aliveEnemies()
+    local tree = Flags.TreeMobsFirst and Game.raidTree()
+    if tree then
+        rootPos = tree.Position
+    end
+    if Flags.KillShieldersFirst then
+        local shielder = Game.shielder(enemies, rootPos)
+        if shielder then
+            return shielder
+        end
+    end
+    for _, enemy in ipairs(enemies) do
+        local isBoss = Flags.PrioritizeBoss and Ecs.has(enemy.entity, G.C.BOSS)
+        local dist = (enemy.part.Position - rootPos).Magnitude
+        if not best or (isBoss and not bestBoss) or (isBoss == bestBoss and dist < bestDist) then
+            best, bestDist, bestBoss = enemy, dist, isBoss
+        end
+    end
+    return best
+end
+
+local function isCrateName(name)
+    if name:match("^crate_") or name:match("^barrel_") then
+        return true
+    end
+    return Flags.IncludeChests and name:match("^chest_") ~= nil
+end
+
+local function nearestCrate(rootPos)
+    local best, bestDist
+    local now = os.clock()
+    Ecs.each(G.C.Breakable, function(entity, model)
+        if isCrateName(model.Name) and alive(entity, model) and not (Game.crateSkip[entity] and Game.crateSkip[entity] > now) then
+            local part = modelRoot(model)
+            if part then
+                local dist = (part.Position - rootPos).Magnitude
+                if not best or dist < bestDist then
+                    best, bestDist = { entity = entity, model = model, part = part }, dist
+                end
+            end
+        end
+    end)
+    return best
+end
+
+local function setHold(value)
+    if Game.holding == value then
+        return
+    end
+    Game.holding = value
+    pcall(G.input.set_attack_held, value)
+end
+
+local function poseAround(targetPart, dt, mode, dist, speed)
+    local pos = targetPart.Position
+    if mode == "Below" then
+        local at = pos - Vector3.new(0, dist, 0)
+        return CFrame.lookAt(at, pos, Vector3.zAxis)
+    elseif mode == "Front" or mode == "Behind" then
+        local at = (targetPart.CFrame * CFrame.new(0, 0, mode == "Front" and -dist or dist)).Position
+        return CFrame.lookAt(at, Vector3.new(pos.X, at.Y, pos.Z))
+    elseif mode == "Orbit" then
+        Game.orbitAngle = (Game.orbitAngle + speed * dt) % (math.pi * 2)
+        local at = pos + Vector3.new(math.cos(Game.orbitAngle) * dist, 0, math.sin(Game.orbitAngle) * dist)
+        return CFrame.lookAt(at, pos)
+    end
+    local at = pos + Vector3.new(0, dist, 0)
+    return CFrame.lookAt(at, pos, Vector3.zAxis)
+end
+
+local function onHeartbeat(dt)
+    if unloaded then
+        return
+    end
+    local _, root = getRoot()
+    if not root then
+        return
+    end
+    local cf
+    if Game.gatherPos then
+        cf = CFrame.new(Game.gatherPos + Vector3.new(0, 3, 0))
+    elseif Game.retreating and Game.retreatPoint then
+        cf = CFrame.new(Game.retreatPoint)
+    elseif Game.goal and Game.goal.part and Game.goal.part.Parent then
+        local goal = Game.goal
+        local isBoss = goal.entity ~= nil and Ecs.world ~= nil and Ecs.has(goal.entity, G.C.BOSS)
+        if isBoss then
+            cf = poseAround(goal.part, dt, Flags.BossPosition, Flags.BossDistance, Flags.BossOrbitSpeed) + Vector3.new(0, Flags.BossHeightOffset, 0)
+        else
+            cf = poseAround(goal.part, dt, Flags.FarmPosition, Flags.FarmDistance, Flags.OrbitSpeed) + Vector3.new(0, Flags.HeightOffset, 0)
+        end
+    end
+    if cf then
+        root.CFrame = cf
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+    end
+end
+
+local function retreatPointFrom(rootPos)
+    local enemies = aliveEnemies()
+    local sum, count = Vector3.zero, 0
+    for _, enemy in ipairs(enemies) do
+        if (enemy.part.Position - rootPos).Magnitude < 200 then
+            sum += enemy.part.Position
+            count += 1
+        end
+    end
+    if count == 0 then
+        return rootPos + Vector3.new(0, 30, 0)
+    end
+    local away = rootPos - sum / count
+    away = Vector3.new(away.X, 0, away.Z)
+    if away.Magnitude < 1 then
+        away = Vector3.new(1, 0, 0)
+    end
+    return rootPos + away.Unit * 70 + Vector3.new(0, 30, 0)
+end
+
+local function fireSkill(slot, target)
+    local me = Ecs.me()
+    if not me or Ecs.has(me, G.C.Dead) or Ecs.has(me, G.C.Stun) then
+        return
+    end
+    local weapon = Ecs.get(me, G.C.EquippedWeapon)
+    if not weapon then
+        return
+    end
+    local weaponDef = Ecs.get(weapon, G.C.Weapon)
+    local skill = weaponDef and weaponDef.skills and weaponDef.skills[slot]
+    if not skill then
+        return
+    end
+    local activation = slot == 1 and G.ActivationType.SkillOne or G.ActivationType.SkillTwo
+    if skill.aiming then
+        if Ecs.has(weapon, G.C.Activated) or Ecs.has(weapon, G.C.Attack) then
+            return
+        end
+        return (pcall(function()
+            Ecs.world:remove(weapon, G.C.SkillAiming)
+            Ecs.world:set(weapon, G.C.Activated, {
+                timestamp = os.clock(),
+                inner = { activation_type = activation, aim_position = target.part.Position },
+            })
+        end))
+    end
+    local signal = slot == 1 and G.input.skill_one or G.input.skill_two
+    return (pcall(signal.Fire, signal, os.clock()))
+end
+
+function Game.stepCombat()
+    if not Ecs.ready() then
+        Game.status = "Waiting for game"
+        return
+    end
+    local _, root = getRoot()
+    if not root then
+        Game.goal = nil
+        setHold(false)
+        Game.status = "Waiting for character"
+        return
+    end
+
+    local gather = Flags.AutoTreeMove and Game.treeGather() or nil
+    Game.gatherPos = gather and gather.position or nil
+    if gather then
+        Game.goal = nil
+        setHold(false)
+        Game.status = string.format("Moving to tree %s/%s", tostring(gather.present), tostring(gather.required))
+        return
+    end
+
+    if Flags.AutoRetreat then
+        local hp = hpPercent()
+        if Game.retreating and hp >= Flags.ResumeHp then
+            Game.retreating = false
+            Game.retreatPoint = nil
+        elseif not Game.retreating and hp <= Flags.RetreatHp then
+            Game.retreating = true
+            Game.retreatPoint = retreatPointFrom(root.Position)
+        end
+    elseif Game.retreating then
+        Game.retreating = false
+        Game.retreatPoint = nil
+    end
+    if Game.retreating then
+        Game.goal = nil
+        setHold(false)
+        Game.status = string.format("Retreating (%d%% HP)", math.floor(hpPercent()))
+        return
+    end
+
+    local target = Flags.AutoFarm and nearestEnemy(root.Position) or nil
+    if target then
+        Game.noEnemySince = nil
+        -- Share the most recent confirmed farming location with Farm Assist.
+        -- Only record positions close to an actual living AutoFarm target.
+        if (root.Position - target.part.Position).Magnitude <= 100 and not root.Anchored then
+            Game.lastFarmCFrame = root.CFrame
+            Game.lastFarmSeenAt = os.clock()
+        end
+        Game.goal = target
+        Game.crate = nil
+        setHold(true)
+        Game.status = target.shielding and ("Breaking shield on " .. target.shielding.Name) or ("Farming " .. target.model.Name)
+        if Flags.AutoSkills and os.clock() - Game.lastSkill >= Flags.SkillInterval then
+            for _ = 1, 2 do
+                Game.nextSkill = Game.nextSkill == 1 and 2 or 1
+                local slot = Game.nextSkill
+                if (slot == 1 and Flags.SkillOne or slot == 2 and Flags.SkillTwo) and fireSkill(slot, target) then
+                    Game.lastSkill = os.clock()
+                    break
+                end
+            end
+        end
+        return
+    end
+
+    if Flags.AutoCrates then
+        local crate = Game.crate
+        if crate and (not alive(crate.entity, crate.model) or os.clock() - Game.crateStart > 4) then
+            if alive(crate.entity, crate.model) then
+                Game.crateSkip[crate.entity] = os.clock() + 10
+            end
+            crate = nil
+        end
+        if not crate then
+            crate = nearestCrate(root.Position)
+            Game.crateStart = os.clock()
+        end
+        Game.crate = crate
+        if crate then
+            Game.goal = crate
+            setHold(true)
+            Game.status = "Breaking " .. crate.model.Name
+            return
+        end
+    end
+
+    Game.goal = nil
+    Game.crate = nil
+    setHold(false)
+    if Flags.AutoFarm then
+        Game.noEnemySince = Game.noEnemySince or os.clock()
+        Game.status = "No enemies found"
+    else
+        Game.noEnemySince = nil
+        Game.status = "Idle"
+    end
+end
+
+local function normalize(text)
+    return string.lower((tostring(text):gsub("[%s_%-]", "")))
+end
+
+local function cardStars(card)
+    if card.item_type == "Weapon" then
+        local attrs = G.weaponAttrs[card.id]
+        return attrs and STAR_VALUE[attrs.stars] or 0
+    end
+    local attrs = G.armorAttrs[card.id]
+    return attrs and tonumber(attrs.stars) or 0
+end
+
+local function cardScore(card)
+    local preferred = 0
+    for word in string.gmatch(Flags.PreferredItems, "[^,]+") do
+        local key = normalize(word)
+        if key ~= "" and string.find(normalize(card.id), key, 1, true) then
+            preferred = 1
+            break
+        end
+    end
+    local rank = #Flags.RarityOrder + 1
+    for i, rarity in ipairs(Flags.RarityOrder) do
+        if rarity == card.rarity then
+            rank = i
+            break
+        end
+    end
+    local typeMatch = (Flags.PreferType == "Any" or Flags.PreferType == card.item_type) and 1 or 0
+    local stars = cardStars(card)
+    if Flags.CardTiebreak == "Stars" then
+        return { preferred, stars, -rank, typeMatch }
+    end
+    return { preferred, -rank, typeMatch, stars }
+end
+
+local function better(a, b)
+    for i = 1, #a do
+        if a[i] ~= b[i] then
+            return a[i] > b[i]
+        end
+    end
+    return false
+end
+
+function Game.stepBanners()
+    local me = Ecs.me()
+    local offer = me and not Ecs.has(me, G.C.Dead) and Ecs.get(me, G.C.Banners)
+    local ids = {}
+    if type(offer) == "table" then
+        for _, id in pairs(offer) do
+            table.insert(ids, tostring(id))
+        end
+    end
+    if #ids == 0 then
+        Game.bannerSig = nil
+        return
+    end
+    table.sort(ids)
+    local sig = table.concat(ids, "|")
+    if Game.bannerSig == sig and os.clock() - Game.bannerSeenAt < 1.5 then
+        return
+    end
+    Game.bannerSig = sig
+    Game.bannerSeenAt = os.clock()
+    local best, bestRank
+    for _, id in ipairs(ids) do
+        local rank = table.find(Flags.BannerOrder, (id:gsub("(%l)(%u)", "%1 %2"))) or 99
+        if not best or rank < bestRank then
+            best, bestRank = id, rank
+        end
+    end
+    G.net.select_banner.fire(best)
+    Game.stats.banners += 1
+end
+
+function Game.stepCards()
+    if not Ecs.ready() then
+        return
+    end
+    Game.stepBanners()
+    local pick = Ecs.get(G.C.CharmPick, G.C.CharmPick)
+    if not pick or pick.resolved or type(pick.offers) ~= "table" then
+        Game.cardSig = nil
+        return
+    end
+    local offer = pick.offers[tostring(LocalPlayer.UserId)]
+    if not offer or offer.picked or type(offer.cards) ~= "table" then
+        return
+    end
+    local parts = { tostring(offer.charm_id), tostring(offer.charm_rarity) }
+    for _, card in pairs(offer.cards) do
+        table.insert(parts, tostring(card.id) .. ":" .. tostring(card.rarity))
+    end
+    local sig = table.concat(parts, "|")
+    if Game.cardSig == sig and os.clock() - Game.cardSeenAt < 1.5 then
+        return
+    end
+    Game.cardSig = sig
+    Game.cardSeenAt = os.clock()
+    local bestIndex, bestScore
+    for index, card in pairs(offer.cards) do
+        local score = cardScore(card)
+        if not bestScore or better(score, bestScore) then
+            bestIndex, bestScore = index, score
+        end
+    end
+    if bestIndex then
+        G.net.pick_charm_card.fire(bestIndex)
+        Game.stats.cards += 1
+    end
+end
+
+local function bestCharmKey(charms)
+    local bestKey, bestRank, bestRarity
+    for key, entry in pairs(charms) do
+        if type(entry) == "table" and (tonumber(entry.count) or 0) > 0 then
+            local rank = table.find(Flags.CharmOrder, entry.id) or 99
+            local rarityRank = table.find(RARITY_LIST, entry.rarity) or 99
+            if not bestKey or rank < bestRank or (rank == bestRank and rarityRank < bestRarity) then
+                bestKey, bestRank, bestRarity = key, rank, rarityRank
+            end
+        end
+    end
+    return bestKey
+end
+
+function Game.stepCharm()
+    if not Ecs.ready() or os.clock() - Game.charmAt < 3 then
+        return
+    end
+    local me = Ecs.me()
+    if not me then
+        return
+    end
+    local equipped = Ecs.get(me, G.C.EquippedCharm)
+    if equipped and equipped.reserved then
+        return
+    end
+    local dealer
+    Ecs.each(G.C.CharmDealer, function(_, model)
+        if typeof(model) == "Instance" and model.Parent then
+            dealer = model
+            return false
+        end
+        return nil
+    end)
+    if not dealer then
+        return
+    end
+    local fishing = Ecs.get(me, G.C.Fishing)
+    local key = fishing and type(fishing.charms) == "table" and bestCharmKey(fishing.charms)
+    if not key then
+        return
+    end
+    Game.charmAt = os.clock()
+    local _, root = getRoot()
+    if root and not Game.retreating then
+        local pivot = dealer:GetPivot()
+        root.CFrame = pivot * CFrame.new(0, 0, -5)
+        task.wait(0.3)
+    end
+    if unloaded or not Flags.AutoCharm then
+        return
+    end
+    G.net.equip_charm.fire(key)
+    Game.stats.charms += 1
+end
+
+function Game.stepRetry()
+    if not Ecs.ready() then
+        return
+    end
+    local vote = Ecs.get(G.C.RunVote, G.C.RunVote)
+    if not vote or vote.resolved then
+        Game.voteSeenAt = 0
+        return
+    end
+    if Game.voteSeenAt == 0 then
+        Game.voteSeenAt = os.clock()
+        return
+    end
+    local choice = vote.kind == "RaidContinue" and "Stay" or "Replay"
+    if Flags.AutoLeave then
+        choice = "Leave"
+    elseif not Flags.AutoRetry then
+        return
+    end
+    local mine = type(vote.votes) == "table" and vote.votes[tostring(LocalPlayer.UserId)]
+    if mine == choice or os.clock() - Game.voteSeenAt < 1 or os.clock() - Game.voteFiredAt < 2 then
+        return
+    end
+    Game.voteFiredAt = os.clock()
+    G.net.run_end_vote.fire(choice)
+    Game.stats.retries += 1
+end
+
+function Game.stepMisc()
+    if not Ecs.ready() then
+        return
+    end
+    local me = Ecs.me()
+    local now = os.clock()
+    if Flags.AutoGiveUp and me and Ecs.has(me, G.C.Dead) and Ecs.has(me, G.C.ReviveTimer) and now - (Game.giveUpAt or 0) > 3 then
+        Game.giveUpAt = now
+        G.net.give_up.fire()
+    end
+    if Flags.AutoSkipCutscene and now - (Game.skipAt or 0) > 1 then
+        local active = false
+        pcall(function()
+            for _ in Ecs.world:query(G.C.Cutscene) do
+                active = true
+                break
+            end
+        end)
+        if active and G.cutsceneState.is_holding_player(Ecs.world, Ecs.state) then
+            Game.skipAt = now
+            G.net.skip_cutscene.fire()
+        end
+    end
+end
+
+local Runs: any = { list = {}, file = "OuroborosHub/PixelBlade_runs.json" }
+local RESULT_NAMES = { Replay = "Replayed", Leave = "Left", Stay = "Stayed" }
+
+function Runs.load()
+    if type(readfile) ~= "function" or type(isfile) ~= "function" then
+        return
+    end
+    local ok, data = pcall(function()
+        return isfile(Runs.file) and HttpService:JSONDecode(readfile(Runs.file)) or nil
+    end)
+    if ok and type(data) == "table" then
+        Runs.list = data
+    end
+end
+
+function Runs.save()
+    if type(writefile) ~= "function" then
+        return
+    end
+    pcall(function()
+        if type(isfolder) == "function" and not isfolder("OuroborosHub") then
+            makefolder("OuroborosHub")
+        end
+        writefile(Runs.file, HttpService:JSONEncode(Runs.list))
+    end)
+end
+
+function Runs.chests()
+    local loot = Ecs.get(Ecs.me(), G.C.Loot)
+    local total = 0
+    if type(loot) == "table" then
+        for _, count in pairs(loot) do
+            total += tonumber(count) or 0
+        end
+    end
+    return total
+end
+
+function Runs.publish()
+    if Runs.table then
+        pcall(Runs.table.SetRows, Runs.table, Runs.list)
+    end
+end
+
+function Runs.step()
+    if not Ecs.ready() or not Ecs.me() then
+        return
+    end
+    local place = Ecs.get(G.C.Place, G.C.Place)
+    if not place or place.id == "Lobby" or place.id == "RaidLobby" then
+        Runs.current = nil
+        return
+    end
+    local vote = Ecs.get(G.C.RunVote, G.C.RunVote)
+    local run = Runs.current
+    if not run then
+        if vote then
+            return
+        end
+        local world = table.find(WORLDS, place.id)
+        Runs.current = {
+            name = (world and ("W" .. world) or tostring(place.id)) .. " " .. tostring(place.difficulty or ""),
+            started = os.clock(),
+            chests = Runs.chests(),
+        }
+        return
+    end
+    if not vote then
+        if run.row then
+            Runs.current = nil
+        end
+        return
+    end
+    if not run.row then
+        local seconds = math.floor(os.clock() - run.started)
+        run.row = {
+            Ended = os.date("%H:%M"),
+            Run = run.name,
+            Time = string.format("%d:%02d", seconds // 60, seconds % 60),
+            Chests = math.max(Runs.chests() - run.chests, 0),
+            Result = "Ended",
+        }
+        table.insert(Runs.list, 1, run.row)
+        while #Runs.list > 25 do
+            table.remove(Runs.list)
+        end
+        Runs.save()
+        Runs.publish()
+    end
+    local mine = type(vote.votes) == "table" and vote.votes[tostring(LocalPlayer.UserId)]
+    local result = mine and RESULT_NAMES[mine] or mine
+    if result and run.row.Result ~= result then
+        run.row.Result = result
+        run.row.Chests = math.max(Runs.chests() - run.chests, run.row.Chests)
+        Runs.save()
+        Runs.publish()
+    end
+end
+
+local Lobby: any = { at = {} }
+
+function Lobby.inLobby()
+    local place = Ecs.get(G.C.Place, G.C.Place)
+    return place ~= nil and place.id == "Lobby"
+end
+
+function Lobby.ready(key, seconds)
+    if not Ecs.ready() or not Lobby.inLobby() then
+        return false
+    end
+    local now = os.clock()
+    if Lobby.at[key] and now - Lobby.at[key] < seconds then
+        return false
+    end
+    Lobby.at[key] = now
+    return true
+end
+
+function Lobby.coins()
+    local coins = Ecs.get(Ecs.me(), G.C.Coins)
+    return coins and tonumber(coins.value) or 0
+end
+
+function Lobby.serverEntity(entity)
+    local ok, id = pcall(Ecs.state.replicator.get_server_entity, Ecs.state.replicator, entity)
+    return ok and id or nil
+end
+
+function Lobby.stepJoin()
+    if Flags.AutoRaid or not Lobby.ready("join", 12) then
+        return
+    end
+    local unlocks = Ecs.get(Ecs.me(), G.C.WorldUnlocks)
+    local world, difficulty = Flags.JoinWorld, Flags.JoinDifficulty
+    if world == "Bootcamp" then
+        difficulty = "Normal"
+    end
+    local worldUnlocks = type(unlocks) == "table" and unlocks[world]
+    if not (type(worldUnlocks) == "table" and worldUnlocks[difficulty]) then
+        Game.lobbyStatus = "Join: " .. world .. " " .. difficulty .. " is locked"
+        return
+    end
+    Game.lobbyStatus = "Joining " .. world .. " " .. difficulty
+    G.net.create_play_session.fire(world, difficulty, world == "Bootcamp" and 1 or Flags.JoinPlayers)
+end
+
+function Lobby.stepStart()
+    if not Ecs.ready() or os.clock() - (Lobby.at.start or 0) < 3 then
+        return
+    end
+    pcall(function()
+        for _, session in Ecs.world:query(G.C.PadSession) do
+            if type(session) == "table" and session.owner_user_id == LocalPlayer.UserId and session.phase == "Open" then
+                Lobby.at.start = os.clock()
+                G.net.start_pad_session.fire()
+                Game.lobbyStatus = "Starting run"
+                break
+            end
+        end
+    end)
+end
+
+function Lobby.stepRaid()
+    if not Ecs.ready() then
+        return
+    end
+    local place = Ecs.get(G.C.Place, G.C.Place)
+    local id = place and place.id
+    if (id == "Lobby" or id == "RaidLobby") and os.clock() - (Lobby.at.raid or 0) >= 10 then
+        Lobby.at.raid = os.clock()
+        G.net.auto_join_raid.fire()
+        Game.lobbyStatus = id == "Lobby" and "Going to raid lobby" or "Joining raid"
+    end
+end
+
+function Lobby.stepQuests()
+    if not Lobby.ready("quests", 4) then
+        return
+    end
+    local me = Ecs.me()
+    local quests = Ecs.get(me, G.C.Quests)
+    if type(quests) ~= "table" then
+        return
+    end
+    local places = G.completedUtil.reached_places(Ecs.world, me)
+    local level = Ecs.get(me, G.C.PlayerLevel) or 1
+    local lines = Ecs.get(me, G.C.QuestLines)
+    local clydeGone = G.completedUtil.is_clyde_gone(Ecs.world, me)
+    for _, npc in ipairs(G.npcConfig.npcs) do
+        if npc.giver then
+            local ok, actions = pcall(G.questUtil.talk_actions, quests, npc.giver, places, level, lines, G.clydeUtil.stand_ins(npc.giver, clydeGone))
+            Lobby.npcSkip = Lobby.npcSkip or {}
+            local skipUntil = Lobby.npcSkip[npc.id] or 0
+            if ok and os.clock() >= skipUntil and (#actions.accepts > 0 or #actions.grants > 0 or #actions.credits > 0) then
+                Lobby.npcSkip[npc.id] = os.clock() + 60
+                local model = workspace:FindFirstChild("npc_" .. npc.id)
+                local prompt = model and model:FindFirstChild("talk", true)
+                local _, root = getRoot()
+                if model and prompt and root and type(fireproximityprompt) == "function" then
+                    Game.lobbyStatus = "Quest: " .. npc.id
+                    root.CFrame = model:GetPivot() * CFrame.new(0, 0, -4)
+                    task.wait(0.4)
+                    pcall(fireproximityprompt, prompt)
+                    task.wait(1.2)
+                    if unloaded or not Flags.AutoQuests then
+                        return
+                    end
+                    G.net.accept_quest.fire(npc.id)
+                    task.wait(1)
+                    return
+                end
+            end
+        end
+    end
+end
+
+function Lobby.stepShop()
+    if not Lobby.ready("shop", 3) then
+        return
+    end
+    local shop = Ecs.get(Ecs.me(), G.C.DailyShop)
+    if type(shop) ~= "table" then
+        return
+    end
+    local daily = G.shopConfig.daily
+    local passes = Ecs.get(Ecs.me(), G.C.Gamepasses) or {}
+    local rarities = {}
+    for _, r in ipairs(Flags.ShopRarities) do
+        rarities[r] = true
+    end
+    for index, row in pairs(shop.order or {}) do
+        if rarities[row.rarity] and not (index == daily.vip_slot_index and not passes.VIP) then
+            local bought = (shop.items and shop.items[row.id]) or 0
+            local cost = daily.buy_cost[row.rarity] or math.huge
+            if bought < (daily.available_buys[row.rarity] or 0) and Lobby.coins() >= cost then
+                G.net.buy_daily.fire(row.id)
+                Game.lobbyStatus = "Bought " .. tostring(row.id)
+                return
+            end
+        end
+    end
+    for _, id in ipairs(Flags.ShopChests) do
+        local claimed = shop.chests and shop.chests[id]
+        if claimed ~= nil and claimed < 1 then
+            local cost = daily.chest_cost[id] or 0
+            local memberOk = cost > 0 or (G.groupUtil and G.groupUtil.is_member() == true)
+            if memberOk and Lobby.coins() >= cost then
+                G.net.buy_daily.fire(id)
+                Game.lobbyStatus = "Bought " .. id
+                return
+            end
+        end
+    end
+end
+
+function Lobby.stepPotions()
+    if not Lobby.ready("potions", 2) then
+        return
+    end
+    local owned = Ecs.get(Ecs.me(), G.C.OwnedPotions) or {}
+    for _, id in ipairs(Flags.BuyPotions) do
+        local def = G.potionConfig[id]
+        if def and (owned[id] or 0) < Flags.PotionTarget and Lobby.coins() >= (def.cost or math.huge) then
+            G.net.buy_potion.fire(id)
+            Game.lobbyStatus = "Bought " .. id
+            return
+        end
+    end
+end
+
+function Lobby.stepEquip()
+    if not Lobby.ready("equip", 5) then
+        return
+    end
+    for _, tab in ipairs({ "Weapons", "Armor" }) do
+        local ok, list = pcall(G.armoryGui.collect_owned, Ecs.world, Ecs.me(), tab)
+        local best = ok and list[1]
+        if best and not Ecs.has(best.entity, G.C.Equipped) then
+            local id = Lobby.serverEntity(best.entity)
+            if id then
+                G.net.equip_item.fire(id)
+                Game.lobbyStatus = "Equipped " .. tostring(best.name)
+                task.wait(0.5)
+            end
+        end
+    end
+end
+
+function Lobby.stepUpgrade()
+    if not Lobby.ready("upgrade", 1.5) then
+        return
+    end
+    local rarities = {}
+    for _, r in ipairs(Flags.UpgradeRarities) do
+        rarities[r] = true
+    end
+    for _, tab in ipairs({ "Weapons", "Armor" }) do
+        local ok, list = pcall(G.armoryGui.collect_owned, Ecs.world, Ecs.me(), tab)
+        for _, item in ipairs(ok and list or {}) do
+            local allowed = rarities[item.rarity] and (not Flags.UpgradeEquippedOnly or Ecs.has(item.entity, G.C.Equipped))
+            if allowed then
+                local okReq, req = pcall(G.upgrade.get_upgrade_requirement, Ecs.world, item.entity)
+                if okReq and req and req.can_upgrade and not req.maxed and Lobby.coins() - (req.needed_coins or 0) >= Flags.UpgradeReserve then
+                    local id = Lobby.serverEntity(item.entity)
+                    if id then
+                        G.net.upgrade_item.fire(id)
+                        Game.lobbyStatus = "Upgraded " .. tostring(item.name)
+                        return
+                    end
+                end
+            end
+        end
+    end
+end
+
+function Lobby.stepChests()
+    if not Lobby.ready("chests", 3) then
+        return
+    end
+    local loot = Ecs.get(Ecs.me(), G.C.Loot)
+    if type(loot) ~= "table" then
+        return
+    end
+    local all = #Flags.OpenChests == 0
+    for id, count in pairs(loot) do
+        if (tonumber(count) or 0) > 0 and (all or table.find(Flags.OpenChests, id)) then
+            G.net.open_chest.fire(id, math.min(count, 1000))
+            Game.lobbyStatus = "Opened " .. id .. " x" .. tostring(count)
+            return
+        end
+    end
+end
+
+function Lobby.stepClass()
+    if not Lobby.ready("class", 3.5) then
+        return
+    end
+    local me = Ecs.me()
+    local current = G.classUtil.get_class_id(Ecs.world, me)
+    if current and table.find(Flags.ClassTargets, current) then
+        Game.lobbyStatus = "Class: got " .. current
+        return
+    end
+    if #Flags.ClassTargets == 0 then
+        Game.lobbyStatus = "Class: pick target classes"
+        return
+    end
+    local dice = Ecs.get(me, G.C.Dice)
+    if not dice or (tonumber(dice.value) or 0) < 1 then
+        Game.lobbyStatus = "Class: out of rolls"
+        return
+    end
+    G.net.roll_class.fire(os.clock())
+    Game.lobbyStatus = "Class: rolled (had " .. tostring(current) .. ")"
+end
+
+function Game.stepPotion()
+    if not Ecs.ready() then
+        return
+    end
+    local me = Ecs.me()
+    if not me or Ecs.has(me, G.C.Dead) or hpPercent() > Flags.PotionHp then
+        return
+    end
+    local slots = Ecs.get(me, G.C.Potions)
+    local owned = Ecs.get(me, G.C.OwnedPotions)
+    if type(slots) ~= "table" or type(owned) ~= "table" then
+        return
+    end
+    local now = os.clock()
+    for i, slot in ipairs(slots) do
+        if Game.potionUses[i] ~= nil and Game.potionUses[i] ~= slot.uses then
+            Game.potionFired[i] = now
+        end
+        Game.potionUses[i] = slot.uses
+    end
+    for i, slot in ipairs(slots) do
+        local def = slot.id and G.potionConfig[slot.id]
+        if def and (tonumber(owned[slot.id]) or 0) > 0 and now - (Game.potionFired[i] or -math.huge) >= (tonumber(def.cooldown) or 1) + 0.5 then
+            for _, effect in ipairs(def.effects or {}) do
+                if effect.type == G.PotionEffectType.Heal then
+                    Game.potionFired[i] = now
+                    pcall(G.input.use_potion.Fire, G.input.use_potion, i)
+                    return
+                end
+            end
+        end
+    end
+end
+
+local HitboxEsp: any = { parts = {} }
+
+function HitboxEsp.clear()
+    if HitboxEsp.conn then
+        HitboxEsp.conn:Disconnect()
+        HitboxEsp.conn = nil
+    end
+    for entity, part in pairs(HitboxEsp.parts) do
+        pcall(part.Destroy, part)
+        HitboxEsp.parts[entity] = nil
+    end
+    if HitboxEsp.folder then
+        pcall(HitboxEsp.folder.Destroy, HitboxEsp.folder)
+        HitboxEsp.folder = nil
+    end
+end
+
+function HitboxEsp.render()
+    if unloaded or not Flags.HitboxEsp or not Ecs.ready() then
+        return
+    end
+    if not HitboxEsp.folder or not HitboxEsp.folder.Parent then
+        HitboxEsp.folder = Instance.new("Folder")
+        HitboxEsp.folder.Name = "OuroHitboxes"
+        HitboxEsp.folder.Parent = workspace
+    end
+    local Shape = G.HitboxShape
+    local seen = {}
+    local ok, err = pcall(function()
+        for entity, hitbox in Ecs.world:query(G.C.Hitbox):without(G.C.Dead) do
+            local inner = hitbox.inner
+            local cf = inner and G.inherit(Ecs.world, entity, G.C.Transform)
+            if cf then
+                if hitbox.offset then
+                    cf = cf * hitbox.offset
+                end
+                local size
+                if inner.shape == Shape.Sphere then
+                    size = Vector3.one * inner.radius * 2
+                elseif inner.shape == Shape.Cylinder then
+                    size = Vector3.new(inner.height, inner.radius * 2, inner.radius * 2)
+                    cf = cf * CFrame.Angles(0, 0, math.pi / 2)
+                elseif inner.shape == Shape.Block then
+                    size = inner.size
+                end
+                if size then
+                    seen[entity] = true
+                    local part = HitboxEsp.parts[entity]
+                    if not part or not part.Parent then
+                        part = Instance.new("Part")
+                        part.Name = "Hitbox"
+                        part.Anchored = true
+                        part.CanCollide = false
+                        part.CanQuery = false
+                        part.CanTouch = false
+                        part.CastShadow = false
+                        part.Material = Enum.Material.ForceField
+                        part.Shape = inner.shape == Shape.Sphere and Enum.PartType.Ball or inner.shape == Shape.Cylinder and Enum.PartType.Cylinder or Enum.PartType.Block
+                        part.Color = G.findAncestor(Ecs.world, entity, G.C.Enemy) and Color3.fromRGB(255, 50, 60) or Color3.fromRGB(70, 200, 255)
+                        part.Parent = HitboxEsp.folder
+                        HitboxEsp.parts[entity] = part
+                    end
+                    part.Size = size
+                    part.CFrame = cf
+                end
+            end
+        end
+    end)
+    if not ok and not HitboxEsp.warned then
+        HitboxEsp.warned = true
+        warn("[PixelBlade] hitbox esp: " .. tostring(err))
+    end
+    for entity, part in pairs(HitboxEsp.parts) do
+        if not seen[entity] then
+            pcall(part.Destroy, part)
+            HitboxEsp.parts[entity] = nil
+        end
+    end
+end
+
+function HitboxEsp.set(enabled)
+    if enabled then
+        HitboxEsp.conn = HitboxEsp.conn or track(RunService.RenderStepped:Connect(HitboxEsp.render))
+    else
+        HitboxEsp.clear()
+    end
+end
+
+local Esp = { items = {} }
+
+function Esp.remove(model)
+    local item = Esp.items[model]
+    if item then
+        pcall(item.highlight.Destroy, item.highlight)
+        pcall(item.billboard.Destroy, item.billboard)
+        Esp.items[model] = nil
+    end
+end
+
+function Esp.clear()
+    for model in pairs(Esp.items) do
+        Esp.remove(model)
+    end
+end
+
+function Esp.step()
+    if not Ecs.ready() then
+        return
+    end
+    local _, root = getRoot()
+    local seen = {}
+    for _, enemy in ipairs(aliveEnemies()) do
+        local model = enemy.model
+        seen[model] = true
+        local item = Esp.items[model]
+        if not item then
+            local highlight = Instance.new("Highlight")
+            highlight.FillColor = Color3.fromRGB(255, 70, 90)
+            highlight.FillTransparency = 0.6
+            highlight.OutlineColor = Color3.fromRGB(255, 255, 255)
+            highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+            highlight.Adornee = model
+            highlight.Parent = model
+            local billboard = Instance.new("BillboardGui")
+            billboard.Size = UDim2.fromOffset(160, 36)
+            billboard.StudsOffset = Vector3.new(0, 3.5, 0)
+            billboard.AlwaysOnTop = true
+            billboard.Adornee = enemy.part
+            local label = Instance.new("TextLabel")
+            label.BackgroundTransparency = 1
+            label.Size = UDim2.fromScale(1, 1)
+            label.Font = Enum.Font.GothamBold
+            label.TextSize = 13
+            label.TextColor3 = Color3.new(1, 1, 1)
+            label.TextStrokeTransparency = 0.4
+            label.Parent = billboard
+            billboard.Parent = model
+            item = { highlight = highlight, billboard = billboard, label = label }
+            Esp.items[model] = item
+        end
+        local info = Ecs.get(enemy.entity, G.C.Enemy)
+        local health = Ecs.get(enemy.entity, G.C.Health)
+        local name = info and info.id and tostring(info.id):gsub("(%l)(%u)", "%1 %2") or model.Name
+        local text = name
+        if health then
+            text ..= string.format("\n%d / %d HP", math.floor(health.value), math.floor(health.max))
+        end
+        if root then
+            text ..= string.format("  [%dm]", math.floor((enemy.part.Position - root.Position).Magnitude))
+        end
+        item.label.Text = text
+    end
+    for model in pairs(Esp.items) do
+        if not seen[model] then
+            Esp.remove(model)
+        end
+    end
+end
+
+local function applyWalkSpeed()
+    local humanoid = select(1, getRoot())
+    if not humanoid then
+        return
+    end
+    if Flags.WalkSpeedEnabled then
+        if Shell.walkSpeedRestore[humanoid] == nil then
+            Shell.walkSpeedRestore[humanoid] = humanoid.WalkSpeed
+        end
+        humanoid.WalkSpeed = Flags.WalkSpeed
+    elseif Shell.walkSpeedRestore[humanoid] ~= nil then
+        humanoid.WalkSpeed = Shell.walkSpeedRestore[humanoid]
+        Shell.walkSpeedRestore[humanoid] = nil
+    end
+end
+
+function Shell.setWalkSpeedEnabled(value)
+    Flags.WalkSpeedEnabled = value == true
+    applyWalkSpeed()
+end
+
+function Shell.setWalkSpeed(value)
+    Flags.WalkSpeed = tonumber(value) or Flags.WalkSpeed
+    if Flags.WalkSpeedEnabled then
+        applyWalkSpeed()
+    end
+end
+
+function Shell.setInfJump(value)
+    Flags.InfJump = value == true
+    if Shell.infJumpConn then
+        Shell.infJumpConn:Disconnect()
+        Shell.infJumpConn = nil
+    end
+    if not Flags.InfJump then
+        return
+    end
+    Shell.infJumpConn = track(UserInputService.JumpRequest:Connect(function()
+        if unloaded or not Flags.InfJump then
+            return
+        end
+        local humanoid = select(1, getRoot())
+        if humanoid then
+            humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+        end
+    end))
+end
+
+function Shell.setNoClip(value)
+    Flags.NoClip = value == true
+    if Shell.noclipConn then
+        Shell.noclipConn:Disconnect()
+        Shell.noclipConn = nil
+    end
+    if not Flags.NoClip then
+        for part, canCollide in pairs(Shell.noclipRestore) do
+            if part.Parent then
+                part.CanCollide = canCollide
+            end
+        end
+        table.clear(Shell.noclipRestore)
+        return
+    end
+    Shell.noclipConn = track(RunService.Stepped:Connect(function()
+        if unloaded or not Flags.NoClip then
+            return
+        end
+        local character = LocalPlayer.Character
+        if not character then
+            return
+        end
+        for _, part in ipairs(character:GetDescendants()) do
+            if part:IsA("BasePart") then
+                if Shell.noclipRestore[part] == nil then
+                    Shell.noclipRestore[part] = part.CanCollide
+                end
+                part.CanCollide = false
+            end
+        end
+    end))
+end
+
+local function snapshotPrompt(prompt)
+    if Shell.promptRestore[prompt] == nil then
+        Shell.promptRestore[prompt] = {
+            HoldDuration = prompt.HoldDuration,
+            MaxActivationDistance = prompt.MaxActivationDistance,
+            RequiresLineOfSight = prompt.RequiresLineOfSight,
+        }
+    end
+    prompt.HoldDuration = 0
+    prompt.MaxActivationDistance = 50
+    prompt.RequiresLineOfSight = false
+end
+
+function Shell.setInstantProximityPrompt(value)
+    Flags.InstantProximityPrompt = value == true
+    if Shell.promptConn then
+        Shell.promptConn:Disconnect()
+        Shell.promptConn = nil
+    end
+    if not Flags.InstantProximityPrompt then
+        for prompt, prev in pairs(Shell.promptRestore) do
+            if prompt.Parent then
+                prompt.HoldDuration = prev.HoldDuration
+                prompt.MaxActivationDistance = prev.MaxActivationDistance
+                prompt.RequiresLineOfSight = prev.RequiresLineOfSight
+            end
+        end
+        table.clear(Shell.promptRestore)
+        return
+    end
+    for _, inst in ipairs(workspace:GetDescendants()) do
+        if inst:IsA("ProximityPrompt") then
+            snapshotPrompt(inst)
+        end
+    end
+    Shell.promptConn = track(workspace.DescendantAdded:Connect(function(inst)
+        if unloaded or not Flags.InstantProximityPrompt then
+            return
+        end
+        if inst:IsA("ProximityPrompt") then
+            snapshotPrompt(inst)
+        end
+    end))
+end
+
+local function stopFly()
+    local flyState = Shell.flyState
+    if flyState and flyState.conn then
+        flyState.conn:Disconnect()
+    end
+    local humanoid = flyState and flyState.humanoid
+    if humanoid and humanoid.Parent and flyState.platformStand ~= nil then
+        humanoid.PlatformStand = flyState.platformStand
+    end
+    Shell.flyState = nil
+end
+
+function Shell.setFly(value)
+    Flags.Fly = value == true
+    stopFly()
+    if not Flags.Fly then
+        return
+    end
+    local humanoid, root = getRoot()
+    if not (humanoid and root) then
+        return
+    end
+    local flyState = {
+        humanoid = humanoid,
+        platformStand = humanoid.PlatformStand,
+    }
+    Shell.flyState = flyState
+    humanoid.PlatformStand = true
+    flyState.conn = track(RunService.RenderStepped:Connect(function()
+        if unloaded or not Flags.Fly or UserInputService:GetFocusedTextBox() then
+            return
+        end
+        local hum, hrp = getRoot()
+        local cam = workspace.CurrentCamera
+        if not (hum and hrp and cam) then
+            return
+        end
+        local move = Vector3.zero
+        if UserInputService:IsKeyDown(Enum.KeyCode.W) then
+            move += cam.CFrame.LookVector
+        end
+        if UserInputService:IsKeyDown(Enum.KeyCode.S) then
+            move -= cam.CFrame.LookVector
+        end
+        if UserInputService:IsKeyDown(Enum.KeyCode.A) then
+            move -= cam.CFrame.RightVector
+        end
+        if UserInputService:IsKeyDown(Enum.KeyCode.D) then
+            move += cam.CFrame.RightVector
+        end
+        if UserInputService:IsKeyDown(Enum.KeyCode.Space) then
+            move += Vector3.yAxis
+        end
+        if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then
+            move -= Vector3.yAxis
+        end
+        hrp.AssemblyLinearVelocity = move.Magnitude > 0 and move.Unit * Flags.FlySpeed or Vector3.zero
+        hum.PlatformStand = true
+    end))
+end
+
+function Shell.setFlySpeed(value)
+    Flags.FlySpeed = tonumber(value) or Flags.FlySpeed
+end
+
+function Shell.setNoGameplayPaused(value)
+    Flags.AntiGameplayPause = value == true
+    for _, key in ipairs({ "gameplayPauseConn", "pauseGuiConn" }) do
+        if Shell[key] then
+            Shell[key]:Disconnect()
+            Shell[key] = nil
+        end
+    end
+    pcall(function()
+        GuiService:SetGameplayPausedNotificationEnabled(not Flags.AntiGameplayPause)
+    end)
+    if not Flags.AntiGameplayPause then
+        return
+    end
+    local function clearPaused()
+        if LocalPlayer.GameplayPaused then
+            if type(sethiddenproperty) == "function" then
+                pcall(sethiddenproperty, LocalPlayer, "GameplayPaused", false)
+            else
+                pcall(function()
+                    LocalPlayer.GameplayPaused = false
+                end)
+            end
+        end
+    end
+    pcall(function()
+        local overlay = CoreGui:FindFirstChild("RobloxNetworkPauseNotification")
+        if overlay then
+            overlay:Destroy()
+        end
+        Shell.pauseGuiConn = track(CoreGui.ChildAdded:Connect(function(child)
+            if not unloaded and Flags.AntiGameplayPause and child.Name == "RobloxNetworkPauseNotification" then
+                task.defer(function()
+                    pcall(child.Destroy, child)
+                end)
+            end
+        end))
+    end)
+    clearPaused()
+    Shell.gameplayPauseConn = track(LocalPlayer:GetPropertyChangedSignal("GameplayPaused"):Connect(function()
+        if not unloaded and Flags.AntiGameplayPause then
+            clearPaused()
+        end
+    end))
+end
+
+function Shell.setAutoReconnect(value)
+    Flags.AutoReconnect = value == true
+    if Shell.reconnectConn then
+        Shell.reconnectConn:Disconnect()
+        Shell.reconnectConn = nil
+    end
+    if Shell.reconnectFailedConn then
+        Shell.reconnectFailedConn:Disconnect()
+        Shell.reconnectFailedConn = nil
+    end
+    if not Flags.AutoReconnect then
+        Shell.reconnectToken += 1
+        return
+    end
+    Shell.reconnectConn = track(GuiService.ErrorMessageChanged:Connect(function()
+        if unloaded or not Flags.AutoReconnect then
+            return
+        end
+        local token = Shell.reconnectToken + 1
+        Shell.reconnectToken = token
+        task.delay(1.5, function()
+            if unloaded or not Flags.AutoReconnect or Shell.reconnectToken ~= token then
+                return
+            end
+            pcall(function()
+                TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+            end)
+        end)
+    end))
+    Shell.reconnectFailedConn = track(TeleportService.TeleportInitFailed:Connect(function(player)
+        if player ~= LocalPlayer or unloaded or not Flags.AutoReconnect then
+            return
+        end
+        task.delay(2, function()
+            if unloaded or not Flags.AutoReconnect then
+                return
+            end
+            pcall(function()
+                TeleportService:Teleport(game.PlaceId, LocalPlayer)
+            end)
+        end)
+    end))
+end
+
+function Shell.setDisable3D(value)
+    Flags.Disable3DRendering = value == true
+    if Flags.Disable3DRendering then
+        pcall(function()
+            RunService:Set3dRenderingEnabled(false)
+        end)
+        if not Shell.renderBacking then
+            local gui = Instance.new("ScreenGui")
+            gui.Name = "OuroborosRenderBacking"
+            gui.IgnoreGuiInset = true
+            gui.DisplayOrder = -100
+            gui.ResetOnSpawn = false
+            local frame = Instance.new("Frame")
+            frame.BackgroundColor3 = Color3.new(0, 0, 0)
+            frame.Size = UDim2.fromScale(1, 1)
+            frame.BorderSizePixel = 0
+            frame.Parent = gui
+            gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+            Shell.renderBacking = gui
+        end
+    else
+        pcall(function()
+            RunService:Set3dRenderingEnabled(true)
+        end)
+        if Shell.renderBacking then
+            Shell.renderBacking:Destroy()
+            Shell.renderBacking = nil
+        end
+    end
+end
+
+local function captureFps(inst)
+    if Shell.fpsRestore[inst] ~= nil then
+        return
+    end
+    local snap = {}
+    if inst:IsA("ParticleEmitter") or inst:IsA("Trail") or inst:IsA("Beam") or inst:IsA("Fire") or inst:IsA("Smoke") or inst:IsA("Sparkles") then
+        snap.Enabled = inst.Enabled
+        inst.Enabled = false
+    elseif inst:IsA("Explosion") then
+        snap.Visible = inst.Visible
+        inst.Visible = false
+    end
+    Shell.fpsRestore[inst] = snap
+end
+
+function Shell.setFpsBoost(value)
+    Flags.FpsBoost = value == true
+    if Shell.fpsConn then
+        Shell.fpsConn:Disconnect()
+        Shell.fpsConn = nil
+    end
+    local restore = Shell.fpsRestore
+    if not Flags.FpsBoost then
+        for inst, snap in pairs(restore) do
+            if typeof(inst) == "Instance" and inst.Parent then
+                for key, prev in pairs(snap) do
+                    pcall(function()
+                        inst[key] = prev
+                    end)
+                end
+            end
+        end
+        local light = restore.Lighting
+        if light then
+            Lighting.GlobalShadows = light.GlobalShadows
+            Lighting.FogEnd = light.FogEnd
+        end
+        table.clear(restore)
+        return
+    end
+    if restore.Lighting == nil then
+        restore.Lighting = {
+            GlobalShadows = Lighting.GlobalShadows,
+            FogEnd = Lighting.FogEnd,
+        }
+        Lighting.GlobalShadows = false
+        Lighting.FogEnd = 1e6
+    end
+    for _, inst in ipairs(workspace:GetDescendants()) do
+        captureFps(inst)
+    end
+    Shell.fpsConn = track(workspace.DescendantAdded:Connect(function(inst)
+        if unloaded or not Flags.FpsBoost then
+            return
+        end
+        captureFps(inst)
+    end))
+end
+
+local function pulseAntiAfk()
+    if unloaded or not Flags.AntiAfk then
+        return
+    end
+    local cam = workspace.CurrentCamera
+    if not cam then
+        return
+    end
+    pcall(function()
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.new(), cam.CFrame)
+    end)
+end
+
+function Shell.setAntiAfk(value)
+    Flags.AntiAfk = value == true
+    if Shell.antiAfkConn then
+        Shell.antiAfkConn:Disconnect()
+        Shell.antiAfkConn = nil
+    end
+    if not Flags.AntiAfk then
+        stopWorker("AntiAfk")
+        return
+    end
+    Shell.antiAfkLast = os.clock()
+    Shell.antiAfkConn = track(LocalPlayer.Idled:Connect(pulseAntiAfk))
+    startWorker("AntiAfk", 1, function()
+        if os.clock() - Shell.antiAfkLast >= 60 then
+            Shell.antiAfkLast = os.clock()
+            pulseAntiAfk()
+        end
+    end)
+end
+
+local function bindCharacter(character)
+    Game.retreating = false
+    Game.retreatPoint = nil
+    Game.holding = false
+    task.defer(function()
+        if unloaded then
+            return
+        end
+        applyWalkSpeed()
+        if Flags.Fly then
+            Shell.setFly(true)
+        end
+    end)
+    local humanoid = character:FindFirstChildOfClass("Humanoid") or character:WaitForChild("Humanoid", 5)
+    if humanoid then
+        track(humanoid:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+            if Flags.WalkSpeedEnabled and not unloaded and humanoid.WalkSpeed ~= Flags.WalkSpeed then
+                humanoid.WalkSpeed = Flags.WalkSpeed
+            end
+        end))
+    end
+end
+
+local Fish: any = { at = 0, rodAt = 0, findAt = 0 }
+
+function Fish.mods()
+    if not Fish.intents then
+        Fish.intents = require(Src.client.fishing_intents)
+        Fish.config = require(Src.configs.fishing_config)
+        Fish.stash = require(Src.stash_capacity_util)
+    end
+    return Fish.intents
+end
+
+function Fish.findState()
+    if Fish.state then
+        return Fish.state
+    end
+    local list = Fish.candidates
+    if list then
+        for _, v in ipairs(list) do
+            if v.phase ~= "idle" then
+                Fish.state = v
+                Fish.candidates = nil
+                return v
+            end
+        end
+    end
+    if not list or os.clock() >= Fish.findAt then
+        Fish.findAt = os.clock() + 5
+        list = {}
+        for _, v in ipairs(getgc(true)) do
+            if type(v) == "table" and rawget(v, "bubble_index") ~= nil and rawget(v, "toast_signature") ~= nil and rawget(v, "fill_direction") ~= nil then
+                if v.phase ~= "idle" then
+                    Fish.state = v
+                    Fish.candidates = nil
+                    return v
+                end
+                table.insert(list, v)
+            end
+        end
+        Fish.candidates = list
+    end
+    if #list == 1 then
+        Fish.state = list[1]
+        Fish.candidates = nil
+        return list[1]
+    end
+    return list[1] and { phase = "idle", auto = false } or nil
+end
+
+function Fish.step()
+    if not Ecs.ready() then
+        return
+    end
+    local me = Ecs.me()
+    if not me or Ecs.has(me, G.C.Dead) then
+        Game.fishStatus = "Waiting for character"
+        return
+    end
+    local intents = Fish.mods()
+    local now = os.clock()
+    if not Ecs.has(me, G.C.RodHeld) then
+        if Flags.FishAutoRod and now - Fish.rodAt > 3 then
+            Fish.rodAt = now
+            G.net.toggle_rod.fire(now)
+        end
+        Game.fishStatus = "Hold your rod"
+        return
+    end
+    local s = Fish.findState()
+    if not s then
+        Game.fishStatus = "Fishing state not found"
+        return
+    end
+    local data = Ecs.get(me, G.C.Fishing)
+    if s.phase == "idle" and data and Fish.stash.is_full(data) then
+        if s.auto then
+            intents.auto_off:Fire(now)
+        end
+        Game.fishStatus = "Stash full"
+        return
+    end
+    if Flags.FishMode == "Game Auto" then
+        if not s.auto and now - Fish.at >= 1 then
+            Fish.at = now
+            intents.auto_on:Fire(now)
+        end
+        Game.fishStatus = "Game auto: " .. tostring(s.phase)
+        return
+    end
+    if s.auto then
+        intents.auto_off:Fire(now)
+    end
+    local phase = s.phase
+    Game.fishStatus = tostring(phase)
+    if phase == "idle" then
+        if now < (s.error_until or 0) then
+            Game.fishStatus = "Cast denied (stash full or bad spot)"
+            return
+        end
+        if now - Fish.at >= Flags.FishCastDelay then
+            Fish.at = now
+            Fish.casts = (Fish.casts or 0) + 1
+            if Fish.casts > 3 then
+                Fish.casts = 0
+                Fish.state = nil
+            end
+            Fish.charging = true
+            G.input.attack:Fire(now)
+        end
+    elseif phase == "charging" then
+        Fish.casts = 0
+        local rod = data and Fish.config.rods[data.equipped_rod]
+        local range = rod and rod.range or 25
+        if Fish.charging and (s.charge_distance or 0) >= range * Flags.FishCastPower / 100 then
+            Fish.charging = false
+            G.input.attack_up:Fire(now)
+        end
+        if s.valid == false then
+            Game.fishStatus = "Face water to cast"
+        end
+    elseif phase == "bubbles" then
+        if not s.holding then
+            if (s.progress or 0) <= 0 and now - Fish.at >= 0.15 then
+                Fish.at = now
+                intents.bubble_down:Fire(now)
+            end
+        elseif s.fill_direction == 1 and s.direction_changes == 0 and s.progress >= 0.93 then
+            intents.bubble_up:Fire(now)
+        end
+    elseif phase == "reel" then
+        if now - Fish.at >= Flags.FishReelDelay then
+            Fish.at = now
+            intents.reel_press:Fire(now)
+        end
+    else
+        Fish.charging = false
+    end
+end
+
+function Fish.set(enabled)
+    if Fish.conn then
+        Fish.conn:Disconnect()
+        Fish.conn = nil
+    end
+    if enabled then
+        Fish.conn = track(RunService.RenderStepped:Connect(function()
+            local ok, err = pcall(Fish.step)
+            if not ok then
+                warn("[PixelBlade] AutoFish: " .. tostring(err))
+            end
+        end))
+    else
+        local s = Fish.state
+        if s and s.auto and Fish.intents then
+            pcall(function()
+                Fish.intents.auto_off:Fire(os.clock())
+            end)
+        end
+        if Fish.charging then
+            Fish.charging = false
+            pcall(function()
+                G.input.attack_up:Fire(os.clock())
+            end)
+        end
+        Game.fishStatus = "Idle"
+    end
+end
+
+local COMBAT_KEYS = { "AutoFarm", "AutoCrates", "AutoRetreat", "AutoTreeMove" }
+local WORKER_STEPS = {
+    AutoCards = { 0.1, Game.stepCards },
+    AutoCharm = { 0.5, Game.stepCharm },
+    MobEsp = { 0.25, Esp.step },
+    AutoPotion = { 0.25, Game.stepPotion },
+    AutoJoin = { 1, Lobby.stepJoin },
+    AutoStart = { 0.5, Lobby.stepStart },
+    AutoRaid = { 1, Lobby.stepRaid },
+    AutoQuests = { 1, Lobby.stepQuests },
+    AutoShop = { 1, Lobby.stepShop },
+    AutoPotions = { 1, Lobby.stepPotions },
+    AutoEquipBest = { 1, Lobby.stepEquip },
+    AutoUpgrade = { 0.5, Lobby.stepUpgrade },
+    AutoChests = { 1, Lobby.stepChests },
+    AutoClass = { 0.5, Lobby.stepClass },
+}
+local GROUPED_WORKERS = {
+    Vote = { { "AutoRetry", "AutoLeave" }, 0.5, Game.stepRetry },
+    Misc = { { "AutoGiveUp", "AutoSkipCutscene" }, 0.5, Game.stepMisc },
+}
+
+local Setters = {}
+
+local function anyFlag(keys)
+    for _, key in ipairs(keys) do
+        if Flags[key] then
+            return true
+        end
+    end
+    return false
+end
+
+local function stopCombat()
+    stopWorker("Combat")
+    if Game.heartbeat then
+        Game.heartbeat:Disconnect()
+        Game.heartbeat = nil
+    end
+    Game.goal = nil
+    Game.gatherPos = nil
+    Game.crate = nil
+    Game.retreating = false
+    Game.retreatPoint = nil
+    setHold(false)
+    Game.status = "Idle"
+end
+
+function Setters.feature(key, enabled)
+    Flags[key] = enabled == true
+    local spec = WORKER_STEPS[key]
+    if spec then
+        setWorker(key, Flags[key], spec[1], spec[2])
+    end
+    if key == "MobEsp" and not Flags[key] then
+        Esp.clear()
+    end
+    if key == "AutoFish" then
+        Fish.set(Flags[key])
+    end
+    if key == "HitboxEsp" then
+        HitboxEsp.set(Flags[key])
+    end
+    for name, group in pairs(GROUPED_WORKERS) do
+        if table.find(group[1], key) then
+            setWorker(name, anyFlag(group[1]), group[2], group[3])
+        end
+    end
+    if table.find(COMBAT_KEYS, key) then
+        if anyFlag(COMBAT_KEYS) then
+            if not workers.Combat then
+                startWorker("Combat", 0.1, Game.stepCombat)
+            end
+            if not Game.heartbeat then
+                Game.heartbeat = track(RunService.Heartbeat:Connect(onHeartbeat))
+            end
+        else
+            stopCombat()
+        end
+    end
+end
+
+local FEATURE_KEYS = { "AutoFarm", "AutoCrates", "AutoRetreat", "AutoTreeMove", "AutoCards", "AutoCharm", "AutoRetry", "AutoLeave", "AutoGiveUp", "AutoSkipCutscene", "MobEsp", "HitboxEsp", "AutoPotion", "AutoJoin", "AutoStart", "AutoRaid", "AutoQuests", "AutoShop", "AutoPotions", "AutoEquipBest", "AutoUpgrade", "AutoChests", "AutoClass", "AutoFish" }
+
+-- Embedded FarmAssist: controlled exclusively by the Player tab toggle.
+local FarmAssist = { active = false, stop = nil }
+function FarmAssist.start()
+    if FarmAssist.active or unloaded then return end
+    FarmAssist.active = true
+    local LogService = game:GetService("LogService")
+    local lp = LocalPlayer
+    -- Fall Freeze (original v2 values, unchanged)
+    local FALL_SPEED   = -40
+    local MOVE_RELEASE = 6
+    local SETTLE_AFTER = 2.5
+    local RETRY_AFTER  = 5
+    local RAY_UP       = 80
+    local RAY_DOWN     = 400
+    local FREEZE_LOG_LINES = 5
+    -- Fallback: if settleOnFloor gets no hit for this many tries in a row,
+    -- teleport to the last mob we saw (exact position, no offset).
+    local FALLBACK_AFTER_TRIES = 5
+    local FALLBACK_MAX_AGE     = 60
+    
+    -- Activity Log
+    local TELEPORT_DIST = 12
+    local STUCK_SECONDS = 10
+    local STUCK_MOVE    = 1
+    local LOG_BUFFER_MAX = 1000
+    local MOB_FILE       = "mob_list.txt"
+    local IGNORE = {
+        "render_class_body_particles",
+        "Stack Begin",
+        "Stack End",
+        "will be suppressed",
+    }
+    
+    -- Auto-recover
+    local AUTO_RECOVER            = true
+    local STUCK_TELEPORT_RANGE    = 50
+    local STUCK_TELEPORT_MAXDIST  = 2000
+    local STUCK_TELEPORT_COOLDOWN = 15
+    local STARTUP_GRACE           = 30
+    local RECOVER_LOG_SILENCE     = 6
+    local GOODPOS_MIN_DIST        = 100
+    local GOODPOS_MAX_AGE         = 120
+    local PROP_BLACKLIST = {
+        "morvik_intro_human",
+    }
+    
+    -- File I/O capability check
+    local HAS_READ   = (type(readfile) == "function") and (type(isfile) == "function")
+    local HAS_WRITE  = (type(writefile) == "function")
+    local HAS_APPEND = (type(appendfile) == "function")
+    
+    -- STATE
+    local killed = false
+    
+    local freezeEnabled = true
+    local anchored, lastPos, frozenAt = false, nil, 0
+    local catches, settles = 0, 0
+    local freezeLines = {}
+    local failedSettleTries = 0
+    
+    local logRunning     = true
+    local logBuffer      = {}
+    local logT0          = os.clock()
+    local logLineCount   = 0
+    local logTotalLines  = 0
+    local logWrittenLines = 0
+    
+    local knownMobs      = {}
+    local knownMobsCount = 0
+    
+    local lastAutoRecover  = 0
+    local autoRecovers     = 0
+    local lastGoodPos      = nil
+    local lastGoodTime     = 0
+    local lastActivityTime = os.clock()
+    
+    -- Last mob we were near, used as a fallback if settleOnFloor gets no hit.
+    local lastMobPos  = nil
+    local lastMobTime = 0
+    
+    local wLastPos, wLastMoveCheckPos, wLastMoveTime = nil, nil, os.clock()
+    local wLastStuckLog = 0
+    
+    local conns = {}
+    
+    if not HAS_WRITE then
+        -- File output unavailable; keep mob names in memory.
+    end
+    
+    -- Load existing mob list
+    if HAS_READ and HAS_WRITE and isfile(MOB_FILE) then
+        local ok, data = pcall(readfile, MOB_FILE)
+        if ok and type(data) == "string" then
+            for line in data:gmatch("[^\r\n]+") do
+                if line ~= "" then
+                    knownMobs[line] = true
+                    knownMobsCount = knownMobsCount + 1
+                end
+            end
+            -- Mob list loaded silently.
+        end
+    end
+    
+    local function isBlacklistedName(name)
+        for _, n in ipairs(PROP_BLACKLIST) do
+            if name == n then return true end
+        end
+        return false
+    end
+    
+    local function saveMobName(name)
+        if not name or name == "" or name == "none" then return end
+        if isBlacklistedName(name) then return end
+        if knownMobs[name] then return end
+    
+        knownMobs[name] = true
+        knownMobsCount = knownMobsCount + 1
+    
+        if not HAS_WRITE then
+            -- Retain the mob name in knownMobs without console output.
+            return
+        end
+    
+        local wroteOk = false
+    
+        if HAS_APPEND and HAS_READ and isfile(MOB_FILE) then
+            wroteOk = pcall(appendfile, MOB_FILE, name .. "\n")
+        end
+    
+        if not wroteOk then
+            wroteOk = pcall(function()
+                local names = {}
+                for m in pairs(knownMobs) do names[#names + 1] = m end
+                table.sort(names)
+                writefile(MOB_FILE, table.concat(names, "\n") .. "\n")
+            end)
+        end
+    
+        -- Mob name is retained internally, and persisted when file I/O succeeds.
+    end
+    
+    local function extractMobName(line)
+        local name = line:match("nearest enemy:%s*([%w_%-]+)")
+        if not name then
+            name = line:match("nearest enemy%s+([%w_%-]+)")
+        end
+        return name
+    end
+    
+    local function getRoot()
+        local c = lp.Character
+        return c and c:FindFirstChild("HumanoidRootPart"), c and c:FindFirstChildOfClass("Humanoid")
+    end
+    
+    local function fmtV(v)
+        return string.format("(%.1f, %.1f, %.1f)", v.X, v.Y, v.Z)
+    end
+    
+    local function pushFreezeLog(msg)
+        freezeLines[#freezeLines + 1] = string.format("%s %s", os.date("%H:%M:%S"), msg)
+        while #freezeLines > FREEZE_LOG_LINES do table.remove(freezeLines, 1) end
+        -- Keep fall events in the internal ring buffer, not executor output.
+    end
+    
+    local function isBlacklisted(model)
+        if not model then return true end
+        for _, n in ipairs(PROP_BLACKLIST) do
+            if model.Name == n then return true end
+        end
+        return false
+    end
+    
+    -- FALL FREEZE LOGIC (original raycast, fallback added)
+    local function release(r)
+        if r then r.Anchored = false end
+        anchored = false
+        failedSettleTries = 0
+    end
+    
+    local function settleOnFloor(r)
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = { lp.Character }
+        local origin = r.Position + Vector3.new(0, RAY_UP, 0)
+        local hit = workspace:Raycast(origin, Vector3.new(0, -(RAY_UP + RAY_DOWN), 0), params)
+        if hit then
+            r.CFrame = CFrame.new(hit.Position + Vector3.new(0, 3.2, 0)) * (r.CFrame - r.CFrame.Position)
+            r.AssemblyLinearVelocity = Vector3.zero
+            settles = settles + 1
+            failedSettleTries = 0
+            pushFreezeLog(string.format("floor: %s y=%.1f", hit.Instance.Name, hit.Position.Y))
+            return true
+        end
+    
+        failedSettleTries = failedSettleTries + 1
+    
+        if failedSettleTries >= FALLBACK_AFTER_TRIES then
+            if lastMobPos and (os.clock() - lastMobTime) < FALLBACK_MAX_AGE then
+                r.CFrame = CFrame.new(lastMobPos)
+                r.AssemblyLinearVelocity = Vector3.zero
+                settles = settles + 1
+                failedSettleTries = 0
+                pushFreezeLog(string.format(
+                    "no floor after %d tries -> teleported to last mob %s (%.0fs ago)",
+                    FALLBACK_AFTER_TRIES, fmtV(lastMobPos), os.clock() - lastMobTime))
+                return true
+            else
+                pushFreezeLog(string.format(
+                    "no floor after %d tries, but no recent mob to fall back to",
+                    failedSettleTries))
+                return false
+            end
+        end
+    
+        pushFreezeLog(string.format("no floor under you, staying frozen (try %d/%d)",
+            failedSettleTries, FALLBACK_AFTER_TRIES))
+        return false
+    end
+    
+    conns[#conns + 1] = RunService.Heartbeat:Connect(function()
+        if killed or not freezeEnabled then return end
+        local r = getRoot()
+        if not r then
+            anchored, lastPos = false, nil
+            return
+        end
+    
+        local pos = r.Position
+        if anchored then
+            if lastPos and (pos - lastPos).Magnitude > MOVE_RELEASE then
+                release(r)
+                pushFreezeLog("released (farm moved you)")
+            elseif os.clock() - frozenAt >= SETTLE_AFTER then
+                if settleOnFloor(r) then
+                    release(r)
+                else
+                    frozenAt = os.clock() + RETRY_AFTER
+                end
+            end
+        elseif r.AssemblyLinearVelocity.Y < FALL_SPEED then
+            r.AssemblyLinearVelocity = Vector3.zero
+            r.Anchored = true
+            anchored = true
+            frozenAt = os.clock()
+            failedSettleTries = 0
+            catches = catches + 1
+            pushFreezeLog(string.format("caught fall #%d at y=%.1f", catches, pos.Y))
+        end
+        lastPos = r.Position
+    end)
+    
+    conns[#conns + 1] = lp.CharacterAdded:Connect(function()
+        anchored, lastPos = false, nil
+        failedSettleTries = 0
+        pushFreezeLog("character respawned")
+    end)
+    
+    -- ACTIVITY LOG LOGIC
+    local NON_ACTIVITY_TAGS = { ["STUCK?"] = true, ["RECOVER"] = true, ["INFO"] = true }
+    
+    local function logLine(tag, msg)
+        local line = string.format("[%7.2f] [%s] %s", os.clock() - logT0, tag, msg)
+        -- Store activity in the internal buffer/file without printing.
+    
+        logTotalLines = logTotalLines + 1
+        logBuffer[#logBuffer + 1] = line
+        while #logBuffer > LOG_BUFFER_MAX do
+            table.remove(logBuffer, 1)
+        end
+    
+        logLineCount = logLineCount + 1
+        if not NON_ACTIVITY_TAGS[tag] then
+            lastActivityTime = os.clock()
+        end
+    
+        local mobName = extractMobName(line)
+        if mobName then saveMobName(mobName) end
+    end
+    
+    local function flushLog()
+        if not HAS_WRITE then return end
+        pcall(function()
+            if HAS_APPEND and isfile("activity_log.txt") and logTotalLines > logWrittenLines then
+                local firstInBuffer = logTotalLines - #logBuffer + 1
+                local fromIdx = (logWrittenLines + 1) - firstInBuffer + 1
+                if fromIdx < 1 then fromIdx = 1 end
+                if fromIdx <= #logBuffer then
+                    local chunk = {}
+                    for i = fromIdx, #logBuffer do
+                        chunk[#chunk + 1] = logBuffer[i]
+                    end
+                    appendfile("activity_log.txt", table.concat(chunk, "\n") .. "\n")
+                end
+                logWrittenLines = logTotalLines
+            else
+                writefile("activity_log.txt", table.concat(logBuffer, "\n"))
+            end
+        end)
+    end
+    
+    local enemyCache, lastScan = {}, 0
+    local function scanEnemies()
+        if os.clock() - lastScan < 1.5 then return enemyCache end
+        lastScan = os.clock()
+        local list = {}
+        for _, d in ipairs(workspace:GetDescendants()) do
+            if d:IsA("Humanoid") and d.Health > 0 then
+                local model = d.Parent
+                if model and model ~= lp.Character
+                    and not Players:GetPlayerFromCharacter(model) then
+                    local root = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+                    if root then list[#list + 1] = { model = model, hum = d, root = root } end
+                end
+            end
+        end
+        enemyCache = list
+        return list
+    end
+    
+    local function nearestEnemy(pos)
+        local best, bestD
+        for _, e in ipairs(scanEnemies()) do
+            if e.root and e.root.Parent then
+                local d = (e.root.Position - pos).Magnitude
+                if not bestD or d < bestD then best, bestD = e, d end
+            end
+        end
+        return best, bestD
+    end
+    
+    local function nearestValidMob(pos)
+        local best, bestD
+        for _, e in ipairs(scanEnemies()) do
+            if e.root and e.root.Parent and not isBlacklisted(e.model) then
+                local d = (e.root.Position - pos).Magnitude
+                if not bestD or d < bestD then best, bestD = e, d end
+            end
+        end
+        return best, bestD
+    end
+    
+    conns[#conns + 1] = LogService.MessageOut:Connect(function(msg, mtype)
+        if killed or not logRunning then return end
+        if mtype == Enum.MessageType.MessageOutput
+            or mtype == Enum.MessageType.MessageInfo then return end
+        for _, s in ipairs(IGNORE) do
+            if msg:find(s, 1, true) then return end
+        end
+        logLine(mtype == Enum.MessageType.MessageError and "ERROR" or "WARN", msg)
+    end)
+    
+    conns[#conns + 1] = RunService.Heartbeat:Connect(function()
+        if killed or not logRunning then return end
+        local root, hum = getRoot()
+        if not root then
+            wLastPos = nil
+            return
+        end
+    
+        local pos = root.Position
+
+        -- AutoFarm and Farm Assist share target state. When AutoFarm has no
+        -- enemies for several seconds, return to its last confirmed combat
+        -- position instead of assuming that standing still means stuck.
+        local now = os.clock()
+        local noTargetFor = Game.noEnemySince and (now - Game.noEnemySince) or 0
+        if Flags.AutoFarm and not Game.goal and not Game.crate
+            and not Game.gatherPos and not Game.retreating
+            and not root.Anchored and hum and hum.Health > 0
+            and noTargetFor >= 8
+            and now - lastAutoRecover >= STUCK_TELEPORT_COOLDOWN
+            and Game.lastFarmCFrame and Game.lastFarmSeenAt
+            and now - Game.lastFarmSeenAt <= 180 then
+            local saved = Game.lastFarmCFrame
+            if (pos - saved.Position).Magnitude >= 8 then
+                root.CFrame = saved
+                root.AssemblyLinearVelocity = Vector3.zero
+                root.AssemblyAngularVelocity = Vector3.zero
+                lastAutoRecover = now
+                autoRecovers = autoRecovers + 1
+                wLastPos = saved.Position
+                wLastMoveCheckPos = saved.Position
+                wLastMoveTime = now
+                logLine("RECOVER", string.format(
+                    "AutoFarm found no targets for %.0fs -> returned to saved farming position %s | attempt #%d",
+                    noTargetFor, fmtV(saved.Position), autoRecovers))
+                -- Allow combat to rescan before another recovery attempt.
+                Game.noEnemySince = now
+                return
+            else
+                -- Already near the saved location; don't spam teleports.
+                Game.noEnemySince = now
+            end
+        end
+        if Game.goal and Game.holding then
+            lastActivityTime = os.clock()
+        end
+    
+        if wLastPos and (pos - wLastPos).Magnitude >= TELEPORT_DIST then
+            local e, d = nearestEnemy(pos)
+            logLine("TELEPORT", string.format("%s -> %s (%.0f studs) | nearest enemy: %s (%.1f away)",
+                fmtV(wLastPos), fmtV(pos), (pos - wLastPos).Magnitude,
+                e and e.model.Name or "none", d or 0))
+        end
+        wLastPos = pos
+    
+        local gm, gd = nearestValidMob(pos)
+        if gm and gd < GOODPOS_MIN_DIST then
+            lastGoodPos  = pos
+            lastGoodTime = os.clock()
+        end
+    
+        -- Remember the last mob we were fighting, for the freeze fallback.
+        if gm and gd and gd < 40 then
+            lastMobPos  = gm.root.Position
+            lastMobTime = os.clock()
+        end
+    
+        if not wLastMoveCheckPos or (pos - wLastMoveCheckPos).Magnitude > STUCK_MOVE then
+            wLastMoveCheckPos, wLastMoveTime = pos, os.clock()
+        elseif os.clock() - wLastMoveTime >= STUCK_SECONDS
+            and os.clock() - wLastStuckLog > 5
+            and os.clock() - lastActivityTime >= RECOVER_LOG_SILENCE then
+            wLastStuckLog = os.clock()
+    
+            local e, d = nearestEnemy(pos)
+            local info = string.format(
+                "not moving for %ds | pos %s | state %s | anchored %s | WalkSpeed %s | health %s",
+                STUCK_SECONDS, fmtV(pos),
+                hum and tostring(hum:GetState()) or "?",
+                tostring(root.Anchored),
+                hum and tostring(hum.WalkSpeed) or "?",
+                hum and string.format("%.0f/%.0f", hum.Health, hum.MaxHealth) or "?")
+            if e then
+                info = info .. string.format(" | nearest enemy %s %.1f studs away, hp %.0f, parent %s",
+                    e.model.Name, d, e.hum.Health,
+                    e.model.Parent and e.model.Parent.Name or "nil")
+            else
+                info = info .. " | NO living enemies found in workspace"
+            end
+            logLine("STUCK?", info)
+    
+            if AUTO_RECOVER and not Flags.AutoFarm then
+                local sinceStart = os.clock() - logT0
+                local sinceLast  = os.clock() - lastAutoRecover
+    
+                if sinceStart < STARTUP_GRACE then
+                    logLine("RECOVER", string.format(
+                        "skipped (startup grace, %.1fs left)", STARTUP_GRACE - sinceStart))
+                elseif sinceLast < STUCK_TELEPORT_COOLDOWN then
+                    logLine("RECOVER", string.format(
+                        "skipped (cooldown, %.1fs left)", STUCK_TELEPORT_COOLDOWN - sinceLast))
+                else
+                    local mob, mobDist = nearestValidMob(pos)
+                    if not mob then
+                        if lastGoodPos and (os.clock() - lastGoodTime) < GOODPOS_MAX_AGE then
+                            root.CFrame = CFrame.new(lastGoodPos + Vector3.new(0, 3, 0))
+                            root.AssemblyLinearVelocity = Vector3.zero
+                            lastAutoRecover = os.clock()
+                            autoRecovers = autoRecovers + 1
+                            logLine("RECOVER", string.format(
+                                "no mobs nearby -> returned to last good spot %s (%.0fs ago) | attempt #%d",
+                                fmtV(lastGoodPos), os.clock() - lastGoodTime, autoRecovers))
+                        else
+                            logLine("RECOVER", "no valid mob and no recent good position")
+                        end
+                    elseif mobDist > STUCK_TELEPORT_MAXDIST then
+                        logLine("RECOVER", string.format(
+                            "skipped (nearest valid mob %s too far: %.0f > %d)",
+                            mob.model.Name, mobDist, STUCK_TELEPORT_MAXDIST))
+                    else
+                        local mobPos = mob.root.Position
+                        local dir = Vector3.new(pos.X - mobPos.X, 0, pos.Z - mobPos.Z)
+                        if dir.Magnitude < 0.1 then
+                            dir = Vector3.new(1, 0, 0)
+                        else
+                            dir = dir.Unit
+                        end
+                        local targetPos = Vector3.new(
+                            mobPos.X + dir.X * STUCK_TELEPORT_RANGE,
+                            mobPos.Y + 3,
+                            mobPos.Z + dir.Z * STUCK_TELEPORT_RANGE)
+                        root.CFrame = CFrame.new(targetPos)
+                        root.AssemblyLinearVelocity = Vector3.zero
+                        lastAutoRecover = os.clock()
+                        autoRecovers = autoRecovers + 1
+                        logLine("RECOVER", string.format(
+                            "teleported to %s from %s (%.0f studs, target %s) | attempt #%d",
+                            fmtV(targetPos), mob.model.Name, mobDist,
+                            mob.model.Name, autoRecovers))
+                    end
+                end
+            end
+        end
+    end)
+    
+    local function watchChar(char)
+        local hum = char:WaitForChild("Humanoid", 5)
+        if not hum then return end
+        conns[#conns + 1] = hum.StateChanged:Connect(function(_, new)
+            if not killed and logRunning then logLine("STATE", tostring(new)) end
+        end)
+        conns[#conns + 1] = hum.Died:Connect(function()
+            if not killed and logRunning then logLine("EVENT", "You died") end
+        end)
+    end
+    if lp.Character then task.spawn(watchChar, lp.Character) end
+    conns[#conns + 1] = lp.CharacterAdded:Connect(function(c)
+        if logRunning then logLine("EVENT", "Character respawned") end
+        task.spawn(watchChar, c)
+    end)
+    
+    task.spawn(function()
+        while not killed do
+            task.wait(5)
+            if killed then break end
+            flushLog()
+        end
+    end)
+    
+
+    local function stop()
+        if killed then return end
+        killed = true
+        freezeEnabled = false
+        logRunning = false
+        release(getRoot())
+        for _, conn in ipairs(conns) do
+            pcall(function() conn:Disconnect() end)
+        end
+        table.clear(conns)
+        flushLog()
+        FarmAssist.active = false
+        FarmAssist.stop = nil
+        -- Disabled silently.
+    end
+    FarmAssist.stop = stop
+    -- Enabled silently.
+end
+
+function FarmAssist.set(enabled)
+    if enabled then
+        FarmAssist.start()
+    elseif FarmAssist.stop then
+        FarmAssist.stop()
+    end
+end
+
+local function unloadScript()
+    if unloaded then
+        return
+    end
+    pcall(function()
+        for _, key in ipairs(FEATURE_KEYS) do
+            Flags[key] = false
+        end
+        stopCombat()
+        Fish.set(false)
+        Esp.clear()
+        HitboxEsp.clear()
+        Shell.setWalkSpeedEnabled(false)
+        Shell.setInfJump(false)
+        Shell.setNoClip(false)
+        Shell.setInstantProximityPrompt(false)
+        Shell.setFly(false)
+        Shell.setNoGameplayPaused(false)
+        Shell.setAutoReconnect(false)
+        Shell.setDisable3D(false)
+        Shell.setFpsBoost(false)
+        Shell.setAntiAfk(false)
+    end)
+    FarmAssist.set(false)
+    unloaded = true
+    table.clear(workers)
+    for _, conn in ipairs(connections) do
+        pcall(function()
+            conn:Disconnect()
+        end)
+    end
+    table.clear(connections)
+    if Window then
+        local window = Window
+        Window = nil
+        pcall(function()
+            window:Destroy()
+        end)
+    end
+    local env = type(getgenv) == "function" and getgenv() or nil
+    if env and env[NAMESPACE] == unloadScript then
+        env[NAMESPACE] = nil
+    end
+end
+
+if type(getgenv) == "function" then
+    getgenv()[NAMESPACE] = unloadScript
+end
+
+local okLibrary, libraryOrErr = pcall(function()
+    return loadstring(game:HttpGet(UI_SOURCE_URL))()
+end)
+if not okLibrary or type(libraryOrErr) ~= "table" then
+    error("failed to load UI library: " .. tostring(libraryOrErr), 0)
+end
+Library = libraryOrErr
+
+track(LocalPlayer.CharacterAdded:Connect(bindCharacter))
+if LocalPlayer.Character then
+    task.spawn(bindCharacter, LocalPlayer.Character)
+end
+
+Library:LoadFont({ Name = "ValleySans" })
+Library:SetDefaultTheme("Rose")
+
+Window = Library:CreateWindow({
+    Name = "Ouroboros",
+    LoadingSubtitle = SCRIPT_VERSION,
+    ToggleUIKeybind = "RightControl",
+    ConfigurationSaving = {
+        Enabled = true,
+        FolderName = "Ouroboros/" .. GAME_KEY,
+        FileName = "default",
+    },
+    ToggleButton = { Platform = "Mobile" },
+    Home = {
+        Title = "Welcome to " .. GAME_NAME .. "!",
+        Tier = SCRIPT_VERSION,
+        Discord = DISCORD_INVITE,
+        Website = WEBSITE_LINK,
+        Stats = { "Players", "Session", "FPS", "Ping" },
+    },
+})
+
+local MainTab = Window:CreateTab({ Name = "Main", Icon = "swords" })
+local CombatTab = MainTab:CreateSubTab({ Name = "Combat", Icon = "sword" })
+local RunTab = MainTab:CreateSubTab({ Name = "Run", Icon = "repeat" })
+local LobbyTab = Window:CreateTab({ Name = "Lobby", Icon = "house" })
+local Player = Window:CreateTab({ Name = "Player", Icon = "user" })
+local Settings = Window:CreateTab({ Name = "Settings", Icon = "settings" })
+
+local UI = {}
+
+function UI.featureToggle(box, name, flag)
+    box:CreateToggle({
+        Name = name,
+        CurrentValue = false,
+        Flag = flag,
+        Callback = function(enabled)
+            Setters.feature(flag, enabled)
+        end,
+    })
+end
+
+function UI.boolToggle(box, name, flag)
+    box:CreateToggle({
+        Name = name,
+        CurrentValue = Flags[flag],
+        Flag = flag,
+        Callback = function(enabled)
+            Flags[flag] = enabled == true
+        end,
+    })
+end
+
+function UI.slider(box, name, flag, range, increment)
+    box:CreateSlider({
+        Name = name,
+        Range = range,
+        Increment = increment,
+        CurrentValue = Flags[flag],
+        Flag = flag,
+        Callback = function(amount)
+            Flags[flag] = tonumber(amount) or Flags[flag]
+        end,
+    })
+end
+
+function UI.choice(box, name, flag, options)
+    box:CreateDropdown({
+        Name = name,
+        Options = options,
+        CurrentOption = Flags[flag],
+        AllowNone = false,
+        Flag = flag,
+        Callback = function(option)
+            Flags[flag] = firstOption(option) or Flags[flag]
+        end,
+    })
+end
+
+function UI.order(box, name, flag)
+    box:CreateOrderList({
+        Name = name,
+        Items = table.clone(Flags[flag]),
+        Flag = flag,
+        Callback = function(order)
+            if type(order) == "table" and #order > 0 then
+                Flags[flag] = listOf(order)
+            end
+        end,
+    })
+end
+
+function UI.combat()
+    local Farm = CombatTab:AddLeftGroupbox({ Name = "Auto Farm", Icon = "crosshair" })
+    UI.featureToggle(Farm, "Auto Farm", "AutoFarm")
+    UI.choice(Farm, "Mob Position", "FarmPosition", POSITIONS)
+    UI.slider(Farm, "Mob Distance", "FarmDistance", { 2, 20 }, 1)
+    UI.slider(Farm, "Mob Height Offset", "HeightOffset", { -20, 20 }, 0.5)
+    UI.slider(Farm, "Mob Orbit Speed", "OrbitSpeed", { 1, 10 }, 0.5)
+    Farm:CreateDivider()
+    UI.choice(Farm, "Boss Position", "BossPosition", POSITIONS)
+    UI.slider(Farm, "Boss Distance", "BossDistance", { 2, 40 }, 1)
+    UI.slider(Farm, "Boss Height Offset", "BossHeightOffset", { -20, 20 }, 0.5)
+    UI.slider(Farm, "Boss Orbit Speed", "BossOrbitSpeed", { 1, 10 }, 0.5)
+    Farm:CreateDivider()
+    UI.boolToggle(Farm, "Prioritize Boss", "PrioritizeBoss")
+    UI.boolToggle(Farm, "Kill Shield Soldiers First", "KillShieldersFirst")
+    UI.featureToggle(Farm, "Auto Move To Tree (Raid)", "AutoTreeMove")
+    UI.boolToggle(Farm, "Prioritize Mobs Near Tree (Raid)", "TreeMobsFirst")
+
+    local Crates = CombatTab:AddLeftGroupbox({ Name = "Crates", Icon = "package" })
+    UI.featureToggle(Crates, "Auto Break Crates", "AutoCrates")
+    UI.boolToggle(Crates, "Include Chests", "IncludeChests")
+
+    local History = CombatTab:AddRightGroupbox({ Name = "Recent Runs", Icon = "history" })
+    Runs.load()
+    Runs.table = History:AddTable({
+        MaxRows = 6,
+        EmptyText = "No runs recorded yet",
+        Columns = {
+            { Name = "Ended", Key = "Ended" },
+            { Name = "Run", Key = "Run" },
+            { Name = "Time", Key = "Time" },
+            {
+                Name = "Chests",
+                Key = "Chests",
+                Format = function(value)
+                    return "+" .. tostring(value or 0)
+                end,
+                Color = Color3.fromRGB(245, 180, 70),
+            },
+            { Name = "Result", Key = "Result" },
+        },
+        Rows = Runs.list,
+    })
+    History:CreateButton({
+        Name = "Clear Runs",
+        Callback = function()
+            table.clear(Runs.list)
+            Runs.save()
+            Runs.publish()
+        end,
+    })
+
+    local Skills = CombatTab:AddRightGroupbox({ Name = "Skills", Icon = "zap" })
+    UI.boolToggle(Skills, "Auto Skills", "AutoSkills")
+    UI.boolToggle(Skills, "Use Skill 1", "SkillOne")
+    UI.boolToggle(Skills, "Use Skill 2", "SkillTwo")
+    UI.slider(Skills, "Skill Interval (s)", "SkillInterval", { 0.1, 5 }, 0.1)
+
+    local Retreat = CombatTab:AddRightGroupbox({ Name = "Retreat", Icon = "heart-pulse" })
+    UI.featureToggle(Retreat, "Auto Retreat", "AutoRetreat")
+    UI.slider(Retreat, "Retreat At HP %", "RetreatHp", { 5, 95 }, 1)
+    UI.slider(Retreat, "Resume At HP %", "ResumeHp", { 10, 100 }, 1)
+
+    local Potion = CombatTab:AddRightGroupbox({ Name = "Auto Potion", Icon = "flask-conical" })
+    UI.featureToggle(Potion, "Auto Potion", "AutoPotion")
+    UI.slider(Potion, "Drink At HP %", "PotionHp", { 5, 95 }, 1)
+
+    local Visuals = CombatTab:AddLeftGroupbox({ Name = "Visuals", Icon = "eye" })
+    UI.featureToggle(Visuals, "Mob ESP", "MobEsp")
+    UI.featureToggle(Visuals, "Hitbox ESP", "HitboxEsp")
+
+    local Status = CombatTab:AddRightGroupbox({ Name = "Status", Icon = "activity" })
+    Status:CreateStatus({
+        Name = "Action",
+        Style = "Row",
+        Update = function()
+            return Game.status
+        end,
+    })
+end
+
+function UI.run()
+    local Cards = RunTab:AddLeftGroupbox({ Name = "Auto Cards", Icon = "layers" })
+    UI.featureToggle(Cards, "Auto Cards", "AutoCards")
+    UI.order(Cards, "Level Up Banner Priority", "BannerOrder")
+    Cards:CreateDivider()
+    UI.order(Cards, "Charm Card Rarity Priority", "RarityOrder")
+    UI.choice(Cards, "Prefer Type", "PreferType", { "Any", "Weapon", "Armor" })
+    UI.choice(Cards, "Tiebreak", "CardTiebreak", { "Stars", "Rarity" })
+    Cards:CreateInput({
+        Name = "Preferred Items",
+        PlaceholderText = "e.g. IronSword, Katana",
+        CurrentValue = "",
+        RemoveTextAfterFocusLost = false,
+        Flag = "PreferredItems",
+        Callback = function(text)
+            Flags.PreferredItems = tostring(text or "")
+        end,
+    })
+
+    local Charm = RunTab:AddRightGroupbox({ Name = "Charm", Icon = "gem" })
+    UI.featureToggle(Charm, "Auto Use Charm", "AutoCharm")
+    UI.order(Charm, "Charm Priority", "CharmOrder")
+
+    local Retry = RunTab:AddRightGroupbox({ Name = "Run Flow", Icon = "rotate-ccw" })
+    UI.featureToggle(Retry, "Auto Retry", "AutoRetry")
+    UI.featureToggle(Retry, "Auto Leave", "AutoLeave")
+    UI.featureToggle(Retry, "Auto Give Up On Death", "AutoGiveUp")
+    UI.featureToggle(Retry, "Auto Skip Cutscenes", "AutoSkipCutscene")
+    Retry:CreateStatusList({
+        Name = "Session",
+        MaxRows = 4,
+        UpdateRate = 1,
+        Update = function()
+            return {
+                { Name = "Banners Picked", Value = tostring(Game.stats.banners) },
+                { Name = "Cards Picked", Value = tostring(Game.stats.cards) },
+                { Name = "Charms Used", Value = tostring(Game.stats.charms) },
+                { Name = "Retries", Value = tostring(Game.stats.retries) },
+            }
+        end,
+    })
+end
+
+function UI.multi(box, name, flag, options)
+    box:CreateDropdown({
+        Name = name,
+        Options = options,
+        MultipleOptions = true,
+        CurrentOption = table.clone(Flags[flag]),
+        Flag = flag,
+        Callback = function(option)
+            Flags[flag] = listOf(option)
+        end,
+    })
+end
+
+function UI.lobby()
+    local Join = LobbyTab:AddLeftGroupbox({ Name = "Auto Join", Icon = "play" })
+    UI.featureToggle(Join, "Auto Join", "AutoJoin")
+    UI.choice(Join, "World", "JoinWorld", WORLDS)
+    UI.choice(Join, "Difficulty", "JoinDifficulty", DIFFICULTIES)
+    UI.slider(Join, "Max Players", "JoinPlayers", { 1, 4 }, 1)
+    UI.featureToggle(Join, "Auto Start", "AutoStart")
+    Join:CreateDivider()
+    UI.featureToggle(Join, "Auto Raid", "AutoRaid")
+
+    local Gear = LobbyTab:AddLeftGroupbox({ Name = "Gear", Icon = "shield" })
+    UI.featureToggle(Gear, "Auto Equip Best Weapon and Armor", "AutoEquipBest")
+    UI.featureToggle(Gear, "Auto Upgrade", "AutoUpgrade")
+    UI.multi(Gear, "Upgrade Rarities", "UpgradeRarities", SHOP_RARITIES)
+    UI.boolToggle(Gear, "Upgrade Equipped Only", "UpgradeEquippedOnly")
+    UI.slider(Gear, "Keep Coins", "UpgradeReserve", { 0, 100000 }, 100)
+
+    local Class = LobbyTab:AddLeftGroupbox({ Name = "Class", Icon = "dice-5" })
+    UI.featureToggle(Class, "Auto Roll Class", "AutoClass")
+    UI.multi(Class, "Stop On Classes", "ClassTargets", CLASSES)
+
+    local Quests = LobbyTab:AddRightGroupbox({ Name = "Quests", Icon = "scroll-text" })
+    UI.featureToggle(Quests, "Auto Take All Available Quests", "AutoQuests")
+
+    local Shop = LobbyTab:AddRightGroupbox({ Name = "Shop", Icon = "shopping-cart" })
+    UI.featureToggle(Shop, "Auto Buy Shop", "AutoShop")
+    UI.multi(Shop, "Daily Item Rarities", "ShopRarities", SHOP_RARITIES)
+    UI.multi(Shop, "Daily Chests", "ShopChests", SHOP_CHESTS)
+    Shop:CreateDivider()
+    UI.featureToggle(Shop, "Auto Buy Potions", "AutoPotions")
+    UI.multi(Shop, "Potions", "BuyPotions", POTIONS)
+    UI.slider(Shop, "Keep Stocked At", "PotionTarget", { 1, 50 }, 1)
+
+    local Chests = LobbyTab:AddRightGroupbox({ Name = "Chests", Icon = "package-open" })
+    UI.featureToggle(Chests, "Auto Open Chests", "AutoChests")
+    UI.multi(Chests, "Chests To Open (empty = all)", "OpenChests", CHESTS)
+
+    local Fishing = LobbyTab:AddLeftGroupbox({ Name = "Fishing", Icon = "fish" })
+    UI.featureToggle(Fishing, "Auto Fish", "AutoFish")
+    UI.choice(Fishing, "Mode", "FishMode", { "Perfect", "Game Auto" })
+    UI.slider(Fishing, "Cast Power %", "FishCastPower", { 10, 100 }, 5)
+    UI.slider(Fishing, "Cast Delay (s)", "FishCastDelay", { 0, 5 }, 0.1)
+    UI.slider(Fishing, "Reel Press Delay (s)", "FishReelDelay", { 0.02, 0.5 }, 0.01)
+    UI.boolToggle(Fishing, "Auto Hold Rod", "FishAutoRod")
+    Fishing:CreateStatus({
+        Name = "Fishing",
+        Style = "Row",
+        Update = function()
+            return Game.fishStatus or "Idle"
+        end,
+    })
+
+    local Status = LobbyTab:AddRightGroupbox({ Name = "Status", Icon = "activity" })
+    Status:CreateStatus({
+        Name = "Last Action",
+        Style = "Row",
+        Update = function()
+            return Game.lobbyStatus or "Idle"
+        end,
+    })
+end
+
+function UI.player()
+    local Movement = Player:AddLeftGroupbox({ Name = "Movement", Icon = "move" })
+    Movement:CreateToggle({
+        Name = "WalkSpeed",
+        CurrentValue = false,
+        Flag = "WalkSpeedEnabled",
+        Callback = Shell.setWalkSpeedEnabled,
+    })
+    Movement:CreateSlider({
+        Name = "Speed",
+        Range = { 16, 250 },
+        Increment = 1,
+        CurrentValue = 32,
+        Flag = "WalkSpeed",
+        Callback = Shell.setWalkSpeed,
+    })
+    Movement:CreateToggle({
+        Name = "Infinite Jump",
+        CurrentValue = false,
+        Flag = "InfJump",
+        Callback = Shell.setInfJump,
+    })
+    Movement:CreateToggle({
+        Name = "Noclip",
+        CurrentValue = false,
+        Flag = "NoClip",
+        Callback = Shell.setNoClip,
+    })
+    Movement:CreateToggle({
+        Name = "Instant ProximityPrompt",
+        CurrentValue = false,
+        Flag = "InstantProximityPrompt",
+        Callback = Shell.setInstantProximityPrompt,
+    })
+
+    local FlyBox = Player:AddRightGroupbox({ Name = "Fly", Icon = "plane" })
+    FlyBox:CreateToggle({
+        Name = "Fly",
+        CurrentValue = false,
+        Flag = "Fly",
+        Callback = Shell.setFly,
+    })
+    FlyBox:CreateSlider({
+        Name = "Fly Speed",
+        Range = { 10, 400 },
+        Increment = 1,
+        CurrentValue = 60,
+        Flag = "FlySpeed",
+        Callback = Shell.setFlySpeed,
+    })
+
+    local Client = Player:AddLeftGroupbox({ Name = "Client", Icon = "monitor" })
+    Client:CreateToggle({
+        Name = "No Gameplay Paused",
+        CurrentValue = true,
+        Flag = "AntiGameplayPause",
+        Callback = Shell.setNoGameplayPaused,
+    })
+    Client:CreateToggle({
+        Name = "Auto Reconnect on Kick",
+        CurrentValue = false,
+        Flag = "AutoReconnect",
+        Callback = Shell.setAutoReconnect,
+    })
+    Client:CreateToggle({
+        Name = "Disable 3D Rendering",
+        CurrentValue = false,
+        Flag = "Disable3DRendering",
+        Callback = Shell.setDisable3D,
+    })
+    Client:CreateToggle({
+        Name = "FPS Boost",
+        CurrentValue = false,
+        Flag = "FpsBoost",
+        Callback = Shell.setFpsBoost,
+    })
+    local Recovery = Player:AddRightGroupbox({ Name = "Farm Assist", Icon = "shield-check" })
+    Recovery:CreateToggle({
+        Name = "Fall Freeze + Activity Log",
+        CurrentValue = false,
+        Flag = "FarmAssistEnabled",
+        Callback = FarmAssist.set,
+    })
+
+    Client:CreateToggle({
+        Name = "Hide UI On Start",
+        CurrentValue = false,
+        Flag = "HideUIOnStart",
+        Callback = function() end,
+    })
+end
+
+function UI.settings()
+    local Interface = Settings:AddLeftGroupbox({ Name = "Menu", Icon = "monitor" })
+    Interface:CreateKeybind({
+        Name = "Toggle UI",
+        CurrentKeybind = "RightControl",
+        Flag = "ToggleUIKey",
+        Callback = function() end,
+        OnChanged = function(key)
+            Window:SetKeybind(key)
+        end,
+    })
+    Interface:CreateDropdown({
+        Name = "Toggle button",
+        Options = { "Mobile only", "Mobile & PC" },
+        CurrentOption = "Mobile only",
+        AllowNone = false,
+        Flag = "ToggleButtonPlatform",
+        Callback = function(option)
+            Window:SetToggleButtonPlatform(firstOption(option) == "Mobile & PC" and "Both" or "Mobile")
+        end,
+    })
+    Interface:CreateToggle({
+        Name = "Anti AFK",
+        CurrentValue = true,
+        Flag = "AntiAfk",
+        Callback = Shell.setAntiAfk,
+    })
+    Interface:CreateButton({
+        Name = "Unload",
+        Icon = "power",
+        Callback = function()
+            Library:Confirm({
+                Title = "Unload?",
+                ConfirmText = "Unload",
+                Callback = unloadScript,
+            })
+        end,
+    })
+    Settings:CreateConfigManager({ Name = "Configs", Side = "Left" })
+    Settings:CreateThemeManager({ Name = "Themes", Side = "Right" })
+end
+
+UI.combat()
+UI.run()
+UI.lobby()
+UI.player()
+UI.settings()
+
+do
+    local gui = Window.Gui
+    if typeof(gui) == "Instance" then
+        track(gui.Destroying:Connect(function()
+            task.defer(unloadScript)
+        end))
+    end
+end
+
+Shell.setNoGameplayPaused(true)
+Shell.setAntiAfk(true)
+startWorker("Runs", 1, Runs.step)
+
+Window:LoadAutoload()
+
+for _, key in ipairs({ "PrioritizeBoss", "TreeMobsFirst", "IncludeChests", "AutoSkills", "SkillOne", "SkillTwo", "UpgradeEquippedOnly" }) do
+    Flags[key] = readFlag(key, Flags[key]) == true
+end
+for _, key in ipairs({ "FarmDistance", "HeightOffset", "OrbitSpeed", "BossDistance", "BossHeightOffset", "BossOrbitSpeed", "SkillInterval", "RetreatHp", "ResumeHp", "JoinPlayers", "PotionTarget", "UpgradeReserve" }) do
+    Flags[key] = tonumber(readFlag(key, Flags[key])) or Flags[key]
+end
+for _, key in ipairs({ "ShopRarities", "ShopChests", "BuyPotions", "UpgradeRarities", "OpenChests", "ClassTargets" }) do
+    local saved = readFlag(key, nil)
+    if type(saved) == "table" then
+        Flags[key] = listOf(saved)
+    end
+end
+for _, key in ipairs({ "FarmPosition", "BossPosition", "PreferType", "CardTiebreak", "JoinWorld", "JoinDifficulty" }) do
+    Flags[key] = firstOption(readFlag(key, Flags[key])) or Flags[key]
+end
+for _, key in ipairs({ "BannerOrder", "RarityOrder", "CharmOrder" }) do
+    local saved = readFlag(key, nil)
+    if type(saved) == "table" and #saved > 0 then
+        Flags[key] = listOf(saved)
+    end
+end
+Flags.PreferredItems = tostring(readFlag("PreferredItems", "") or "")
+for _, key in ipairs(FEATURE_KEYS) do
+    Setters.feature(key, readFlag(key, false) == true)
+end
+Shell.setWalkSpeed(readFlag("WalkSpeed", Flags.WalkSpeed))
+Shell.setWalkSpeedEnabled(readFlag("WalkSpeedEnabled", false) == true)
+Shell.setInfJump(readFlag("InfJump", false) == true)
+Shell.setNoClip(readFlag("NoClip", false) == true)
+Shell.setInstantProximityPrompt(readFlag("InstantProximityPrompt", false) == true)
+Shell.setFlySpeed(readFlag("FlySpeed", Flags.FlySpeed))
+Shell.setFly(readFlag("Fly", false) == true)
+Shell.setNoGameplayPaused(readFlag("AntiGameplayPause", true) == true)
+Shell.setAutoReconnect(readFlag("AutoReconnect", false) == true)
+Shell.setDisable3D(readFlag("Disable3DRendering", false) == true)
+Shell.setFpsBoost(readFlag("FpsBoost", false) == true)
+Shell.setAntiAfk(readFlag("AntiAfk", true) == true)
+FarmAssist.set(readFlag("FarmAssistEnabled", false) == true)
+
+if readFlag("HideUIOnStart", false) == true then
+    Window:Toggle(false)
+end
