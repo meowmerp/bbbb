@@ -1,7 +1,7 @@
 --!nonstrict
 --=============================================================================
--- Standalone The Forest Automation Script + GUI
--- v3.0 (Config persistence, area progress gate, automated boss phase)
+-- Chop A Forest automation script + GUI
+-- v5.0 (hold gun trigger during boss encounters)
 --=============================================================================
 
 local Players            = game:GetService("Players")
@@ -22,7 +22,7 @@ if not game:IsLoaded() then
     game.Loaded:Wait() 
 end
 
-local SCRIPT_VERSION = "v3.3-boss-topbar-safety"
+local SCRIPT_VERSION = "v5.0"
 local GAME_NAME      = "The Forest"
 local CONFIG_FILE    = "ForestConfig.json"
 
@@ -96,6 +96,26 @@ xpcall(function()
         bossNextRepositionAt = 0,
         bossAnchoredRoot = nil,
         bossRootWasAnchored = nil,
+        bossEncounterActive = false,
+        bossPlayerDied = false,
+        bossReturnPosition = nil,
+        bossRespawnTeleportPending = false,
+        bossKnockedDownDetectedAt = nil,
+        bossReturnMonitorRunning = false,
+        bossDownedWatcherRunning = false,
+        -- Keep the completed-area boss phase latched after a knockdown until
+        -- a live boss is reacquired and gun attacks resume.
+        bossRecoveryActive = false,
+        bossMeleeHeld = false,
+        bossGunHeld = false,
+        bossGunHoldMode = nil,
+        bossGunHoldPoint = nil,
+        bossRecoveryAttackRunning = false,
+        bossMeleeInputMode = nil,
+        bossMeleePoint = nil,
+        bossSlot2Selected = false,
+        bossSlot2Tool = nil,
+        lastBossAttackDiagnostic = 0,
     }
 
     --=============================================================================
@@ -326,6 +346,214 @@ xpcall(function()
         root.AssemblyLinearVelocity = Vector3.zero
         root.CFrame = CFrame.new(position)
         return true
+    end
+
+    -- The game's knockdown screen is custom and may not fire Humanoid.Died.
+    -- Search PlayerGui AND CoreGui, because custom HUD layers can be parented
+    -- differently between game versions. Check individual text nodes so the
+    -- title and cabin countdown may be separate labels.
+    local function isKnockedDownScreenVisible()
+        local roots = {}
+        local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        if playerGui then table.insert(roots, playerGui) end
+        local coreGuiOk, coreGui = pcall(function()
+            return game:GetService("CoreGui")
+        end)
+        if coreGuiOk and coreGui then table.insert(roots, coreGui) end
+
+        for _, guiRoot in ipairs(roots) do
+            local ok, descendants = pcall(function()
+                return guiRoot:GetDescendants()
+            end)
+            if ok and descendants then
+                for _, item in ipairs(descendants) do
+                    if item:IsA("TextLabel") or item:IsA("TextButton") or item:IsA("TextBox") then
+                        local text = string.lower(tostring(item.Text or ""))
+                        local isKnockedText = string.find(text, "knocked down", 1, true) ~= nil
+                            or string.find(text, "waking at the cabin", 1, true) ~= nil
+                        if isKnockedText then
+                            local visible = true
+                            local ancestor = item
+                            while ancestor and ancestor ~= guiRoot do
+                                if ancestor:IsA("GuiObject") and not ancestor.Visible then
+                                    visible = false
+                                    break
+                                end
+                                if ancestor:IsA("ScreenGui") and not ancestor.Enabled then
+                                    visible = false
+                                    break
+                                end
+                                ancestor = ancestor.Parent
+                            end
+                            if visible then return true end
+                        end
+                    end
+                end
+            end
+        end
+        return false
+    end
+
+    -- Forward-declare so the respawn monitor can re-equip the Axe as soon as
+    -- the character wakes and is teleported back to the encounter area.
+    local equipAxe
+    local isAxeTool -- forward declaration for the recovery watcher below
+
+    -- Run independently of CharacterAdded because waking at the cabin can reuse
+    -- the same character. Wait until the countdown HUD goes away and a live root
+    -- exists, then teleport back to the last saved boss-side position.
+    local function startBossReturnMonitor()
+        if Game.bossReturnMonitorRunning then return end
+        Game.bossReturnMonitorRunning = true
+        task.spawn(function()
+            local aliveSince = nil
+            local recoverySlotSelected = false
+            while not unloaded and Game.bossRespawnTeleportPending do
+                local character = LocalPlayer.Character
+                local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+                local root = character and character:FindFirstChild("HumanoidRootPart")
+                local knockedDown = isKnockedDownScreenVisible()
+                if humanoid and humanoid.Health > 0 and root and root:IsA("BasePart") and not knockedDown then
+                    aliveSince = aliveSince or os.clock()
+                    if os.clock() - aliveSince >= 0.55 then
+                        local destination = Game.bossReturnPosition
+                        if destination then
+                            local moved = false
+                            for attempt = 1, 4 do
+                                if unloaded or not Game.bossRespawnTeleportPending then break end
+                                local currentCharacter = LocalPlayer.Character
+                                local currentHumanoid = currentCharacter and currentCharacter:FindFirstChildOfClass("Humanoid")
+                                local currentRoot = currentCharacter and currentCharacter:FindFirstChild("HumanoidRootPart")
+                                if currentHumanoid and currentHumanoid.Health > 0
+                                    and currentRoot and currentRoot:IsA("BasePart")
+                                    and not isKnockedDownScreenVisible() then
+                                    -- After waking, select gun once before returning to the boss.
+                                    if not recoverySlotSelected then
+                                        recoverySlotSelected = true
+                                        if Game.pressWeaponSlot then pcall(Game.pressWeaponSlot, 5) end
+                                        task.wait(0.12)
+                                        Game.bossSlot2Selected = false
+                                    end
+                                    local ok = pcall(function()
+                                        currentRoot.Anchored = false
+                                        currentRoot.AssemblyLinearVelocity = Vector3.zero
+                                        currentRoot.AssemblyAngularVelocity = Vector3.zero
+                                        currentRoot.CFrame = CFrame.new(destination)
+                                    end)
+                                    task.wait(0.3)
+                                    local checkCharacter = LocalPlayer.Character
+                                    local checkHumanoid = checkCharacter and checkCharacter:FindFirstChildOfClass("Humanoid")
+                                    local checkRoot = checkCharacter and checkCharacter:FindFirstChild("HumanoidRootPart")
+                                    if ok and checkHumanoid and checkHumanoid.Health > 0
+                                        and checkRoot and checkRoot:IsA("BasePart")
+                                        and (checkRoot.Position - destination).Magnitude <= 24 then
+                                        moved = true
+                                        break
+                                    end
+                                end
+                                task.wait(0.25)
+                            end
+                            if moved then
+                                Game.bossRespawnTeleportPending = false
+                                Game.bossPlayerDied = false
+                                Game.bossKnockedDownDetectedAt = nil
+                                Game.bossRecoveryActive = true
+                                Game.cachedBoss = nil
+                                Game.lastBossNotice = nil
+
+                                -- Gun was selected once after waking; don't repeat key input.
+                                task.wait(0.2)
+                                Game.status = "Returned to boss area; firing gun"
+                                notify("Returned to boss area; holding gun trigger.")
+                                if Game.setBossGunHeld then pcall(Game.setBossGunHeld, true) end
+
+                                -- Reassert the held trigger while awaiting boss respawn.
+                                if not Game.bossRecoveryAttackRunning then
+                                    Game.bossRecoveryAttackRunning = true
+                                    task.spawn(function()
+                                        while not unloaded and not Game.bossRespawnTeleportPending
+                                            and not Game.bossPlayerDied
+                                            and not (Game.bossEncounterActive and not Game.bossRecoveryActive) do
+                                            if isKnockedDownScreenVisible() then break end
+                                            if Game.setBossGunHeld then pcall(Game.setBossGunHeld, true) end
+                                            task.wait(0.12)
+                                        end
+                                        Game.bossRecoveryAttackRunning = false
+                                    end)
+                                end
+                                break
+                            end
+                        else
+                            warn("[TheForest] Boss return is pending, but no saved boss position is available yet.")
+                        end
+                        aliveSince = nil
+                    end
+                else
+                    aliveSince = nil
+                end
+                task.wait(0.2)
+            end
+            Game.bossReturnMonitorRunning = false
+        end)
+    end
+
+    local function markBossPlayerDowned(reason)
+        Game.bossSlot2Selected = false
+        Game.bossSlot2Tool = nil
+        -- Release the gun trigger when down; restart after waking and returning.
+        if Game.setBossGunHeld then pcall(Game.setBossGunHeld, false) end
+        if Game.setBossMeleeHeld then
+            pcall(Game.setBossMeleeHeld, false)
+        end
+        -- Keep the last live boss-side position. If the main positioning loop
+        -- hasn't recorded one yet, fall back to the last locked boss root.
+        if not Game.bossReturnPosition and Game.bossLockedBossPosition then
+            Game.bossReturnPosition = Game.bossLockedBossPosition + Vector3.new(0, 3, 0)
+        end
+        if not Game.bossReturnPosition then
+            -- Last-resort recovery point: the player's current root is usually
+            -- still beside the boss when the custom knockdown overlay appears.
+            local character = LocalPlayer.Character
+            local currentRoot = character and character:FindFirstChild("HumanoidRootPart")
+            if currentRoot and currentRoot:IsA("BasePart") then
+                Game.bossReturnPosition = currentRoot.Position + Vector3.new(0, 2, 0)
+            end
+        end
+        if not Game.bossReturnPosition then
+            warn("[TheForest] Knockdown detected during boss combat, but neither the boss nor player return position was available yet.")
+            return
+        end
+        local firstDetection = not Game.bossRespawnTeleportPending
+        Game.bossPlayerDied = true
+        Game.bossRespawnTeleportPending = true
+        Game.bossRecoveryActive = true
+        Game.bossKnockedDownDetectedAt = Game.bossKnockedDownDetectedAt or os.clock()
+        if firstDetection then
+            Game.status = "Knocked down; waiting to return to boss area"
+            notify("Knocked down during boss fight. Waiting to wake up, then returning to the saved boss location.")
+            warn("[TheForest] Boss recovery queued: " .. tostring(reason or "player downed"))
+        end
+        startBossReturnMonitor()
+    end
+
+    -- This watcher is independent from the main boss loop, so it can detect
+    -- the knockdown even if the boss bar vanishes or the encounter loop exits.
+    local function startBossDownedWatcher()
+        if Game.bossDownedWatcherRunning then return end
+        Game.bossDownedWatcherRunning = true
+        task.spawn(function()
+            while not unloaded do
+                if Game.bossEncounterActive then
+                    if isKnockedDownScreenVisible() then
+                        markBossPlayerDowned("KNOCKED DOWN / waking at the cabin HUD watcher")
+                    end
+                    task.wait(0.15)
+                else
+                    task.wait(0.4)
+                end
+            end
+            Game.bossDownedWatcherRunning = false
+        end)
     end
 
     local function partPosition(inst)
@@ -1302,33 +1530,7 @@ xpcall(function()
         return Flags.AutoChop or Flags.AutoPickup or Flags.AutoSell 
     end
 
-    local function equipTool(name)
-        local humanoid, root = getRoot()
-        local character = LocalPlayer.Character
-        if not character or not humanoid or not root then
-            return nil
-        end
 
-        local tool = character:FindFirstChild(name)
-        if tool and tool:IsA("Tool") then
-            return tool
-        end
-
-        local backpack = LocalPlayer:FindFirstChild("Backpack")
-        tool = backpack and backpack:FindFirstChild(name)
-        if tool and tool:IsA("Tool") then
-            local equipped = pcall(function()
-                humanoid:EquipTool(tool)
-            end)
-            if not equipped then
-                return nil
-            end
-            task.wait(0.3)
-            local current = character:FindFirstChild(name)
-            return current and current:IsA("Tool") and current or nil
-        end
-        return nil
-    end
 
     local function sellLogs()
         if carried() <= 0 or not Remotes then 
@@ -1440,46 +1642,69 @@ xpcall(function()
         end
     end
 
-    local function equipAxe()
+    isAxeTool = function(tool)
+        if not tool or not tool:IsA("Tool") then return false end
+        -- Some experiences rename their hotbar tools internally. Trust the
+        -- tool captured immediately after the ONE slot-2 selection, but never
+        -- an explicitly named firearm.
+        local loweredName = string.lower(tool.Name)
+        local firearm = loweredName:find("gun", 1, true) or loweredName:find("rifle", 1, true)
+            or loweredName:find("pistol", 1, true) or loweredName:find("shotgun", 1, true)
+        if Game.bossSlot2Tool == tool and not firearm then return true end
+        local candidates = { tool.Name, tool.ToolTip }
+        for _, attributeName in ipairs({ "DisplayName", "ItemName", "ToolName", "WeaponName" }) do
+            local ok, value = pcall(function() return tool:GetAttribute(attributeName) end)
+            if ok and value ~= nil then table.insert(candidates, tostring(value)) end
+        end
+        for _, candidate in ipairs(candidates) do
+            if string.find(string.lower(tostring(candidate or "")), "axe", 1, true) then
+                return true
+            end
+        end
+        return false
+    end
+
+    equipAxe = function()
         local humanoid, root = getRoot()
         local character = LocalPlayer.Character
         if not character or not humanoid or not root then
             return nil
         end
 
-        -- Some versions of the game give the equipped axe a different internal
-        -- name (or don't expose it as a Backpack tool). Prefer the tool already
-        -- in the character instead of requiring its Name to contain "Axe".
+        -- Never treat a generic equipped Tool as the Axe: that allowed an
+        -- unrelated previously equipped tool to be activated during the encounter.
         local heldTool = character:FindFirstChildOfClass("Tool")
-        if heldTool then
+        if isAxeTool(heldTool) then
             return heldTool
+        end
+        -- Never unequip an unidentified tool immediately after selecting slot 2;
+        -- that was preventing ALL attacks when the Axe has a custom Tool name.
+        if Game.bossSlot2Selected and heldTool and heldTool:IsA("Tool") then
+            local n = string.lower(heldTool.Name)
+            if not (n:find("gun", 1, true) or n:find("rifle", 1, true)
+                or n:find("pistol", 1, true) or n:find("shotgun", 1, true)) then
+                Game.bossSlot2Tool = heldTool
+                return heldTool
+            end
         end
 
         local backpack = LocalPlayer:FindFirstChild("Backpack")
-        local containers = { backpack }
-        for _, container in ipairs(containers) do
-            if container then
-                local exact = container:FindFirstChild("Axe")
-                if exact and exact:IsA("Tool") then
-                    local ok = pcall(function() humanoid:EquipTool(exact) end)
-                    if not ok then return nil end
-                    task.wait(0.1)
-                    return character:FindFirstChildOfClass("Tool")
-                end
-            end
-        end
         if backpack then
             for _, item in ipairs(backpack:GetChildren()) do
-                if item:IsA("Tool") and string.find(string.lower(item.Name), "axe", 1, true) then
+                if isAxeTool(item) then
                     local ok = pcall(function() humanoid:EquipTool(item) end)
                     if not ok then return nil end
-                    task.wait(0.1)
-                    return character:FindFirstChildOfClass("Tool")
+                    task.wait(0.12)
+                    local current = character:FindFirstChildOfClass("Tool")
+                    if isAxeTool(current) then return current end
                 end
             end
         end
-        -- The game may handle an attack on mouse click alone, so callers still
-        -- attempt the click even when no Tool instance is exposed locally.
+
+        -- Slot 2 is pressed once at encounter start / once after respawn.
+        -- Never press 2 in this frequently-called helper: it interrupts attacks.
+        -- A custom slot-2 hotbar may not create any Roblox Tool instance.
+        -- Do not unequip anything just because the Tool search returned nil.
         return nil
     end
 
@@ -1492,29 +1717,219 @@ xpcall(function()
         end)
     end
 
+    -- Hold MouseButton1 continuously during boss melee. Unlike clickAttack(),
+    -- this keeps the input down across frames, including after the respawn loop
+    -- re-equips the Axe. The boss loop still pulses Tool:Activate() to support
+    -- tools whose attack handler listens to Activated rather than held input.
+    Game.setBossMeleeHeld = function(shouldHold)
+        local camera = workspace.CurrentCamera
+        local viewport = camera and camera.ViewportSize or Vector2.new(1600, 900)
+        local point = Game.bossMeleePoint or Vector2.new(
+            math.floor(viewport.X * 0.5), math.floor(viewport.Y * 0.5)
+        )
+
+        if shouldHold then
+            local character = LocalPlayer.Character
+            local heldTool = character and character:FindFirstChildOfClass("Tool")
+            if not isAxeTool(heldTool) or isKnockedDownScreenVisible()
+                or Game.bossRespawnTeleportPending or Game.bossPlayerDied then
+                return false
+            end
+            if Game.bossMeleeHeld then return true end
+
+            -- Prefer executor-native mouse holds when available. VirtualInputManager
+            -- can return successfully without maintaining a real held click in some
+            -- executor/game combinations, especially after character respawn.
+            if type(mouse1press) == "function" then
+                local executorOk = pcall(mouse1press)
+                if executorOk then
+                    Game.bossMeleeHeld = true
+                    Game.bossMeleeInputMode = "ExecutorMouse"
+                    Game.bossMeleePoint = point
+                    return true
+                end
+            end
+
+            local inputOk = pcall(function()
+                local virtualInput = game:GetService("VirtualInputManager")
+                virtualInput:SendMouseButtonEvent(point.X, point.Y, 0, true, game, 0)
+            end)
+            if inputOk then
+                Game.bossMeleeHeld = true
+                Game.bossMeleeInputMode = "VirtualInputManager"
+                Game.bossMeleePoint = point
+                return true
+            end
+
+            local userOk = pcall(function()
+                VirtualUser:CaptureController()
+                VirtualUser:Button1Down(point, camera and camera.CFrame)
+            end)
+            if userOk then
+                Game.bossMeleeHeld = true
+                Game.bossMeleeInputMode = "VirtualUser"
+                Game.bossMeleePoint = point
+                return true
+            end
+            return false
+        end
+
+        if not Game.bossMeleeHeld then
+            Game.bossMeleeInputMode = nil
+            Game.bossMeleePoint = nil
+            return true
+        end
+
+        local releasePoint = Game.bossMeleePoint or point
+        local releaseOk = false
+        if Game.bossMeleeInputMode == "ExecutorMouse" and type(mouse1release) == "function" then
+            releaseOk = pcall(mouse1release)
+        elseif Game.bossMeleeInputMode == "VirtualUser" then
+            releaseOk = pcall(function()
+                VirtualUser:Button1Up(releasePoint, camera and camera.CFrame)
+            end)
+        else
+            releaseOk = pcall(function()
+                local virtualInput = game:GetService("VirtualInputManager")
+                virtualInput:SendMouseButtonEvent(releasePoint.X, releasePoint.Y, 0, false, game, 0)
+            end)
+        end
+        Game.bossMeleeHeld = false
+        Game.bossMeleeInputMode = nil
+        Game.bossMeleePoint = nil
+        return releaseOk
+    end
+
+    -- A keyboard event or character respawn can silently interrupt a simulated
+    -- held mouse input without updating bossMeleeHeld. Periodically re-press it.
+    Game.refreshBossMeleeHold = function(force)
+        local character = LocalPlayer.Character
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        local equipped = character and character:FindFirstChildOfClass("Tool")
+        if not humanoid or humanoid.Health <= 0 or not isAxeTool(equipped)
+            or isKnockedDownScreenVisible() or Game.bossRespawnTeleportPending
+            or Game.bossPlayerDied then
+            if Game.setBossMeleeHeld then Game.setBossMeleeHeld(false) end
+            return false
+        end
+        if force or not Game.bossMeleeHeld then
+            Game.setBossMeleeHeld(false)
+            local held = Game.setBossMeleeHeld(true)
+            if held then Game.bossMeleeLastPressedAt = os.clock() end
+            return held
+        end
+        -- Keep the existing MouseButton1 hold uninterrupted until combat ends.
+        return true
+    end
+
     Game.clickAttack = function()
-        -- Use the viewport center because the camera is aimed at the target. A
-        -- hard-coded point such as (800, 400) can land on the open script menu.
+        -- Axe-only attack pulse. Do not treat pcall() success as proof that an
+        -- input reached the game: executor mouse APIs can exist yet silently do
+        -- nothing after a respawn. Try independent attack paths every pulse.
         local character = LocalPlayer.Character
         local heldTool = character and character:FindFirstChildOfClass("Tool")
-        if heldTool then
-            pcall(function() heldTool:Activate() end)
+        -- This game can equip slot-2 weapons through its own hotbar without
+        -- parenting a Roblox Tool into Character. NONE must not block clicks.
+        local heldName = heldTool and string.lower(heldTool.Name) or ""
+        local isFirearm = heldName:find("gun", 1, true) or heldName:find("rifle", 1, true)
+            or heldName:find("pistol", 1, true) or heldName:find("shotgun", 1, true)
+        if isFirearm or not Game.bossSlot2Selected then
+            if os.clock() - (Game.lastBossAttackDiagnostic or 0) > 4 then
+                Game.lastBossAttackDiagnostic = os.clock()
+                warn("[TheForest] v4.6 attack blocked: firearm or slot 2 not selected; Tool=" .. tostring(heldTool and heldTool.Name or "NONE"))
+            end
+            return false
         end
+
         local camera = workspace.CurrentCamera
         local viewport = camera and camera.ViewportSize or Vector2.new(1600, 900)
         local point = Vector2.new(math.floor(viewport.X * 0.5), math.floor(viewport.Y * 0.5))
-        local clickSucceeded = pcall(function()
+        local attempted = false
+
+        -- Tool activation works for tools that listen to Tool.Activated rather
+        -- than UserInputService mouse state. A short pulse avoids leaving the
+        -- activation held when slot keys or a teleport occur.
+        local activateOk = false
+        if heldTool then
+            activateOk = pcall(function() heldTool:Activate() end)
+            attempted = attempted or activateOk
+            task.wait(0.045)
+            pcall(function() heldTool:Deactivate() end)
+        end
+
+        -- Attempt executor click even if pcall reports success elsewhere; a
+        -- successful Lua call does not guarantee the client generated an input.
+        if type(mouse1click) == "function" then
+            local nativeOk = pcall(mouse1click)
+            attempted = attempted or nativeOk
+        end
+
+        -- VirtualUser is used on every pulse, not just when another API throws.
+        -- This fixes the previous false-positive fallback logic where pcall()
+        -- returned true even though no visible swing occurred.
+        local virtualUserOk = pcall(function()
             VirtualUser:CaptureController()
             VirtualUser:ClickButton1(point)
         end)
-        if not clickSucceeded then
-            pcall(function()
-                local virtualInput = game:GetService("VirtualInputManager")
+        attempted = attempted or virtualUserOk
+
+        -- Also send a balanced explicit down/up event. Always release in a
+        -- separate protected call so a failure cannot leave the button stuck.
+        local virtualInput = nil
+        pcall(function() virtualInput = game:GetService("VirtualInputManager") end)
+        if virtualInput then
+            local downOk = pcall(function()
                 virtualInput:SendMouseButtonEvent(point.X, point.Y, 0, true, game, 0)
-                task.wait(0.04)
+            end)
+            if downOk then task.wait(0.055) end
+            local upOk = pcall(function()
                 virtualInput:SendMouseButtonEvent(point.X, point.Y, 0, false, game, 0)
             end)
+            attempted = attempted or downOk or upOk
         end
+        if os.clock() - (Game.lastBossAttackDiagnostic or 0) > 4 then
+            Game.lastBossAttackDiagnostic = os.clock()
+            warn("[TheForest] v4.6 Axe swing attempt: equipped=" .. (heldTool and heldTool.Name or "CUSTOM HOTBAR / NO TOOL")
+                .. ", Tool:Activate=" .. tostring(activateOk)
+                .. ", inputAttempted=" .. tostring(attempted))
+        end
+        return attempted
+    end
+
+    Game.getBossHeadPosition = function(boss, boxCf, boxSize, targetRoot)
+        -- Prefer the boss's actual Head part so our hover height and aim point
+        -- are level with its head, not above the model's bounding box.
+        local head = nil
+        pcall(function()
+            local candidate = boss:FindFirstChild("Head", true)
+            if candidate and candidate:IsA("BasePart") then
+                head = candidate
+            end
+        end)
+        if head then
+            return head.Position
+        end
+
+        -- Some custom NPC rigs do not expose a part named Head. In that case,
+        -- aim near the upper quarter of the model and keep the player at that
+        -- same height as a practical fallback.
+        if boxCf and boxSize then
+            return boxCf.Position + Vector3.new(0, boxSize.Y * 0.22, 0)
+        end
+        return targetRoot and targetRoot.Position or Vector3.zero
+    end
+
+    Game.getPlayerHeadOffset = function(playerRoot)
+        -- The HumanoidRootPart sits below the player's eye/head level. Aligning
+        -- the root itself with the boss's aim point makes the player look too high.
+        -- Measure the actual head-to-root offset so the player's head/shot level
+        -- lines up with the boss point being aimed at.
+        local character = LocalPlayer.Character
+        local head = character and character:FindFirstChild("Head", true)
+        if playerRoot and head and head:IsA("BasePart") then
+            return head.Position.Y - playerRoot.Position.Y
+        end
+        return 1.5
     end
 
     Game.placeAtBossWeakpoint = function(boss, resetDirection)
@@ -1533,29 +1948,61 @@ xpcall(function()
             boxSize = targetRoot.Size
         end
 
-        -- Choose one stable world-space approach direction from the boss's
-        -- facing. Do not orbit through four sides; that was causing the erratic
-        -- motion reported during otherwise successful fights.
+        -- Choose one stable approach direction in FRONT of the boss. Roblox's
+        -- LookVector is the boss's forward-facing direction; keep the player's
+        -- approach horizontal so the avatar doesn't pitch upward toward the aim point.
         if resetDirection or not Game.bossApproachDirection then
             local look = targetRoot.CFrame.LookVector
             local horizontalLook = Vector3.new(look.X, 0, look.Z)
             if horizontalLook.Magnitude < 0.05 then
                 horizontalLook = Vector3.new(0, 0, -1)
             end
-            Game.bossApproachDirection = -horizontalLook.Unit
+            Game.bossApproachDirection = horizontalLook.Unit
         end
 
         local horizontal = Game.bossApproachDirection
-        local radius = math.clamp(math.max(boxSize.X, boxSize.Z) * 0.32, 5.5, 10)
-        -- Stay above the ground and roughly at the boss's torso level, without
-        -- jumping to the top of the model. The camera aims separately at the
-        -- upper-body point, so the player position needn't orbit around it.
-        local verticalOffset = math.clamp(boxSize.Y * 0.08, 2.5, 4.5)
-        local destination = boxCf.Position + horizontal * radius + Vector3.new(0, verticalOffset, 0)
-        local aimPoint = boxCf.Position + Vector3.new(0, math.clamp(boxSize.Y * 0.12, 2, 5), 0)
+        -- For every boss, anchor 15 studs in front near its feet,
+        -- and aim at an actual leg instead of the gap between the legs.
+        local frontDistance = 15
+        local bossFeetY = boxCf.Position.Y - boxSize.Y * 0.5
+        local character = LocalPlayer.Character
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        local rootToFeet = (humanoid and humanoid.HipHeight or 2)
+            + (playerRoot.Size.Y * 0.5)
+        -- A little clearance keeps the character from clipping into the floor.
+        local destination = Vector3.new(
+            boxCf.Position.X + horizontal.X * frontDistance,
+            bossFeetY + rootToFeet + 0.5,
+            boxCf.Position.Z + horizontal.Z * frontDistance
+        )
+        -- Aim at a lower leg/foot part when the boss rig exposes one.
+        -- Otherwise offset to the side of its lower bounding box so the
+        -- crosshair points at a leg, not through the empty gap between them.
+        local aimHeight = math.clamp(boxSize.Y * 0.19, 1.5, 5)
+        local aimPoint = boxCf.Position
+            - Vector3.new(0, boxSize.Y * 0.5 - aimHeight, 0)
+            - boxCf.RightVector * (boxSize.X * 0.22)
+        local legPart = nil
+        pcall(function()
+            for _, part in ipairs(boss:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    local partName = part.Name:lower():gsub("[%s_%-]", "")
+                    if partName:find("lowerleg", 1, true)
+                        or partName:find("leftleg", 1, true)
+                        or partName:find("leftfoot", 1, true)
+                        or partName:find("rightleg", 1, true)
+                        or partName:find("rightfoot", 1, true) then
+                        legPart = part
+                        break
+                    end
+                end
+            end
+        end)
+        if legPart then
+            aimPoint = legPart.Position
+        end
+        local flatFacingPoint = Vector3.new(aimPoint.X, destination.Y, aimPoint.Z)
 
-        -- Anchor the character root at the selected position for a stable firing
-        -- platform. Remember its original state so every normal exit restores it.
         if Game.bossAnchoredRoot ~= playerRoot then
             Game.bossAnchoredRoot = playerRoot
             Game.bossRootWasAnchored = playerRoot.Anchored
@@ -1564,184 +2011,237 @@ xpcall(function()
             playerRoot.AssemblyLinearVelocity = Vector3.zero
             playerRoot.AssemblyAngularVelocity = Vector3.zero
             playerRoot.Anchored = true
-            playerRoot.CFrame = CFrame.lookAt(destination, aimPoint)
+            playerRoot.CFrame = CFrame.lookAt(destination, flatFacingPoint)
         end)
 
         Game.bossAimPoint = aimPoint
         Game.bossLockedBossPosition = targetRoot.Position
+        -- Save a safe position just in front of the boss so the player returns
+        -- to the encounter area without spawning inside the boss model.
+        Game.bossReturnPosition = Vector3.new(
+            targetRoot.Position.X + horizontal.X * (frontDistance + 2.5),
+            targetRoot.Position.Y + 3,
+            targetRoot.Position.Z + horizontal.Z * (frontDistance + 2.5)
+        )
         Game.bossNextRepositionAt = os.clock() + 0.8
         Game.aimCameraAt(aimPoint)
         return true
     end
 
-    -- Simulate the game's ordinary hotbar keys rather than searching Backpack
-    -- for a Tool instance; in this game slot 5 is the gun and slot 2 is the axe.
+    -- Boss gun uses slot 5; outside boss fights the Axe remains in slot 2.
     Game.pressWeaponSlot = function(slot)
+        slot = slot or 2
         local keyCode = slot == 5 and Enum.KeyCode.Five or Enum.KeyCode.Two
+        local vk = slot == 5 and 0x35 or 0x32
         local ok = pcall(function()
             local virtualInput = game:GetService("VirtualInputManager")
             virtualInput:SendKeyEvent(true, keyCode, false, game)
             task.wait(0.06)
             virtualInput:SendKeyEvent(false, keyCode, false, game)
         end)
-        if not ok then
-            local keyNumber = slot == 5 and 0x35 or 0x32
-            if type(keypress) == "function" and type(keyrelease) == "function" then
-                ok = pcall(function()
-                    keypress(keyNumber)
-                    task.wait(0.06)
-                    keyrelease(keyNumber)
-                end)
-            end
+        if not ok and type(keypress) == "function" and type(keyrelease) == "function" then
+            ok = pcall(function()
+                keypress(vk)
+                task.wait(0.06)
+                keyrelease(vk)
+            end)
         end
-        if not ok then
-            warn("[TheForest] Could not send hotbar key " .. tostring(slot) .. "; check whether the executor supports keyboard input.")
-        end
+        if not ok then warn("[TheForest] Could not send hotbar slot " .. tostring(slot)) end
         return ok
     end
 
-    -- Keep the left mouse button held down through the boss encounter. The
-    -- matching release is performed on every exit path from runBossEncounter.
-    Game.setAttackMouseDown = function(isDown)
+    -- Gun combat doesn't require a Roblox Tool instance: this game's custom
+    -- hotbar may equip the gun without parenting a Tool to the character.
+    -- Boss gun is a custom hotbar item; do not require a Roblox Tool instance.
+    -- Keep left mouse DOWN until the encounter ends or the player is downed.
+    Game.setBossGunHeld = function(shouldHold)
         local camera = workspace.CurrentCamera
         local viewport = camera and camera.ViewportSize or Vector2.new(1600, 900)
-        local point = Vector2.new(math.floor(viewport.X * 0.5), math.floor(viewport.Y * 0.5))
-        local ok = pcall(function()
-            local virtualInput = game:GetService("VirtualInputManager")
-            virtualInput:SendMouseButtonEvent(point.X, point.Y, 0, isDown, game, 0)
-        end)
-        if not ok then
-            pcall(function()
+        local point = Game.bossGunHoldPoint or Vector2.new(
+            math.floor(viewport.X * 0.5), math.floor(viewport.Y * 0.5)
+        )
+        if shouldHold then
+            local character = LocalPlayer.Character
+            local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+            if not humanoid or humanoid.Health <= 0 or isKnockedDownScreenVisible()
+                or Game.bossPlayerDied or Game.bossRespawnTeleportPending then
+                return false
+            end
+            if Game.bossGunHeld then return true end
+            local mode = nil
+            if type(mouse1press) == "function" and pcall(mouse1press) then
+                mode = "ExecutorMouse"
+            elseif pcall(function()
+                game:GetService("VirtualInputManager"):SendMouseButtonEvent(point.X, point.Y, 0, true, game, 0)
+            end) then
+                mode = "VirtualInputManager"
+            elseif pcall(function()
                 VirtualUser:CaptureController()
-                if isDown then
-                    VirtualUser:Button1Down(point, camera and camera.CFrame or CFrame.new())
-                else
-                    VirtualUser:Button1Up(point, camera and camera.CFrame or CFrame.new())
-                end
+                VirtualUser:Button1Down(point, camera and camera.CFrame)
+            end) then
+                mode = "VirtualUser"
+            end
+            if not mode then return false end
+            Game.bossGunHeld = true
+            Game.bossGunHoldMode = mode
+            Game.bossGunHoldPoint = point
+            warn("[TheForest] v5.0 gun trigger held via " .. mode)
+            return true
+        end
+        if not Game.bossGunHeld then return true end
+        local mode = Game.bossGunHoldMode
+        local releasePoint = Game.bossGunHoldPoint or point
+        local ok = false
+        if mode == "ExecutorMouse" and type(mouse1release) == "function" then
+            ok = pcall(mouse1release)
+        elseif mode == "VirtualUser" then
+            ok = pcall(function()
+                VirtualUser:Button1Up(releasePoint, camera and camera.CFrame)
+            end)
+        else
+            ok = pcall(function()
+                game:GetService("VirtualInputManager"):SendMouseButtonEvent(releasePoint.X, releasePoint.Y, 0, false, game, 0)
             end)
         end
+        Game.bossGunHeld = false
+        Game.bossGunHoldMode = nil
+        Game.bossGunHoldPoint = nil
         return ok
     end
 
     local function runBossEncounter(boss, areaKey)
+        -- Clear stale Axe hold before selecting gun (gun hold begins after slot 5).
+        if Game.setBossMeleeHeld and not Game.bossRecoveryActive and not Game.bossRecoveryAttackRunning then
+            pcall(Game.setBossMeleeHeld, false)
+        end
         local bossName = boss and boss.Name or Game.areaBossName or "Boss"
-        Game.status = "Fighting " .. tostring(bossName) .. " with Gun"
-        notify("Boss encounter started: " .. tostring(bossName) .. "; selecting slot 5 and locking behind the boss.")
+        Game.status = "Boss: gun attack (15 studs in front, aiming at legs)"
+        notify("Boss encounter started: " .. tostring(bossName) .. "; selecting gun in slot 5 and hovering 15 studs in front and aiming at the legs.")
+        warn("[TheForest] Boss gun combat enabled: anchored 15 studs in front near feet level, aiming at legs.")
 
         local lastMissingTargetWarning = 0
-        local bossMissingSince = nil
         local bossBarMissingSince = nil
+        local nextKnockdownCheckAt = 0
         local outcome = "stopped"
         Game.bossApproachDirection = nil
         Game.bossLockedBossPosition = nil
         Game.bossNextRepositionAt = 0
+        Game.bossPlayerDied = false
+        Game.bossRespawnTeleportPending = false
+        Game.bossReturnPosition = nil
+        local openingBossRoot = modelRootPart(boss)
+        if openingBossRoot then
+            local look = openingBossRoot.CFrame.LookVector
+            local horizontal = Vector3.new(look.X, 0, look.Z)
+            if horizontal.Magnitude < 0.05 then horizontal = Vector3.new(0, 0, -1) end
+            horizontal = horizontal.Unit
+            Game.bossLockedBossPosition = openingBossRoot.Position
+            Game.bossReturnPosition = openingBossRoot.Position + horizontal * 8 + Vector3.new(0, 3, 0)
+        end
+        Game.bossEncounterActive = true
+        startBossDownedWatcher()
         Game.bossAnchoredRoot = nil
         Game.bossRootWasAnchored = nil
         local previousWindowVisible = Game.overlayWindow and Game.overlayWindow.Visible
         if Game.overlayWindow then
             Game.overlayWindow.Visible = false
         end
+        -- One gun selection per boss encounter; no hotbar presses in the attack loop.
+        Game.bossSlot2Tool = nil
+        Game.bossSlot2Selected = false
+        if Game.setBossGunHeld then pcall(Game.setBossGunHeld, false) end
         Game.pressWeaponSlot(5)
         task.wait(0.15)
-        -- Wait for a visible top boss bar and a matching model before firing.
-        Game.setAttackMouseDown(false)
+        if Game.setBossGunHeld then pcall(Game.setBossGunHeld, true) end
+        -- Hold trigger through encounter; boss tracking continues while held.
 
+        warn("[TheForest] v4.6 entering boss attack loop: area=" .. tostring(areaKey))
         local loopOk, loopErr = pcall(function()
             while not unloaded and Flags.AutoChop and Game.areaCompleteKey == areaKey do
+                if os.clock() >= nextKnockdownCheckAt then
+                    nextKnockdownCheckAt = os.clock() + 0.22
+                    if isKnockedDownScreenVisible() then
+                        markBossPlayerDowned("KNOCKED DOWN / waking at the cabin HUD")
+                    end
+                end
+                if Game.bossPlayerDied or Game.bossRespawnTeleportPending then
+                    outcome = "player-died"
+                    break
+                end
                 local currentState = readAreaHudState()
-                if currentState.key ~= areaKey
-                    or (currentState.percent ~= nil and currentState.percent < 99.9) then
+                if currentState.key ~= areaKey and not Game.bossRecoveryActive then
                     outcome = "area-changed"
                     break
                 end
 
-                -- The top health bar is authoritative. Release fire immediately
-                -- whenever it disappears; don't keep shooting/teleporting at a
-                -- stale model, nameplate, stump, or building.
-                if not currentState.bossBarPresent or not currentState.bossName then
-                    Game.setAttackMouseDown(false)
+                -- v4.1: A boss model was verified before entering this encounter.
+                -- A temporary loss of the top HUD bar must not suppress all attacks.
+                -- Only use the already-locked living boss (or re-find that same boss).
+                local hudHasBoss = currentState.bossBarPresent and currentState.bossName ~= nil
+                if hudHasBoss and currentState.bossHealth ~= nil and currentState.bossHealth <= 0 then
+                    outcome = "defeated"
+                    break
+                end
+                local requestedBossName = hudHasBoss and currentState.bossName or bossName
+                local liveBoss = nil
+                if boss and boss.Parent and modelRootPart(boss) then
+                    liveBoss = boss
+                else
+                    liveBoss = findActiveBoss(requestedBossName)
+                end
+                if not hudHasBoss and os.clock() - (Game.lastBossAttackDiagnostic or 0) > 4 then
+                    Game.lastBossAttackDiagnostic = os.clock()
+                    warn("[TheForest] v4.6 HUD bar temporarily unavailable; locked boss="
+                        .. tostring(bossName) .. "; model=" .. tostring(liveBoss and liveBoss.Name or "NONE")
+                        .. "; continuing only if locked boss model is alive")
+                end
+                if not liveBoss then
                     bossBarMissingSince = bossBarMissingSince or os.clock()
-                    if os.clock() - bossBarMissingSince >= 1.8 then
-                        local stillTracked = findActiveBoss(Game.areaBossName or bossName)
-                        local trackedHp = stillTracked and modelHealth(stillTracked) or nil
-                        if not stillTracked or (trackedHp ~= nil and trackedHp <= 0) then
-                            outcome = "defeated"
-                        else
-                            outcome = "boss-bar-lost"
-                        end
+                    if os.clock() - bossBarMissingSince >= 2.5 then
+                        outcome = "boss-target-missing"
                         break
                     end
                     task.wait(0.12)
                 else
                     bossBarMissingSince = nil
-                    Game.areaBossName = currentState.bossName
-                    if currentState.bossHealth ~= nil and currentState.bossHealth <= 0 then
-                        Game.setAttackMouseDown(false)
-                        outcome = "defeated"
-                        break
-                    end
-
-                    local liveBoss = findActiveBoss(currentState.bossName)
-                    if not liveBoss then
-                        Game.setAttackMouseDown(false)
-                        bossMissingSince = bossMissingSince or os.clock()
-                        if os.clock() - bossMissingSince >= 1.8 then
-                            outcome = "boss-target-missing"
-                            break
-                        end
-                        task.wait(0.12)
-                    else
-                        bossMissingSince = nil
-                        boss = liveBoss
-                        bossName = currentState.bossName
+                    if hudHasBoss then Game.areaBossName = currentState.bossName end
+                    boss = liveBoss
+                        bossName = requestedBossName
                         local hp = modelHealth(boss)
                         if hp ~= nil and hp <= 0 then
-                            Game.setAttackMouseDown(false)
                             outcome = "defeated"
                             break
                         end
                         local _, root = getRoot()
                         local targetRoot = modelRootPart(boss)
                         if not root or not targetRoot then
-                            Game.setAttackMouseDown(false)
+                            if Game.setBossMeleeHeld then pcall(Game.setBossMeleeHeld, false) end
                             if os.clock() - lastMissingTargetWarning > 3 then
                                 lastMissingTargetWarning = os.clock()
-                                warn("[TheForest] Boss bar is visible, but its matching world model/root could not be found. Firing is paused to avoid attacking unrelated objects.")
+                                warn("[TheForest] Boss locked but a live character root or boss model root could not be found. Axe attacks are paused to avoid attacking unrelated objects.")
                             end
                             task.wait(0.15)
                         else
-                            -- Hold fire only while both the live bar and the
-                            -- corresponding model are present in the current scan.
-                            -- Lock behind the boss once, then only reposition if
-                            -- it has moved several studs; aim is refreshed each tick.
-                            Game.setAttackMouseDown(true)
-                            local bossDisplacement = Game.bossLockedBossPosition
-                                and (targetRoot.Position - Game.bossLockedBossPosition).Magnitude
-                                or math.huge
-                            if not Game.bossLockedBossPosition
-                                or (bossDisplacement >= 5 and os.clock() >= (Game.bossNextRepositionAt or 0)) then
-                                Game.placeAtBossWeakpoint(boss, false)
-                            else
-                                local currentAimPoint = targetRoot.Position
-                                local boundsOk, currentBoxCf, currentBoxSize = pcall(function()
-                                    local cf, size = boss:GetBoundingBox()
-                                    return cf, size
-                                end)
-                                if boundsOk and currentBoxCf and currentBoxSize then
-                                    currentAimPoint = currentBoxCf.Position
-                                        + Vector3.new(0, math.clamp(currentBoxSize.Y * 0.12, 2, 5), 0)
-                                end
-                                Game.bossAimPoint = currentAimPoint
-                                Game.aimCameraAt(currentAimPoint)
+                            -- Follow the boss at feet level, aim at a leg, and fire the gun.
+                            -- Never re-press slot 5 while attacking.
+                            Game.placeAtBossWeakpoint(boss, false)
+                            -- Keep the gun trigger down; no clicks or mouse-up between frames.
+                            if Game.setBossGunHeld then pcall(Game.setBossGunHeld, true) end
+                            if Game.bossRecoveryActive then
+                                Game.bossRecoveryActive = false
+                                notify("Gun trigger held again after returning to the boss area.")
                             end
+                            Game.status = "Boss: firing gun at legs"
                             task.wait(0.08)
                         end
-                    end
                 end
             end
         end)
 
-        Game.setAttackMouseDown(false)
+        if Game.setBossGunHeld then pcall(Game.setBossGunHeld, false) end
+        if Game.setBossMeleeHeld then
+            pcall(Game.setBossMeleeHeld, false)
+        end
         if Game.bossAnchoredRoot and Game.bossAnchoredRoot.Parent then
             pcall(function()
                 Game.bossAnchoredRoot.AssemblyLinearVelocity = Vector3.zero
@@ -1751,6 +2251,7 @@ xpcall(function()
         end
         Game.bossAnchoredRoot = nil
         Game.bossRootWasAnchored = nil
+        Game.bossEncounterActive = false
         Game.bossApproachDirection = nil
         Game.bossLockedBossPosition = nil
         Game.bossNextRepositionAt = 0
@@ -1761,10 +2262,13 @@ xpcall(function()
             warn("[TheForest] Boss attack loop stopped safely: " .. tostring(loopErr))
             return "stopped"
         end
+        if outcome == "defeated" or outcome == "area-changed" then
+            Game.bossRecoveryActive = false
+        end
         if outcome == "defeated" then
             Game.pressWeaponSlot(2)
-            task.wait(0.12)
-            notify(tostring(bossName) .. " defeated; released fire and switched back to Axe (slot 2).")
+            Game.bossSlot2Selected = true
+            notify(tostring(bossName) .. " defeated; switched to Axe (slot 2).")
         end
         return outcome
     end
@@ -1980,6 +2484,7 @@ xpcall(function()
 
             if Game.currentAreaKey ~= areaKey then
                 Game.currentAreaKey = areaKey
+                Game.bossRecoveryActive = false
                 Game.areaCompleteKey = nil
                 Game.areaCompletedAt = nil
                 Game.bossDefeatedKey = nil
@@ -2016,8 +2521,13 @@ xpcall(function()
                     Game.lastBossNotice = nil
                     Game.bossSearchWarningShown = false
                     notify(zoneLabel(Flags.Zone) .. " reached " .. tostring(rounded) .. "% cleared. Auto Chop paused for the boss encounter.")
-                elseif areaState.percent < 99.9 and Game.areaCompleteKey == areaKey then
-                    -- The area progress reset, or a new clear cycle began.
+                elseif areaState.percent < 99.9 and Game.areaCompleteKey == areaKey
+                    and not Game.bossRecoveryActive
+                    and not Game.bossRespawnTeleportPending
+                    and not Game.bossPlayerDied then
+                    -- The area progress reset, or a new clear cycle began. During
+                    -- post-knockdown recovery keep this latched until the boss has
+                    -- actually been reacquired and an Axe attack has resumed.
                     Game.areaCompleteKey = nil
                     Game.areaCompletedAt = nil
                     Game.bossDefeatedKey = nil
@@ -2030,6 +2540,11 @@ xpcall(function()
             -- Once this area's HUD reaches 100%, pause tree chopping and wait for
             -- the boss named by the HUD. After its defeat, remain paused until the
             -- progress resets or the AREA n/total marker changes.
+            if Game.bossRespawnTeleportPending then
+                Game.status = "Knocked down; waiting to return to the boss area"
+                return
+            end
+
             if Game.areaCompleteKey == areaKey then
                 if Game.bossDefeatedKey == areaKey then
                     Game.status = Game.zoneAdvancePending
@@ -2058,7 +2573,7 @@ xpcall(function()
                         Game.lastBossNotice = boss
                         local targetRoot = modelRootPart(boss)
                         local where = targetRoot and string.format(" (target %.1f, %.1f, %.1f)", targetRoot.Position.X, targetRoot.Position.Y, targetRoot.Position.Z) or ""
-                        notify("Boss target locked: " .. tostring(boss.Name) .. where .. ". Starting gun encounter (slot 5).")
+                        notify("Boss target locked: " .. tostring(boss.Name) .. where .. ". Starting Axe encounter (slot 2).")
                         warn("[TheForest] Boss target locked to model '" .. tostring(boss.Name) .. "'" .. where)
                     end
                     local outcome = runBossEncounter(boss, areaKey)
@@ -2074,14 +2589,19 @@ xpcall(function()
                         end
                     elseif outcome == "area-changed" then
                         Game.cachedBoss = nil
+                    elseif outcome == "player-died" then
+                        Game.cachedBoss = nil
+                        Game.lastBossNotice = nil
+                        Game.status = "Respawned after boss death; returning to boss area"
+                        notify("Died during boss fight. Returning to the boss area and waiting for it to respawn.")
                     elseif outcome == "boss-bar-lost" then
                         Game.cachedBoss = nil
-                        Game.status = "Boss bar missing; firing stopped, waiting for bar"
-                        warn("[TheForest] Boss health bar disappeared from the top HUD; released fire and paused boss targeting.")
+                        Game.status = "Boss bar missing; Axe attacks paused, waiting for bar"
+                        warn("[TheForest] Boss health bar disappeared from the top HUD; paused Axe attacks and boss targeting.")
                     elseif outcome == "boss-target-missing" then
                         Game.cachedBoss = nil
                         Game.status = "Boss bar visible, but matching world model not found"
-                        warn("[TheForest] Boss bar is visible but no matching boss rig was found. Firing stayed released to avoid targeting unrelated objects.")
+                        warn("[TheForest] Boss bar is visible but no matching boss rig was found. Axe attacks stayed paused to avoid hitting unrelated objects.")
                     elseif outcome == "stopped" then
                         Game.status = "Boss encounter paused"
                     end
@@ -2238,6 +2758,13 @@ xpcall(function()
             if ok and type(result) == "table" and result.Ok then
                 Game.bought += 1
                 notify("Bought " .. tostring(def.DisplayName or name))
+                if name == "Axe" then
+                    task.wait(0.25)
+                    if Game.pressWeaponSlot then
+                        Game.pressWeaponSlot(2)
+                    end
+                    notify("Axe bought; pressed slot 2 to equip it.")
+                end
                 return true
             end
             return false
@@ -2341,6 +2868,18 @@ xpcall(function()
     local function stepBuyer()
         if Game.busy or unloaded then 
             return 
+        end
+
+        -- Axe is the mandatory first purchase. Do not spend on upgrades or
+        -- any other shop items until the player owns it. This intentionally
+        -- runs even when AutoTools is off, as long as the buyer worker is active.
+        if not toolOwned("Axe") then
+            Game.status = "Axe required first — waiting to buy Axe"
+            local boughtAxe = tryBuyTool("Axe")
+            if boughtAxe then
+                notify("Axe purchased; other purchases are unlocked.")
+            end
+            return
         end
         
         if Flags.AutoTools then
@@ -3203,6 +3742,14 @@ xpcall(function()
                     end
                 end
             end)
+            bind(humanoid.Died, function()
+                if Game.bossEncounterActive and Game.bossReturnPosition then
+                    markBossPlayerDowned("Humanoid.Died")
+                end
+            end)
+        end
+        if Game.bossRespawnTeleportPending and Game.bossReturnPosition then
+            startBossReturnMonitor()
         end
     end
 
@@ -3381,7 +3928,7 @@ xpcall(function()
     new("UIStroke", { Color = Theme.accent }, toggleBtn)
 
     window = new("Frame", {
-        Size = UDim2.new(0, 700, 0, 520), Position = UDim2.new(0.5, -350, 0.5, -260),
+        Size = UDim2.new(0, 700, 0, 560), Position = UDim2.new(0.5, -350, 0.5, -280),
         BackgroundColor3 = Theme.bg, BorderSizePixel = 0, ClipsDescendants = true,
     }, screenGui)
     Game.overlayWindow = window
@@ -3391,7 +3938,7 @@ xpcall(function()
     local titleBar = new("Frame", { Size = UDim2.new(1, 0, 0, 46), BackgroundColor3 = Theme.panel, BorderSizePixel = 0 }, window)
     new("TextLabel", {
         Position = UDim2.new(0, 16, 0, 0), Size = UDim2.new(0, 300, 1, 0), BackgroundTransparency = 1,
-        Text = "THE FOREST   ·   " .. SCRIPT_VERSION, Font = FONT_BOLD, TextSize = 13, TextColor3 = Theme.text,
+        Text = "CHOP A FOREST   ·   " .. SCRIPT_VERSION, Font = FONT_BOLD, TextSize = 13, TextColor3 = Theme.text,
         TextXAlignment = Enum.TextXAlignment.Left,
     }, titleBar)
     local closeBtn = new("TextButton", {
@@ -4070,43 +4617,76 @@ xpcall(function()
     local isDragging = false
     local dragStart: Vector2? = nil
     local dragStartPos: Vector2? = nil
+    local activeDragTouch: InputObject? = nil
+
+    local function stopDragging(): ()
+        isDragging = false
+        dragStart = nil
+        dragStartPos = nil
+        activeDragTouch = nil
+    end
 
     local function ensureOnScreen(): ()
-        if not window.Visible or isDragging then 
-            return 
+        if not window.Visible or isDragging then
+            return
         end
         local abs = window.AbsolutePosition
         local cx, cy = clampOffsets(abs.X, abs.Y)
         if math.abs(cx - abs.X) > 0.5 or math.abs(cy - abs.Y) > 0.5 then
-            window.Position = UDim2.new(0, cx, 0, cy)
+            window.Position = UDim2.fromOffset(cx, cy)
         end
     end
 
     titleBar.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            local abs = window.AbsolutePosition
-            window.Position = UDim2.new(0, abs.X, 0, abs.Y)
-            dragStart = Vector2.new(input.Position.X, input.Position.Y)
-            dragStartPos = Vector2.new(window.Position.X.Offset, window.Position.Y.Offset)
-            isDragging = true
-            input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then 
-                    isDragging = false 
-                    dragStart = nil 
-                    dragStartPos = nil 
-                end
-            end)
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1
+            and input.UserInputType ~= Enum.UserInputType.Touch then
+            return
         end
+
+        -- Ignore a press over the close button; it should close the window,
+        -- not start a drag. Capture the absolute window position BEFORE
+        -- converting away from the centered scale-based initial position.
+        local pointer = Vector2.new(input.Position.X, input.Position.Y)
+        local closePos = closeBtn.AbsolutePosition
+        local closeSize = closeBtn.AbsoluteSize
+        local overClose = pointer.X >= closePos.X and pointer.X <= closePos.X + closeSize.X
+            and pointer.Y >= closePos.Y and pointer.Y <= closePos.Y + closeSize.Y
+        if overClose then
+            return
+        end
+
+        local abs = window.AbsolutePosition
+        dragStart = pointer
+        dragStartPos = Vector2.new(abs.X, abs.Y)
+        activeDragTouch = input.UserInputType == Enum.UserInputType.Touch and input or nil
+        window.Position = UDim2.fromOffset(abs.X, abs.Y)
+        isDragging = true
     end)
 
     bind(UserInputService.InputChanged, function(input)
-        if not isDragging or not dragStart or not dragStartPos then 
-            return 
+        if not isDragging or not dragStart or not dragStartPos then
+            return
         end
-        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
-            local delta = Vector2.new(input.Position.X, input.Position.Y) - dragStart
-            local x, y = clampOffsets(dragStartPos.X + delta.X, dragStartPos.Y + delta.Y)
-            window.Position = UDim2.new(0, x, 0, y)
+
+        local isMouseMove = input.UserInputType == Enum.UserInputType.MouseMovement
+        local isActiveTouchMove = activeDragTouch ~= nil and input == activeDragTouch
+        if not isMouseMove and not isActiveTouchMove then
+            return
+        end
+
+        local pointer = Vector2.new(input.Position.X, input.Position.Y)
+        local delta = pointer - dragStart
+        local x, y = clampOffsets(dragStartPos.X + delta.X, dragStartPos.Y + delta.Y)
+        window.Position = UDim2.fromOffset(x, y)
+    end)
+
+    bind(UserInputService.InputEnded, function(input)
+        if not isDragging then
+            return
+        end
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or (activeDragTouch ~= nil and input == activeDragTouch) then
+            stopDragging()
         end
     end)
 
@@ -4209,12 +4789,9 @@ xpcall(function()
         end
 
         unloaded = true
-        -- If the script is unloaded during a boss fight, release the held fire
-        -- input and undo the temporary player-root anchor immediately.
+        -- If the script is unloaded during a boss fight, undo the temporary
+        -- player-root anchor immediately. Boss combat holds the gun trigger.
         pcall(function()
-            if Game.setAttackMouseDown then
-                Game.setAttackMouseDown(false)
-            end
             if Game.bossAnchoredRoot and Game.bossAnchoredRoot.Parent then
                 Game.bossAnchoredRoot.AssemblyLinearVelocity = Vector3.zero
                 Game.bossAnchoredRoot.AssemblyAngularVelocity = Vector3.zero
@@ -4223,6 +4800,7 @@ xpcall(function()
         end)
         Game.bossAnchoredRoot = nil
         Game.bossRootWasAnchored = nil
+        if Game.setBossGunHeld then pcall(Game.setBossGunHeld, false) end
         stopAllFeatures()
         for _, c in ipairs(connections) do
             pcall(function()
