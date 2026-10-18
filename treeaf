@@ -11,7 +11,7 @@ do
     end
 end
 
-local SCRIPT_VERSION = "v2.5"
+local SCRIPT_VERSION = "v2.6"
 local GAME_NAME = "Deforestation"
 local GAME_KEY = "TheForest"
 local DISCORD_INVITE = "https://discord.gg/synapsex"
@@ -1003,8 +1003,6 @@ end
 -- user's screenshot is a fallback, not a guarantee of where the NPC is.
 local BUSINESSMAN_FALLBACK = Vector3.new(330.1, 3.2, 181.9)
 local finalNpcScanAt = 0
-local finalLastButton = nil
-local finalLastButtonAt = 0
 
 local function visibleFinalGui(node)
     if not node or not node:IsA("GuiObject") then return false end
@@ -1105,7 +1103,11 @@ local function pressFinalInteract()
         input:SendKeyEvent(false, Enum.KeyCode.E, false, game)
     end)
     if not ok and type(keypress) == "function" and type(keyrelease) == "function" then
-        pcall(function() keypress(0x45) task.wait(0.08) keyrelease(0x45) end)
+        pcall(function()
+            keypress(0x45)
+            task.wait(0.08)
+            keyrelease(0x45)
+        end)
     end
 end
 
@@ -2729,6 +2731,11 @@ local function unloadScript()
     end
 end
 
+-- Keep GUI locals inside a separate function scope. The old monolithic
+-- top-level chunk exceeded Luau's 200-register local limit near its end.
+-- Existing gameplay helpers remain captured as upvalues; behavior is unchanged.
+local function initializeGUI()
+
 -- GUI library loaded from the requested GitHub source.
 local UI_SOURCE_URL = "https://raw.githubusercontent.com/meowmerp/bbbb/main/gui"
 local function loadGuiLibrary()
@@ -3346,3 +3353,6 @@ end
 if readFlag("HideUIOnStart", false) == true then
     Window:Toggle(false)
 end
+
+end -- initializeGUI
+initializeGUI()
