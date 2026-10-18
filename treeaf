@@ -1,8 +1,17 @@
-if not game:IsLoaded() then
-    game.Loaded:Wait()
+-- Safe game-ready gate with an explicit failure message for executor compatibility.
+do
+    local ok, loaded = pcall(function() return game:IsLoaded() end)
+    if not ok then
+        warn("[Deforestation] Startup: game:IsLoaded() failed: " .. tostring(loaded))
+    elseif not loaded then
+        local waitOk, waitErr = pcall(function() game.Loaded:Wait() end)
+        if not waitOk then
+            warn("[Deforestation] Startup: game.Loaded:Wait() failed: " .. tostring(waitErr))
+        end
+    end
 end
 
-local SCRIPT_VERSION = "v2.4"
+local SCRIPT_VERSION = "v2.5"
 local GAME_NAME = "Deforestation"
 local GAME_KEY = "TheForest"
 local DISCORD_INVITE = "https://discord.gg/synapsex"
@@ -2726,24 +2735,38 @@ local function loadGuiLibrary()
     if type(loadstring) ~= "function" then
         error("GUI loader requires loadstring", 0)
     end
+    print("[Deforestation] Startup: downloading GUI library")
     local source = game:HttpGet(UI_SOURCE_URL)
     if type(source) ~= "string" or source == "" then
         error("GUI library download returned empty content", 0)
     end
+    print("[Deforestation] Startup: compiling GUI library (" .. tostring(#source) .. " bytes)")
     local compiled, compileError = loadstring(source, "=DeforestationGUI")
     if not compiled then
         error("GUI library compilation failed: " .. tostring(compileError), 0)
     end
-    return compiled()
+    print("[Deforestation] Startup: executing GUI library")
+    local runOk, result = xpcall(compiled, function(err)
+        local trace = (debug and type(debug.traceback) == "function")
+            and debug.traceback(tostring(err), 2) or tostring(err)
+        return trace
+    end)
+    if not runOk then
+        error("Downloaded GUI library failed while executing: " .. tostring(result), 0)
+    end
+    return result
 end
 
-local okLibrary, libraryOrErr = pcall(function()
-    return loadGuiLibrary()
+local okLibrary, libraryOrErr = xpcall(loadGuiLibrary, function(err)
+    local trace = (debug and type(debug.traceback) == "function")
+        and debug.traceback(tostring(err), 2) or tostring(err)
+    return trace
 end)
 if not okLibrary or type(libraryOrErr) ~= "table" then
-    error("failed to load UI library: " .. tostring(libraryOrErr), 0)
+    error("[Deforestation] GUI startup failed: " .. tostring(libraryOrErr), 0)
 end
 Library = libraryOrErr
+print("[Deforestation] Startup: GUI loaded successfully")
 
 track(LocalPlayer.CharacterAdded:Connect(bindCharacter))
 if LobbyRemotes then
