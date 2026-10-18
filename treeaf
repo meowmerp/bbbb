@@ -2,7 +2,7 @@ if not game:IsLoaded() then
     game.Loaded:Wait()
 end
 
-local SCRIPT_VERSION = "v2.1"
+local SCRIPT_VERSION = "v2.2"
 local GAME_NAME = "Deforestation"
 local GAME_KEY = "TheForest"
 local DISCORD_INVITE = "https://discord.gg/synapsex"
@@ -125,6 +125,13 @@ local Game = {
     treeSearchStep = 0,
     treeSearchNextAt = 0,
     treeSearchLastArea = nil,
+    finalSequence = false,
+    finalDone = false,
+    finalStage = nil,
+    finalStartedAt = nil,
+    finalNextAction = 0,
+    finalTalkAttempts = 0,
+    finalTarget = nil,
 }
 local WORKER_STEPS
 
@@ -219,7 +226,7 @@ local function startWorker(key, interval, step)
     workers[key] = true
     task.spawn(function()
         while workers[key] and not unloaded do
-            if Game.bossPhase and BOSS_PAUSED_WORKERS[key] then
+            if (Game.bossPhase or Game.finalSequence) and BOSS_PAUSED_WORKERS[key] then
                 task.wait(interval)
                 continue
             end
@@ -745,7 +752,7 @@ local bossLastPosition = 0
 local bossNextAttack = 0
 local bossCombatRunning = false
 local function bossCombatStep()
-    if unloaded or not Flags.AutoChop or not Game.bossPhase or Game.bossDefeated then return end
+    if unloaded or not Flags.AutoChop or not Game.bossPhase or Game.bossDefeated or Game.finalSequence then return end
     if bossCombatRunning then return end
     bossCombatRunning = true
     local ok, err = pcall(function()
@@ -811,6 +818,7 @@ local function monitorBossAndAdvance()
         if currentArea then Game.sellAreaNumber = currentArea end
     end
     if not Flags.AutoChop then return end
+    if Game.finalSequence then return end
     -- A disappearing area label during the defeat animation is not a new area.
     local areaKey = tostring(zone) .. "|" .. tostring(state.marker or (Game.bossPhase and Game.bossAreaMarker) or "")
     if Game.bossAreaKey ~= areaKey then
@@ -860,6 +868,19 @@ local function monitorBossAndAdvance()
         end
         return
     end
+    -- The last boss ends the forest run; finish at the Businessman instead
+    -- of trying to advance beyond Golden Aspens.
+    if zone == "GoldenAspens" or Game.bossAreaMarker == "8/8" or state.marker == "8/8" then
+        if not Game.finalSequence then
+            Game.finalSequence = true
+            Game.finalStartedAt = os.clock()
+            Game.finalStage = "FindBusinessman"
+            Game.finalNextAction = 0
+            Game.status = "Final boss defeated; visiting Businessman"
+            print("[Deforestation] Golden Aspens boss defeated; starting final interaction")
+        end
+        return
+    end
     if not Flags.AutoAdvanceZone then
         Game.status = "Boss defeated; auto advance disabled"
         return
@@ -895,6 +916,204 @@ local function monitorBossAndAdvance()
         end
     end
     Game.status = "Boss defeated; waiting for next zone unlock"
+end
+
+-- Final Golden Aspens interaction.  The businessman position shown in the
+-- user's screenshot is a fallback, not a guarantee of where the NPC is.
+local BUSINESSMAN_FALLBACK = Vector3.new(330.1, 3.2, 181.9)
+local finalNpcScanAt = 0
+local finalLastButton = nil
+local finalLastButtonAt = 0
+
+local function visibleFinalGui(node)
+    if not node or not node:IsA("GuiObject") then return false end
+    local current = node
+    while current do
+        if current:IsA("GuiObject") and not current.Visible then return false end
+        if current:IsA("ScreenGui") and not current.Enabled then return false end
+        current = current.Parent
+    end
+    return true
+end
+
+local function finalGuiState()
+    local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local state = {won = false, returnButton = nil, dialogueVisible = false, nextButton = nil}
+    if not gui then return state end
+    local labels = {}
+    local buttons = {}
+    for _, node in ipairs(gui:GetDescendants()) do
+        if (node:IsA("TextLabel") or node:IsA("TextButton")) and visibleFinalGui(node) then
+            local content = tostring(node.Text or ""):lower():gsub("<[^>]->", "")
+            table.insert(labels, content)
+            if node:IsA("TextButton") then
+                table.insert(buttons, {button = node, text = content})
+            end
+            local ancestry = node
+            while ancestry and ancestry ~= gui do
+                if ancestry.Name:lower():find("dialog") or ancestry.Name:lower():find("conversation") then
+                    state.dialogueVisible = true
+                    break
+                end
+                ancestry = ancestry.Parent
+            end
+        elseif node:IsA("ImageButton") and visibleFinalGui(node) then
+            table.insert(buttons, {button = node, text = node.Name:lower()})
+        end
+    end
+    for _, content in ipairs(labels) do
+        if content:find("forest cleared", 1, true) then state.won = true end
+    end
+    for _, item in ipairs(buttons) do
+        local t = item.text:gsub("^%s+", ""):gsub("%s+$", "")
+        if t:find("return to lobby", 1, true) then
+            state.returnButton = item.button
+        elseif t == "continue" or t == "next" or t == "okay" or t == "ok" or t == "yes"
+            or t == "finish" or t == "thanks" or t == "thank you" or t == "goodbye"
+            or t == "proceed" or t == "..." or t == "[next]" then
+            state.nextButton = state.nextButton or item.button
+        end
+    end
+    return state
+end
+
+local function pressFinalInteract()
+    local ok = pcall(function()
+        local input = game:GetService("VirtualInputManager")
+        input:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+        task.wait(0.08)
+        input:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+    end)
+    if not ok and type(keypress) == "function" and type(keyrelease) == "function" then
+        pcall(function() keypress(0x45) task.wait(0.08) keyrelease(0x45) end)
+    end
+end
+
+local function clickFinalButton(button)
+    if not button or not visibleFinalGui(button) or button.AbsoluteSize.Magnitude < 5 then return false end
+    local at = button.AbsolutePosition + button.AbsoluteSize * 0.5
+    local ok = pcall(function()
+        local input = game:GetService("VirtualInputManager")
+        input:SendMouseButtonEvent(math.floor(at.X), math.floor(at.Y), 0, true, game, 0)
+        task.wait(0.06)
+        input:SendMouseButtonEvent(math.floor(at.X), math.floor(at.Y), 0, false, game, 0)
+    end)
+    return ok
+end
+
+local function locateBusinessman()
+    if Game.finalTarget and Game.finalTarget.Parent then
+        return Game.finalTarget
+    end
+    if os.clock() < finalNpcScanAt then return nil end
+    finalNpcScanAt = os.clock() + 3
+    local best, dist = nil, math.huge
+    for _, node in ipairs(workspace:GetDescendants()) do
+        if (node:IsA("Model") or node:IsA("BasePart"))
+            and node.Name:lower():find("businessman", 1, true) then
+            local point
+            if node:IsA("BasePart") then point = node.Position
+            elseif node.PrimaryPart then point = node.PrimaryPart.Position
+            else
+                local ok, pivot = pcall(function() return node:GetPivot() end)
+                if ok then point = pivot.Position end
+            end
+            if point then
+                local d = (point - BUSINESSMAN_FALLBACK).Magnitude
+                if d < dist then best, dist = node, d end
+            end
+        end
+    end
+    Game.finalTarget = best
+    return best
+end
+
+local function finalBusinessmanStep()
+    if unloaded or not Game.finalSequence or Game.finalDone then return end
+    local now = os.clock()
+    local ui = finalGuiState()
+    -- The end-of-run screen is authoritative, even if the NPC interaction
+    -- has already advanced beyond a visible dialogue panel.
+    if ui.won and ui.returnButton then
+        Game.finalStage = "ReturnToLobby"
+        Game.status = "Forest cleared! Selecting Return to Lobby"
+        if now >= Game.finalNextAction then
+            Game.finalNextAction = now + 2
+            if clickFinalButton(ui.returnButton) then
+                Game.finalDone = true
+                Game.status = "Return to Lobby selected"
+            else
+                Game.status = "Forest cleared; waiting to click Return to Lobby"
+            end
+        end
+        return
+    end
+    if ui.won then
+        Game.status = "Forest cleared; waiting for Return to Lobby button"
+        return
+    end
+    if ui.dialogueVisible then
+        Game.finalStage = "Dialogue"
+        Game.status = "Businessman dialogue: advancing"
+        if now >= Game.finalNextAction then
+            Game.finalNextAction = now + 1.2
+            if ui.nextButton then
+                clickFinalButton(ui.nextButton)
+            else
+                -- Games using E-to-advance dialogue may expose no TextButton.
+                pressFinalInteract()
+            end
+        end
+        return
+    end
+    local npc = locateBusinessman()
+    local destination = BUSINESSMAN_FALLBACK
+    if npc then
+        if npc:IsA("BasePart") then destination = npc.Position
+        else
+            local ok, pivot = pcall(function() return npc:GetPivot() end)
+            if ok then destination = pivot.Position end
+        end
+    end
+    local _, root = getRoot()
+    if not root then
+        Game.status = "Waiting for character before Businessman interaction"
+        return
+    end
+    if (root.Position - destination).Magnitude > 11 then
+        -- Stand near the NPC rather than inside the NPC model.
+        Game.status = "Moving to Businessman"
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.CFrame = CFrame.new(destination + Vector3.new(0, 3, 5))
+        Game.finalNextAction = now + 0.8
+        return
+    end
+    Game.status = "Businessman: pressing E / waiting for dialogue"
+    if now >= Game.finalNextAction then
+        Game.finalNextAction = now + 2
+        Game.finalTalkAttempts += 1
+        local nearbyPrompt
+        for _, part in ipairs(workspace:GetPartBoundsInRadius(root.Position, 16)) do
+            for _, node in ipairs(part:GetDescendants()) do
+                if node:IsA("ProximityPrompt") and node.Enabled then
+                    local text = (node.ActionText .. " " .. node.ObjectText):lower()
+                    if text:find("talk", 1, true) or text:find("businessman", 1, true) then
+                        nearbyPrompt = node
+                        break
+                    end
+                end
+            end
+            if nearbyPrompt then break end
+        end
+        if nearbyPrompt and type(fireproximityprompt) == "function" then
+            pcall(fireproximityprompt, nearbyPrompt)
+        else
+            pressFinalInteract()
+        end
+        if Game.finalTalkAttempts >= 8 then
+            Game.status = "Waiting for Businessman dialogue; check interaction"
+        end
+    end
 end
 
 local function detectCycle()
@@ -2932,6 +3151,7 @@ startWorker("ZoneAndCycle", 0.25, function()
     monitorBossAndAdvance()
 end)
 startWorker("BossCombatV7", 0.18, bossCombatStep)
+startWorker("FinalBusinessman", 0.45, finalBusinessmanStep)
 setupLobbyTab()
 setupShopTab()
 setupPlayerTab()
