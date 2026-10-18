@@ -1,7 +1,7 @@
 --!nonstrict
 --=============================================================================
--- Chop A Forest automation script + GUI
--- v5.0 (hold gun trigger during boss encounters)
+-- deforestation automation script + GUI
+-- v1 (hold gun trigger during boss encounters)
 --=============================================================================
 
 local Players            = game:GetService("Players")
@@ -22,8 +22,8 @@ if not game:IsLoaded() then
     game.Loaded:Wait() 
 end
 
-local SCRIPT_VERSION = "v5.0"
-local GAME_NAME      = "The Forest"
+local SCRIPT_VERSION = "v1"
+local GAME_NAME      = "deforestation"
 local CONFIG_FILE    = "ForestConfig.json"
 
 xpcall(function()
@@ -115,6 +115,8 @@ xpcall(function()
         bossMeleePoint = nil,
         bossSlot2Selected = false,
         bossSlot2Tool = nil,
+        goldenAspensBusinessmanDone = false,
+        goldenAspensBusinessmanRunning = false,
         lastBossAttackDiagnostic = 0,
     }
 
@@ -204,7 +206,7 @@ xpcall(function()
             end
             local ok, err = writeConfigNow()
             if not ok then
-                warn("[TheForest] Config autosave failed: " .. tostring(err))
+                warn("[deforestation] Config autosave failed: " .. tostring(err))
             end
         end)
         return true
@@ -247,9 +249,9 @@ xpcall(function()
                         end
                     end
                     loaded = true
-                    print("[TheForest] Loaded " .. CONFIG_FILE .. " (FreeCursorMenu=" .. tostring(Flags.FreeCursorMenu) .. ")")
+                    print("[deforestation] Loaded " .. CONFIG_FILE .. " (FreeCursorMenu=" .. tostring(Flags.FreeCursorMenu) .. ")")
                 elseif fileExists then
-                    warn("[TheForest] " .. CONFIG_FILE .. " exists but is not valid JSON; preserving it rather than overwriting it with defaults.")
+                    warn("[deforestation] " .. CONFIG_FILE .. " exists but is not valid JSON; preserving it rather than overwriting it with defaults.")
                 end
             end
         end
@@ -275,9 +277,9 @@ xpcall(function()
         if not loaded and not fileExists then
             local saved, err = saveConfig(true)
             if not saved then
-                warn("[TheForest] Could not create " .. CONFIG_FILE .. ": " .. tostring(err))
+                warn("[deforestation] Could not create " .. CONFIG_FILE .. ": " .. tostring(err))
             else
-                print("[TheForest] Created initial config at " .. CONFIG_FILE)
+                print("[deforestation] Created initial config at " .. CONFIG_FILE)
             end
         end
     end
@@ -484,7 +486,7 @@ xpcall(function()
                                 break
                             end
                         else
-                            warn("[TheForest] Boss return is pending, but no saved boss position is available yet.")
+                            warn("[deforestation] Boss return is pending, but no saved boss position is available yet.")
                         end
                         aliveSince = nil
                     end
@@ -520,7 +522,7 @@ xpcall(function()
             end
         end
         if not Game.bossReturnPosition then
-            warn("[TheForest] Knockdown detected during boss combat, but neither the boss nor player return position was available yet.")
+            warn("[deforestation] Knockdown detected during boss combat, but neither the boss nor player return position was available yet.")
             return
         end
         local firstDetection = not Game.bossRespawnTeleportPending
@@ -531,7 +533,7 @@ xpcall(function()
         if firstDetection then
             Game.status = "Knocked down; waiting to return to boss area"
             notify("Knocked down during boss fight. Waiting to wake up, then returning to the saved boss location.")
-            warn("[TheForest] Boss recovery queued: " .. tostring(reason or "player downed"))
+            warn("[deforestation] Boss recovery queued: " .. tostring(reason or "player downed"))
         end
         startBossReturnMonitor()
     end
@@ -1006,7 +1008,7 @@ xpcall(function()
             areaState.key = tostring(Flags.Zone) .. "|" .. tostring(areaState.marker or "")
             if Game.lastHudAreaReport ~= detectedZone then
                 Game.lastHudAreaReport = detectedZone
-                print("[TheForest] Top-right HUD area detected: " .. zoneLabel(detectedZone))
+                print("[deforestation] Top-right HUD area detected: " .. zoneLabel(detectedZone))
             end
             return false
         end
@@ -1023,7 +1025,7 @@ xpcall(function()
         areaState.key = tostring(Flags.Zone) .. "|" .. tostring(areaState.marker or "")
         saveConfig()
         Game.lastHudAreaReport = detectedZone
-        print("[TheForest] Top-right HUD area detected: " .. zoneLabel(detectedZone)
+        print("[deforestation] Top-right HUD area detected: " .. zoneLabel(detectedZone)
             .. "; Zone dropdown updated from " .. zoneLabel(previousZone) .. ".")
         notify("HUD area matched: " .. zoneLabel(detectedZone) .. ". Zone dropdown updated.")
         return true
@@ -1836,7 +1838,7 @@ xpcall(function()
         if isFirearm or not Game.bossSlot2Selected then
             if os.clock() - (Game.lastBossAttackDiagnostic or 0) > 4 then
                 Game.lastBossAttackDiagnostic = os.clock()
-                warn("[TheForest] v4.6 attack blocked: firearm or slot 2 not selected; Tool=" .. tostring(heldTool and heldTool.Name or "NONE"))
+                warn("[deforestation] v4.6 attack blocked: firearm or slot 2 not selected; Tool=" .. tostring(heldTool and heldTool.Name or "NONE"))
             end
             return false
         end
@@ -1889,7 +1891,7 @@ xpcall(function()
         end
         if os.clock() - (Game.lastBossAttackDiagnostic or 0) > 4 then
             Game.lastBossAttackDiagnostic = os.clock()
-            warn("[TheForest] v4.6 Axe swing attempt: equipped=" .. (heldTool and heldTool.Name or "CUSTOM HOTBAR / NO TOOL")
+            warn("[deforestation] v4.6 Axe swing attempt: equipped=" .. (heldTool and heldTool.Name or "CUSTOM HOTBAR / NO TOOL")
                 .. ", Tool:Activate=" .. tostring(activateOk)
                 .. ", inputAttempted=" .. tostring(attempted))
         end
@@ -2046,7 +2048,7 @@ xpcall(function()
                 keyrelease(vk)
             end)
         end
-        if not ok then warn("[TheForest] Could not send hotbar slot " .. tostring(slot)) end
+        if not ok then warn("[deforestation] Could not send hotbar slot " .. tostring(slot)) end
         return ok
     end
 
@@ -2085,7 +2087,7 @@ xpcall(function()
             Game.bossGunHeld = true
             Game.bossGunHoldMode = mode
             Game.bossGunHoldPoint = point
-            warn("[TheForest] v5.0 gun trigger held via " .. mode)
+            warn("[deforestation] v1 gun trigger held via " .. mode)
             return true
         end
         if not Game.bossGunHeld then return true end
@@ -2117,7 +2119,7 @@ xpcall(function()
         local bossName = boss and boss.Name or Game.areaBossName or "Boss"
         Game.status = "Boss: gun attack (15 studs in front, aiming at legs)"
         notify("Boss encounter started: " .. tostring(bossName) .. "; selecting gun in slot 5 and hovering 15 studs in front and aiming at the legs.")
-        warn("[TheForest] Boss gun combat enabled: anchored 15 studs in front near feet level, aiming at legs.")
+        warn("[deforestation] Boss gun combat enabled: anchored 15 studs in front near feet level, aiming at legs.")
 
         local lastMissingTargetWarning = 0
         local bossBarMissingSince = nil
@@ -2155,7 +2157,7 @@ xpcall(function()
         if Game.setBossGunHeld then pcall(Game.setBossGunHeld, true) end
         -- Hold trigger through encounter; boss tracking continues while held.
 
-        warn("[TheForest] v4.6 entering boss attack loop: area=" .. tostring(areaKey))
+        warn("[deforestation] v4.6 entering boss attack loop: area=" .. tostring(areaKey))
         local loopOk, loopErr = pcall(function()
             while not unloaded and Flags.AutoChop and Game.areaCompleteKey == areaKey do
                 if os.clock() >= nextKnockdownCheckAt then
@@ -2191,7 +2193,7 @@ xpcall(function()
                 end
                 if not hudHasBoss and os.clock() - (Game.lastBossAttackDiagnostic or 0) > 4 then
                     Game.lastBossAttackDiagnostic = os.clock()
-                    warn("[TheForest] v4.6 HUD bar temporarily unavailable; locked boss="
+                    warn("[deforestation] v4.6 HUD bar temporarily unavailable; locked boss="
                         .. tostring(bossName) .. "; model=" .. tostring(liveBoss and liveBoss.Name or "NONE")
                         .. "; continuing only if locked boss model is alive")
                 end
@@ -2218,7 +2220,7 @@ xpcall(function()
                             if Game.setBossMeleeHeld then pcall(Game.setBossMeleeHeld, false) end
                             if os.clock() - lastMissingTargetWarning > 3 then
                                 lastMissingTargetWarning = os.clock()
-                                warn("[TheForest] Boss locked but a live character root or boss model root could not be found. Axe attacks are paused to avoid attacking unrelated objects.")
+                                warn("[deforestation] Boss locked but a live character root or boss model root could not be found. Axe attacks are paused to avoid attacking unrelated objects.")
                             end
                             task.wait(0.15)
                         else
@@ -2259,7 +2261,7 @@ xpcall(function()
             Game.overlayWindow.Visible = previousWindowVisible
         end
         if not loopOk then
-            warn("[TheForest] Boss attack loop stopped safely: " .. tostring(loopErr))
+            warn("[deforestation] Boss attack loop stopped safely: " .. tostring(loopErr))
             return "stopped"
         end
         if outcome == "defeated" or outcome == "area-changed" then
@@ -2382,7 +2384,7 @@ xpcall(function()
                     nextPositionAdjustAt = 0
                     if os.clock() - lastWarningAt > 6 then
                         lastWarningAt = os.clock()
-                        warn("[TheForest] Axe hits have not reduced " .. tostring(mobName) .. " health yet; cycling melee positions and retrying.")
+                        warn("[deforestation] Axe hits have not reduced " .. tostring(mobName) .. " health yet; cycling melee positions and retrying.")
                     end
                 end
                 if currentHealth <= 0 then
@@ -2392,7 +2394,7 @@ xpcall(function()
                     return "defeated"
                 end
             elseif os.clock() - startedAt > 90 then
-                warn("[TheForest] Could not confirm whether " .. tostring(mobName) .. " was defeated (no exposed health value). Returning to the farm loop.")
+                warn("[deforestation] Could not confirm whether " .. tostring(mobName) .. " was defeated (no exposed health value). Returning to the farm loop.")
                 Game.cachedMob = nil
                 Game.lastMobNotice = nil
                 return "unconfirmed"
@@ -2402,13 +2404,149 @@ xpcall(function()
         return "stopped"
     end
 
+    -- Golden Aspens completion: visit the Businessman and follow his UI to the lobby.
+    -- Only runs for Golden Aspens, and only after the boss is confirmed defeated.
+    local BUSINESSMAN_POS = Vector3.new(330.1, 3.2, 181.9)
+
+    local function visibleUi(inst)
+        local ancestor = inst
+        while ancestor and ancestor ~= game do
+            if ancestor:IsA("GuiObject") and not ancestor.Visible then return false end
+            if ancestor:IsA("ScreenGui") and not ancestor.Enabled then return false end
+            ancestor = ancestor.Parent
+        end
+        return true
+    end
+
+    local function clickGuiButton(button)
+        if not button or not button:IsA("GuiButton") or not visibleUi(button) then return false end
+        local size, pos = button.AbsoluteSize, button.AbsolutePosition
+        if size.X < 2 or size.Y < 2 then return false end
+        local x, y = math.floor(pos.X + size.X * 0.5), math.floor(pos.Y + size.Y * 0.5)
+        local ok = pcall(function()
+            local vim = game:GetService("VirtualInputManager")
+            vim:SendMouseButtonEvent(x, y, 0, true, game, 0)
+            task.wait(0.07)
+            vim:SendMouseButtonEvent(x, y, 0, false, game, 0)
+        end)
+        if not ok then
+            ok = pcall(function()
+                VirtualUser:CaptureController()
+                VirtualUser:ClickButton1(Vector2.new(x, y))
+            end)
+        end
+        return ok
+    end
+
+    local function readButtonLabel(button)
+        local values = {button.Name}
+        if button:IsA("TextButton") then table.insert(values, button.Text) end
+        for _, child in ipairs(button:GetDescendants()) do
+            if child:IsA("TextLabel") then table.insert(values, child.Text) end
+        end
+        return string.lower(table.concat(values, " "))
+    end
+
+    local function findVisibleDialogueButton(kind)
+        local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        if not gui then return nil end
+        for _, inst in ipairs(gui:GetDescendants()) do
+            if inst:IsA("GuiButton") and visibleUi(inst) then
+                local name = readButtonLabel(inst)
+                if kind == "lobby" and (name:find("go to lobby", 1, true) or name:find("gotolobby", 1, true) or name:find("return to lobby", 1, true) or name:find("returntolobby", 1, true)) then
+                    return inst
+                end
+                if kind == "advance" and (name:find("continue", 1, true) or name:find("next", 1, true)
+                    or name:find("proceed", 1, true) or name:find("okay", 1, true)
+                    or name:find("dialogueadvance", 1, true)) then
+                    return inst
+                end
+            end
+        end
+        return nil
+    end
+
+    local function pressTalkKey()
+        local ok = pcall(function()
+            local vim = game:GetService("VirtualInputManager")
+            vim:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+            task.wait(0.09)
+            vim:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+        end)
+        if not ok and type(keypress) == "function" and type(keyrelease) == "function" then
+            ok = pcall(function()
+                keypress(0x45)
+                task.wait(0.09)
+                keyrelease(0x45)
+            end)
+        end
+        return ok
+    end
+
+    local function talkToBusinessman()
+        if Game.goldenAspensBusinessmanDone or Game.goldenAspensBusinessmanRunning then return end
+        Game.goldenAspensBusinessmanRunning = true
+        Game.status = "Golden Aspens cleared; speaking to Businessman"
+        notify("Golden Aspens boss defeated. Visiting Businessman at 330.1, 3.2, 181.9.")
+        local success, err = pcall(function()
+            local _, root = getRoot()
+            if not root then error("Character root not ready") end
+            root.Anchored = false
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.CFrame = CFrame.new(BUSINESSMAN_POS + Vector3.new(0, 0.2, 0))
+            task.wait(0.8)
+
+            -- A proximity prompt is preferred if the NPC uses one; E is the fallback.
+            local chosenPrompt, nearest = nil, 16
+            for _, inst in ipairs(workspace:GetDescendants()) do
+                if inst:IsA("ProximityPrompt") and inst.Enabled and inst.Parent and inst.Parent:IsA("BasePart") then
+                    local dist = (inst.Parent.Position - BUSINESSMAN_POS).Magnitude
+                    if dist < nearest then
+                        nearest = dist
+                        chosenPrompt = inst
+                    end
+                end
+            end
+            if chosenPrompt and type(fireproximityprompt) == "function" then
+                pcall(function() fireproximityprompt(chosenPrompt) end)
+            else
+                pressTalkKey()
+            end
+
+            local deadline = os.clock() + 35
+            local lastAdvanceAt, lastTalkAt = 0, os.clock()
+            while not unloaded and os.clock() < deadline do
+                local lobby = findVisibleDialogueButton("lobby")
+                if lobby then
+                    Game.status = "Businessman dialogue complete; Go to Lobby"
+                    notify("Businessman dialogue finished; clicking Go to Lobby.")
+                    clickGuiButton(lobby)
+                    Game.goldenAspensBusinessmanDone = true
+                    return
+                end
+                local advance = findVisibleDialogueButton("advance")
+                if advance and os.clock() - lastAdvanceAt > 0.6 then
+                    clickGuiButton(advance)
+                    lastAdvanceAt = os.clock()
+                elseif not advance and os.clock() - lastTalkAt > 2.5 then
+                    pressTalkKey()
+                    lastTalkAt = os.clock()
+                end
+                task.wait(0.25)
+            end
+            warn("[deforestation] Businessman: Go to Lobby button not found within 35s; leaving lobby transition to manual interaction.")
+        end)
+        if not success then warn("[deforestation] Businessman interaction failed: " .. tostring(err)) end
+        Game.goldenAspensBusinessmanRunning = false
+    end
+
     local function advanceToNextZone()
         if Game.zoneAdvancePending then return end
         local oldZone = Flags.Zone
         local oldIndex = zoneIndex(oldZone)
         local order = zoneOrder()
         if not oldIndex or #order == 0 then
-            warn("[TheForest] Cannot advance to the next zone: zone order is unavailable.")
+            warn("[deforestation] Cannot advance to the next zone: zone order is unavailable.")
             return
         end
 
@@ -2449,7 +2587,7 @@ xpcall(function()
                     end
                     local saved, saveErr = saveConfig(true)
                     if not saved then
-                        warn("[TheForest] Moved to " .. zoneLabel(nextZone) .. " but could not save config: " .. tostring(saveErr))
+                        warn("[deforestation] Moved to " .. zoneLabel(nextZone) .. " but could not save config: " .. tostring(saveErr))
                     end
                     Game.status = "Advanced to " .. zoneLabel(nextZone)
                     notify("Boss defeated; Zone dropdown advanced to " .. zoneLabel(nextZone) .. ". Auto Chop will use trees from that zone.")
@@ -2574,13 +2712,17 @@ xpcall(function()
                         local targetRoot = modelRootPart(boss)
                         local where = targetRoot and string.format(" (target %.1f, %.1f, %.1f)", targetRoot.Position.X, targetRoot.Position.Y, targetRoot.Position.Z) or ""
                         notify("Boss target locked: " .. tostring(boss.Name) .. where .. ". Starting Axe encounter (slot 2).")
-                        warn("[TheForest] Boss target locked to model '" .. tostring(boss.Name) .. "'" .. where)
+                        warn("[deforestation] Boss target locked to model '" .. tostring(boss.Name) .. "'" .. where)
                     end
                     local outcome = runBossEncounter(boss, areaKey)
                     if outcome == "defeated" then
                         Game.cachedBoss = nil
                         Game.bossDefeatedKey = areaKey
                         Game.status = tostring(boss.Name) .. " defeated; moving to next unlocked zone"
+                        if Flags.Zone == "GoldenAspens" then
+                            talkToBusinessman()
+                            if Game.goldenAspensBusinessmanDone then return end
+                        end
                         if Flags.AutoAdvanceZone then
                             notify(tostring(boss.Name) .. " defeated. Looking for the next unlocked zone.")
                             advanceToNextZone()
@@ -2597,11 +2739,11 @@ xpcall(function()
                     elseif outcome == "boss-bar-lost" then
                         Game.cachedBoss = nil
                         Game.status = "Boss bar missing; Axe attacks paused, waiting for bar"
-                        warn("[TheForest] Boss health bar disappeared from the top HUD; paused Axe attacks and boss targeting.")
+                        warn("[deforestation] Boss health bar disappeared from the top HUD; paused Axe attacks and boss targeting.")
                     elseif outcome == "boss-target-missing" then
                         Game.cachedBoss = nil
                         Game.status = "Boss bar visible, but matching world model not found"
-                        warn("[TheForest] Boss bar is visible but no matching boss rig was found. Axe attacks stayed paused to avoid hitting unrelated objects.")
+                        warn("[deforestation] Boss bar is visible but no matching boss rig was found. Axe attacks stayed paused to avoid hitting unrelated objects.")
                     elseif outcome == "stopped" then
                         Game.status = "Boss encounter paused"
                     end
@@ -2611,7 +2753,7 @@ xpcall(function()
                     if not Game.bossSearchWarningShown and Game.areaCompletedAt
                         and os.clock() - Game.areaCompletedAt >= 5 then
                         Game.bossSearchWarningShown = true
-                        warn("[TheForest] Area is complete but no boss model matched the HUD name " .. tostring(Game.areaBossName) .. ". Search includes model names, display-name attributes, and world-space name tags.")
+                        warn("[deforestation] Area is complete but no boss model matched the HUD name " .. tostring(Game.areaBossName) .. ". Search includes model names, display-name attributes, and world-space name tags.")
                     end
                 end
                 return
@@ -3494,10 +3636,10 @@ xpcall(function()
             if connectOk then
                 reconnectConn = connectionOrErr
             else
-                warn("[TheForest] Auto Reconnect: ErrorMessageChanged is unavailable in this executor; using teleport-failure fallback.")
+                warn("[deforestation] Auto Reconnect: ErrorMessageChanged is unavailable in this executor; using teleport-failure fallback.")
             end
         else
-            warn("[TheForest] Auto Reconnect: ErrorMessageChanged is unavailable; using teleport-failure fallback.")
+            warn("[deforestation] Auto Reconnect: ErrorMessageChanged is unavailable; using teleport-failure fallback.")
         end
 
         -- Keep the supported teleport-failure fallback, but guard it too so
@@ -3520,7 +3662,7 @@ xpcall(function()
         if failedConnectOk then
             reconnectFailedConn = failedConnectionOrErr
         else
-            warn("[TheForest] Auto Reconnect fallback unavailable: " .. tostring(failedConnectionOrErr))
+            warn("[deforestation] Auto Reconnect fallback unavailable: " .. tostring(failedConnectionOrErr))
         end
     end
 
@@ -3938,7 +4080,7 @@ xpcall(function()
     local titleBar = new("Frame", { Size = UDim2.new(1, 0, 0, 46), BackgroundColor3 = Theme.panel, BorderSizePixel = 0 }, window)
     new("TextLabel", {
         Position = UDim2.new(0, 16, 0, 0), Size = UDim2.new(0, 300, 1, 0), BackgroundTransparency = 1,
-        Text = "CHOP A FOREST   ·   " .. SCRIPT_VERSION, Font = FONT_BOLD, TextSize = 13, TextColor3 = Theme.text,
+        Text = "DEFORESTATION   ·   " .. SCRIPT_VERSION, Font = FONT_BOLD, TextSize = 13, TextColor3 = Theme.text,
         TextXAlignment = Enum.TextXAlignment.Left,
     }, titleBar)
     local closeBtn = new("TextButton", {
@@ -4084,12 +4226,12 @@ xpcall(function()
 
                 local saveOk, saveErr = saveConfig(true)
                 if not callbackOk then
-                    warn("[TheForest] Toggle callback failed for '" .. tostring(label) .. "': " .. tostring(callbackErr))
+                    warn("[deforestation] Toggle callback failed for '" .. tostring(label) .. "': " .. tostring(callbackErr))
                 end
                 if saveOk then
-                    print("[TheForest] Saved toggle " .. tostring(flagKey or label) .. "=" .. tostring(state) .. " to " .. CONFIG_FILE)
+                    print("[deforestation] Saved toggle " .. tostring(flagKey or label) .. "=" .. tostring(state) .. " to " .. CONFIG_FILE)
                 else
-                    warn("[TheForest] Toggle save failed for '" .. tostring(label) .. "': " .. tostring(saveErr))
+                    warn("[deforestation] Toggle save failed for '" .. tostring(label) .. "': " .. tostring(saveErr))
                 end
             end
         end
@@ -4578,10 +4720,10 @@ xpcall(function()
         local saved, err = saveConfig(true)
         if saved then
             notify("Config verified: " .. CONFIG_FILE)
-            print("[TheForest] Manual save verified: " .. CONFIG_FILE)
+            print("[deforestation] Manual save verified: " .. CONFIG_FILE)
         else
             notify("Config save failed; check console")
-            warn("[TheForest] Manual config save failed: " .. tostring(err))
+            warn("[deforestation] Manual config save failed: " .. tostring(err))
         end
     end)
     makeBtn(miscCard, "Rejoin Server", function() 
@@ -4785,7 +4927,7 @@ xpcall(function()
         if not snapshotOk then
             local snapshotErr = savedConfigText
             savedConfigText = nil
-            warn("[TheForest] Could not encode config during shutdown: " .. tostring(snapshotErr))
+            warn("[deforestation] Could not encode config during shutdown: " .. tostring(snapshotErr))
         end
 
         unloaded = true
@@ -4836,15 +4978,15 @@ xpcall(function()
                     end
                 end
                 if verifyOk then
-                    print("[TheForest] Shutdown config saved and verified: " .. CONFIG_FILE)
+                    print("[deforestation] Shutdown config saved and verified: " .. CONFIG_FILE)
                 else
-                    warn("[TheForest] Shutdown config verification failed: " .. tostring(verifyErr))
+                    warn("[deforestation] Shutdown config verification failed: " .. tostring(verifyErr))
                 end
             else
-                warn("[TheForest] Shutdown config write failed: " .. tostring(writeErr))
+                warn("[deforestation] Shutdown config write failed: " .. tostring(writeErr))
             end
         else
-            warn("[TheForest] Shutdown config could not be saved; writefile() or JSON encoding is unavailable")
+            warn("[deforestation] Shutdown config could not be saved; writefile() or JSON encoding is unavailable")
         end
 
         notify("Script killed completely via kill switch.")
