@@ -2,7 +2,7 @@ if not game:IsLoaded() then
     game.Loaded:Wait()
 end
 
-local SCRIPT_VERSION = "v2.2"
+local SCRIPT_VERSION = "v2.3"
 local GAME_NAME = "Deforestation"
 local GAME_KEY = "TheForest"
 local DISCORD_INVITE = "https://discord.gg/synapsex"
@@ -132,6 +132,7 @@ local Game = {
     finalNextAction = 0,
     finalTalkAttempts = 0,
     finalTarget = nil,
+    goldenAspensChecked = false,
 }
 local WORKER_STEPS
 
@@ -807,10 +808,68 @@ local function bossCombatStep()
     end
 end
 
+-- End-of-run objective: a checkmark next to Golden Aspens in the upper-right HUD.
+-- Also accept the checkmark as a neighboring label in the same HUD row.
+local function goldenAspensCheckVisible()
+    local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not gui then return false end
+    local camera = workspace.CurrentCamera
+    local viewport = camera and camera.ViewportSize or Vector2.new(1920, 1080)
+    local labels = {}
+    for _, node in ipairs(gui:GetDescendants()) do
+        if (node:IsA("TextLabel") or node:IsA("TextButton")) and visibleHudLabel(node) then
+            local pos = node.AbsolutePosition
+            if pos.X >= viewport.X * 0.43 and pos.Y <= viewport.Y * 0.44 then
+                local text = cleanAreaHudText(node.Text):lower()
+                if text ~= "" then
+                    local marked = text:find("✓", 1, true) or text:find("✔", 1, true)
+                        or text:find("☑", 1, true)
+                    if text:find("golden aspens", 1, true) and marked then
+                        return true
+                    end
+                    table.insert(labels, {text=text, pos=pos, marked=marked ~= nil})
+                end
+            end
+        end
+    end
+    for _, label in ipairs(labels) do
+        if label.text:find("golden aspens", 1, true) then
+            for _, other in ipairs(labels) do
+                if other ~= label and other.marked
+                    and math.abs(other.pos.Y - label.pos.Y) <= 25
+                    and math.abs(other.pos.X - label.pos.X) <= 280 then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+local function beginFinalBusinessman(reason)
+    if Game.finalSequence or Game.finalDone then return end
+    Game.finalSequence = true
+    Game.bossPhase = true -- immediately pause ongoing farming, pickup and selling
+    Game.goldenAspensChecked = true
+    Game.finalStartedAt = os.clock()
+    Game.finalStage = "FindBusinessman"
+    Game.finalNextAction = 0
+    Game.status = "Golden Aspens cleared; visiting Businessman"
+    print("[Deforestation] " .. reason .. "; starting Businessman interaction")
+end
+
 local function monitorBossAndAdvance()
     if not Flags.AutoChop and not Flags.AutoSell and not Flags.AutoPickup then return end
     local zone = Flags.Zone
     local state = readBossProgress()
+    -- The final-area checkmark is authoritative: begin the Businessman flow
+    -- even when the boss HUD or regular day/night timer has disappeared.
+    if not Game.finalSequence and not Game.finalDone
+        and (zone == "GoldenAspens" or state.marker == "8/8" or Game.bossAreaMarker == "8/8")
+        and goldenAspensCheckVisible() then
+        beginFinalBusinessman("Golden Aspens checkmark detected")
+        return
+    end
     -- Area number is authoritative for log selling when the top-right HUD is present.
     -- Keep the last number while the HUD temporarily disappears for boss animations.
     if state.marker then
@@ -871,14 +930,7 @@ local function monitorBossAndAdvance()
     -- The last boss ends the forest run; finish at the Businessman instead
     -- of trying to advance beyond Golden Aspens.
     if zone == "GoldenAspens" or Game.bossAreaMarker == "8/8" or state.marker == "8/8" then
-        if not Game.finalSequence then
-            Game.finalSequence = true
-            Game.finalStartedAt = os.clock()
-            Game.finalStage = "FindBusinessman"
-            Game.finalNextAction = 0
-            Game.status = "Final boss defeated; visiting Businessman"
-            print("[Deforestation] Golden Aspens boss defeated; starting final interaction")
-        end
+        beginFinalBusinessman("Golden Aspens boss defeat confirmed")
         return
     end
     if not Flags.AutoAdvanceZone then
@@ -934,6 +986,45 @@ local function visibleFinalGui(node)
         current = current.Parent
     end
     return true
+end
+
+local finalLastDialogueSnapshot = nil
+local function logBusinessmanDialogue()
+    local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not gui then return end
+    local entries = {}
+    local seen = {}
+    for _, node in ipairs(gui:GetDescendants()) do
+        if (node:IsA("TextLabel") or node:IsA("TextButton") or node:IsA("TextBox"))
+            and visibleFinalGui(node) then
+            local inDialogue = false
+            local cursor = node
+            while cursor and cursor ~= gui do
+                local name = cursor.Name:lower()
+                if name:find("dialog", 1, true) or name:find("conversation", 1, true) then
+                    inDialogue = true
+                    break
+                end
+                cursor = cursor.Parent
+            end
+            if inDialogue then
+                local content = tostring(node.Text or ""):gsub("<[^>]->", "")
+                    :gsub("%s+", " "):match("^%s*(.-)%s*$")
+                if content and content ~= "" and not seen[content] then
+                    seen[content] = true
+                    table.insert(entries, (node:IsA("TextButton") and "[CHOICE] " or "")
+                        .. content:sub(1, 220))
+                end
+            end
+        end
+    end
+    if #entries == 0 then return end
+    local maxEntries = math.min(#entries, 20)
+    local snapshot = table.concat(entries, " | ", 1, maxEntries)
+    if snapshot ~= finalLastDialogueSnapshot then
+        finalLastDialogueSnapshot = snapshot
+        print("[Deforestation][Businessman dialogue] " .. snapshot)
+    end
 end
 
 local function finalGuiState()
@@ -1053,6 +1144,7 @@ local function finalBusinessmanStep()
         return
     end
     if ui.dialogueVisible then
+        logBusinessmanDialogue()
         Game.finalStage = "Dialogue"
         Game.status = "Businessman dialogue: advancing"
         if now >= Game.finalNextAction then
