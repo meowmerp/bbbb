@@ -11,7 +11,7 @@ do
     end
 end
 
-local SCRIPT_VERSION = "v2.8"
+local SCRIPT_VERSION = "v3.0"
 local GAME_NAME = "Deforestation"
 local GAME_KEY = "TheForest"
 local DISCORD_INVITE = "https://discord.gg/synapsex"
@@ -150,6 +150,8 @@ local Game = {
     finalTalkAttempts = 0,
     finalTarget = nil,
     goldenAspensChecked = false,
+    finalRejected = false,
+    finalReturnCFrame = nil,
 }
 local WORKER_STEPS
 
@@ -885,6 +887,8 @@ end
 
 local function beginFinalBusinessman(reason)
     if Game.finalSequence or Game.finalDone then return end
+    local _, previousRoot = getRoot()
+    if previousRoot then Game.finalReturnCFrame = previousRoot.CFrame end
     Game.finalSequence = true
     Game.bossPhase = true -- immediately pause ongoing farming, pickup and selling
     Game.goldenAspensChecked = true
@@ -901,7 +905,8 @@ local function monitorBossAndAdvance()
     local state = readBossProgress()
     -- The final-area checkmark is authoritative: begin the Businessman flow
     -- even when the boss HUD or regular day/night timer has disappeared.
-    if not Game.finalSequence and not Game.finalDone
+    if not Game.finalSequence and not Game.finalDone and not Game.finalRejected
+        and Game.bossDefeated
         and (zone == "GoldenAspens" or state.marker == "8/8" or Game.bossAreaMarker == "8/8" or Game.sellAreaNumber == 8)
         and goldenAspensCheckVisible() then
         beginFinalBusinessman("Golden Aspens checkmark detected")
@@ -931,6 +936,10 @@ local function monitorBossAndAdvance()
     -- A genuine 100% top-right progress label is required before boss handling.
     if state.progress ~= nil and state.cleared then Game.bossCleared = true end
     if not Game.bossCleared then return end
+    if Game.finalRejected and state.cleared and state.name then
+        Game.finalRejected = false
+        print("[Deforestation] Confirmed new Golden Aspens boss encounter")
+    end
     if state.name then
         Game.bossPhase = true -- 100% + a spawned boss bar; pause the farming/day-night cycle
         if not Game.bossSeen or Game.bossName ~= state.name then
@@ -966,7 +975,7 @@ local function monitorBossAndAdvance()
     end
     -- The last boss ends the forest run; finish at the Businessman instead
     -- of trying to advance beyond Golden Aspens.
-    if zone == "GoldenAspens" or Game.bossAreaMarker == "8/8" or state.marker == "8/8" then
+    if not Game.finalRejected and (zone == "GoldenAspens" or Game.bossAreaMarker == "8/8" or state.marker == "8/8") then
         beginFinalBusinessman("Golden Aspens boss defeat confirmed")
         return
     end
@@ -1064,7 +1073,7 @@ end
 
 local function finalGuiState()
     local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-    local state = {won = false, returnButton = nil, dialogueVisible = false, nextButton = nil}
+    local state = {won = false, unfinished = false, returnButton = nil, dialogueVisible = false, nextButton = nil}
     if not gui then return state end
     local labels = {}
     local buttons = {}
@@ -1090,6 +1099,9 @@ local function finalGuiState()
     end
     for _, label in ipairs(labels) do
         if label.text:find("forest cleared", 1, true) then state.won = true end
+        if label.text:find("go finish your job first", 1, true) then
+            state.unfinished = true
+        end
     end
     for _, item in ipairs(buttons) do
         local t = item.text:gsub("^%s+", ""):gsub("%s+$", "")
@@ -1197,6 +1209,73 @@ local function finalBusinessmanStep()
     if unloaded or not Game.finalSequence or Game.finalDone then return end
     local now = os.clock()
     local ui = finalGuiState()
+    -- The NPC can reject an incomplete run despite an apparent completion row.
+    -- Handle that before dialogue auto-advance or further E presses.
+    if ui.unfinished and not ui.won then
+        Game.finalRejected = true
+        Game.finalSequence = false
+        Game.finalDone = false
+        Game.goldenAspensChecked = false
+        Game.finalStage = nil
+        Game.finalTarget = nil
+        Game.finalTalkAttempts = 0
+        Game.finalNextAction = 0
+        Game.bossPhase = false
+        Game.bossCleared = false
+        Game.bossDefeated = false
+        Game.bossSeen = false
+        Game.bossName = nil
+        Game.bossAreaKey = nil
+        Game.bossAreaMarker = nil
+        Game.bossEndConfirmedAt = nil
+        bossTarget = nil
+        bossNextScan = 0
+        Flags.Zone = "GoldenAspens"
+        if detectedZoneDropdown then
+            settingZoneFromDetection = true
+            pcall(function()
+                if type(detectedZoneDropdown.Set) == "function" then
+                    detectedZoneDropdown:Set({zoneLabel("GoldenAspens")})
+                elseif type(detectedZoneDropdown.SetValue) == "function" then
+                    detectedZoneDropdown:SetValue(zoneLabel("GoldenAspens"))
+                end
+            end)
+            settingZoneFromDetection = false
+        end
+        table.clear(Game.badTrees)
+        Game.treeSearchStep = 0
+        Game.treeSearchAnchor = nil
+        Game.treeSearchNextAt = 0
+        Game.treeSearchZone = nil
+        Game.treeSearchLastArea = nil
+        Game.status = "Businessman rejected: returning to Golden Aspens trees"
+        print("[Deforestation] Businessman: Go finish your job first; returning to Golden Aspens trees")
+        local _, root = getRoot()
+        local folder = workspace:FindFirstChild("Map")
+        folder = folder and folder:FindFirstChild("Trees")
+        local destination = nil
+        if folder then
+            for _, tree in ipairs(folder:GetChildren()) do
+                local trunk = tree:FindFirstChild("TrunkBase")
+                if tree:GetAttribute("Biome") == "GoldenAspens"
+                    and trunk and trunk:IsA("BasePart")
+                    and (tonumber(tree:GetAttribute("HP")) or 0) > 0 then
+                    destination = CFrame.new(trunk.Position + Vector3.new(4, 3, 0))
+                    break
+                end
+            end
+        end
+        destination = destination or Game.finalReturnCFrame
+        if root and destination then
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.CFrame = destination
+            Game.treeSearchAnchor = root.Position
+        else
+            Game.status = "Golden Aspens unfinished; searching for trees"
+        end
+        Game.finalReturnCFrame = nil
+        return
+    end
     -- Hide our overlay as soon as the results screen appears, so it cannot
     -- obscure/intercept the game's Return to Lobby button.
     if ui.won and not Game.finalGuiHidden then
