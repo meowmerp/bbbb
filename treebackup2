@@ -1,0 +1,3502 @@
+-- Safe game-ready gate with an explicit failure message for executor compatibility.
+do
+    local ok, loaded = pcall(function() return game:IsLoaded() end)
+    if not ok then
+        warn("[Deforestation] Startup: game:IsLoaded() failed: " .. tostring(loaded))
+    elseif not loaded then
+        local waitOk, waitErr = pcall(function() game.Loaded:Wait() end)
+        if not waitOk then
+            warn("[Deforestation] Startup: game.Loaded:Wait() failed: " .. tostring(waitErr))
+        end
+    end
+end
+
+local SCRIPT_VERSION = "v3.1"
+local GAME_NAME = "Deforestation"
+local GAME_KEY = "TheForest"
+local DISCORD_INVITE = "https://discord.gg/synapsex"
+local WEBSITE_LINK = "https://ouroboros-hub-rbx.web.app/"
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local VirtualUser = game:GetService("VirtualUser")
+local TeleportService = game:GetService("TeleportService")
+local GuiService = game:GetService("GuiService")
+local Lighting = game:GetService("Lighting")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local StarterGui = game:GetService("StarterGui")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- The main game's lobby place. A forest run uses a different PlaceId.
+local LOBBY_PLACE_ID = 103363457515322
+local function isLobbyPlace()
+    return game.PlaceId == LOBBY_PLACE_ID
+end
+
+local unloaded = false
+local connections = {}
+local workers = {}
+local Library
+local Window
+
+local Flags = {
+    AutoChop = false,
+    Zone = "OakWood",
+    AutoDetectZone = true,
+    AutoFightMobs = true,
+    AutoAdvanceZone = true,
+    ChopDelay = 0.4,
+    AutoPickup = false,
+    AutoSell = false,
+    SellAt = 5,
+    AutoCoins = false,
+    AutoTools = false,
+    BuyTools = {},
+    AutoUpgrades = false,
+    BuyUpgrades = {},
+    AutoDynamite = false,
+    AutoCars = false,
+    BuyCars = {},
+    AutoBackpack = false,
+    AutoJoin = false,
+    Difficulty = "NORMAL",
+    PartySize = 1,
+    SavedRun = nil,
+    AutoDaily = false,
+    AutoClasses = false,
+    BuyClasses = {},
+    AutoGemPerks = false,
+    BuyGemPerks = {},
+    WalkSpeedEnabled = false,
+    WalkSpeed = 32,
+    InfJump = false,
+    NoClip = false,
+    InstantProximityPrompt = false,
+    Fly = false,
+    FlySpeed = 60,
+    AntiGameplayPause = true,
+    AutoReconnect = false,
+    Disable3DRendering = false,
+    FpsBoost = false,
+    AntiAfk = true,
+    NoCustomCursor = false,
+    FreeCursorMenu = true,
+}
+
+local walkSpeedRestore = {}
+local noclipRestore = {}
+local promptRestore = {}
+local fpsRestore = {}
+local flyState = nil
+local infJumpConn = nil
+local noclipConn = nil
+local promptConn = nil
+local fpsConn = nil
+local antiAfkConn = nil
+local antiAfkLast = 0
+local reconnectConn = nil
+local reconnectFailedConn = nil
+local reconnectToken = 0
+local gameplayPauseConn = nil
+local renderBacking = nil
+local cursorBound = false
+local menuCursor = nil
+
+local Remotes, Config
+pcall(function()
+    Remotes = require(ReplicatedStorage:WaitForChild("Shared", 15):WaitForChild("Services", 15):WaitForChild("ChopRemotes", 15))
+end)
+pcall(function()
+    Config = require(ReplicatedStorage.Shared:WaitForChild("Configs", 15):WaitForChild("Chopping", 15))
+end)
+
+local Game = {
+    trees = 0,
+    sells = 0,
+    bought = 0,
+    status = "Idle",
+    busy = false,
+    hitSeq = 0,
+    badTrees = {},
+    badLogs = {},
+    carBuys = {},
+    dayNight = "Unknown",
+    lastNightMob = nil,
+    bossAreaKey = nil,
+    bossSeen = false,
+    bossName = nil,
+    bossDefeated = false,
+    bossBaselineUnlock = nil,
+    bossCleared = false,
+    bossPhase = false,
+    bossErrorAt = nil,
+    bossEndConfirmedAt = nil,
+    bossAreaMarker = nil,
+    sellAreaNumber = nil,
+    treeSearchZone = nil,
+    treeSearchAnchor = nil,
+    treeSearchStep = 0,
+    treeSearchNextAt = 0,
+    treeSearchLastArea = nil,
+    finalSequence = false,
+    finalDone = false,
+    finalGuiHidden = false,
+    finalReturnClickedAt = nil,
+    finalStage = nil,
+    finalStartedAt = nil,
+    finalNextAction = 0,
+    finalTalkAttempts = 0,
+    finalTarget = nil,
+    goldenAspensChecked = false,
+    finalRejected = false,
+    finalReturnCFrame = nil,
+}
+local WORKER_STEPS
+
+local TOOL_STATIONS = {
+    Axe = "Station_Axe",
+    Vacuum = "Station_Vacuum",
+    Chainsaw = "Station_TrialChainsaw",
+    Flamethrower = "Station_Flamethrower",
+}
+
+local function track(conn)
+    if conn then
+        table.insert(connections, conn)
+    end
+    return conn
+end
+
+local function notify(content, notifyType)
+    if Library and type(Library.Notify) == "function" then
+        Library:Notify({
+            Title = GAME_NAME,
+            Content = content,
+            Type = notifyType or "Info",
+            Duration = 3,
+        })
+    end
+end
+
+local function readFlag(name, default)
+    local entry = Library and Library.Flags and Library.Flags[name]
+    if entry == nil then
+        return default
+    end
+    if type(entry) == "table" then
+        if type(entry.Get) == "function" then
+            local ok, value = pcall(entry.Get, entry)
+            if ok then
+                return value
+            end
+        end
+        if entry.Value ~= nil then
+            return entry.Value
+        end
+        return default
+    end
+    return entry
+end
+
+local function asList(option)
+    local out = {}
+    if typeof(option) == "table" then
+        for _, v in ipairs(option) do
+            table.insert(out, v)
+        end
+    elseif type(option) == "string" then
+        table.insert(out, option)
+    end
+    return out
+end
+
+local function firstOption(option)
+    if typeof(option) == "table" then
+        return option[1]
+    end
+    return option
+end
+
+local function getRoot()
+    local character = LocalPlayer.Character
+    if not character then
+        return nil, nil
+    end
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    local root = character:FindFirstChild("HumanoidRootPart")
+    if humanoid and humanoid.Health > 0 and root and root:IsA("BasePart") then
+        return humanoid, root
+    end
+    return nil, nil
+end
+
+local BOSS_PAUSED_WORKERS = {
+    Farm = true, AutoCoins = true, AutoTools = true, AutoUpgrades = true,
+    AutoDynamite = true, AutoCars = true, AutoBackpack = true,
+    AutoDaily = true, AutoClasses = true, AutoGemPerks = true,
+    AutoJoin = true,
+}
+
+local function startWorker(key, interval, step)
+    if workers[key] then
+        return
+    end
+    workers[key] = true
+    task.spawn(function()
+        while workers[key] and not unloaded do
+            if (Game.bossPhase or Game.finalSequence) and BOSS_PAUSED_WORKERS[key] then
+                task.wait(interval)
+                continue
+            end
+            local ok, err = pcall(step)
+            if not ok then
+                warn("[Deforestation] " .. key .. ": " .. tostring(err))
+            end
+            task.wait(interval)
+        end
+        workers[key] = nil
+    end)
+end
+
+local function stopWorker(key)
+    workers[key] = false
+end
+
+local function setWorker(key, enabled, interval, step)
+    if enabled then
+        startWorker(key, interval, step)
+    else
+        stopWorker(key)
+    end
+end
+
+local function cashValue()
+    local ls = LocalPlayer:FindFirstChild("leaderstats")
+    local cash = ls and ls:FindFirstChild("Cash")
+    return cash and cash.Value or 0
+end
+
+local function gemsValue()
+    return tonumber(LocalPlayer:GetAttribute("Gems")) or 0
+end
+
+local function carried()
+    return tonumber(LocalPlayer:GetAttribute("CarriedLogs")) or 0
+end
+
+local function backpackLevel()
+    return math.floor(tonumber(LocalPlayer:GetAttribute("Up_GearBackpack")) or 0)
+end
+
+local function upgradeDef(id)
+    if not Config then
+        return nil
+    end
+    for _, section in ipairs(Config.Upgrades.Sections) do
+        for _, item in ipairs(section.Items) do
+            if item.Id == id then
+                return item, section
+            end
+        end
+    end
+    return nil
+end
+
+local function capacity()
+    local item = upgradeDef("GearBackpack")
+    local level = backpackLevel()
+    local bag = item and item.Capacity and level > 0 and item.Capacity[math.min(level, #item.Capacity)] or 0
+    return bag + 5
+end
+
+-- Per-zone selling targets, set by the dropdowns in the Main tab.
+local SELL_OPTIONS = {"40", "60", "80", "100", "150", "999", "Don't Pick Up Logs"}
+local sellByZone = {}
+local function currentSellZone()
+    local areaNumber = Game.sellAreaNumber
+    local order = Config and Config.Forest and Config.Forest.Areas and Config.Forest.Areas.Order or {}
+    return (areaNumber and order[areaNumber]) or Flags.Zone
+end
+
+local function pickupDisabledForZone()
+    return sellByZone[currentSellZone()] == "Don't Pick Up Logs"
+end
+
+local function sellThreshold()
+    local zone = currentSellZone()
+    local value = tonumber(sellByZone[zone])
+    if value then return value end
+    -- The no-pickup choice is handled separately; this fallback keeps
+    -- other numerical comparisons safe if the player already has logs.
+    if pickupDisabledForZone() then return 999 end
+    local order = Config and Config.Forest and Config.Forest.Areas and Config.Forest.Areas.Order or {}
+    return (zone == order[1]) and 60 or 100
+end
+
+local function zoneOrder()
+    local order = Config and Config.Forest.Areas.Order or {}
+    return order
+end
+
+local function zoneIndex(key)
+    for i, k in ipairs(zoneOrder()) do
+        if k == key then
+            return i
+        end
+    end
+    return nil
+end
+
+local function zoneLabel(key)
+    local biome = Config and Config.Forest.Biomes[key]
+    return biome and biome.Label or key
+end
+
+local function zoneUnlocked(key)
+    local index = zoneIndex(key)
+    local unlocked = tonumber(workspace:GetAttribute("AreasUnlocked")) or 1
+    return index ~= nil and index <= unlocked
+end
+
+local function teleport(position)
+    local _, root = getRoot()
+    if not root then
+        return false
+    end
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.CFrame = CFrame.new(position)
+    return true
+end
+
+local function partPosition(inst)
+    if not inst then
+        return nil
+    end
+    if inst:IsA("BasePart") then
+        return inst.Position
+    end
+    if inst:IsA("Model") then
+        return inst:GetPivot().Position
+    end
+    return nil
+end
+
+-- Read the top-right area label, not boss health bars or objective text.
+local function visibleHudLabel(node)
+    if not (node:IsA("TextLabel") or node:IsA("TextButton")) then return false end
+    local ancestor = node
+    while ancestor and ancestor ~= game do
+        if ancestor:IsA("GuiObject") and not ancestor.Visible then return false end
+        if ancestor:IsA("ScreenGui") and not ancestor.Enabled then return false end
+        ancestor = ancestor.Parent
+    end
+    return true
+end
+
+local function cleanAreaHudText(value)
+    return tostring(value or ""):gsub("<[^>]->", ""):gsub("&nbsp;", " "):gsub("\194\160", " ")
+end
+
+local function areaProgress(text)
+    text = cleanAreaHudText(text):lower()
+    return tonumber(text:match("(%d+%.?%d*)%s*%%%s*cleared")
+        or text:match("(%d+%.?%d*)%s*%%"))
+end
+
+local function normalizeZoneLabel(value)
+    return tostring(value or ""):lower():gsub("[^%w]", "")
+end
+
+local detectedZoneDropdown = nil
+local settingZoneFromDetection = false
+local function detectCurrentZone()
+    if not Flags.AutoDetectZone then return end
+    local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not gui then return end
+    local cam = workspace.CurrentCamera
+    local size = cam and cam.ViewportSize or Vector2.new(1920,1080)
+    for _, node in ipairs(gui:GetDescendants()) do
+        if visibleHudLabel(node) then
+            local pos = node.AbsolutePosition
+            if pos.X >= size.X * 0.52 and pos.Y < size.Y * 0.32 then
+                local raw = cleanAreaHudText(node.Text)
+                local stripped = raw:match("^%s*(.-)%s+[Aa][Rr][Ee][Aa]%s*%d+%s*/%s*%d+") or raw
+                local name = normalizeZoneLabel(stripped)
+                for _, key in ipairs(zoneOrder()) do
+                    if name ~= "" and (name == normalizeZoneLabel(key) or name == normalizeZoneLabel(zoneLabel(key))) then
+                        if Flags.Zone ~= key then
+                            Flags.Zone = key
+                            table.clear(Game.badTrees)
+                            -- Keep the GUI dropdown in sync when the library supports setting a value.
+                            if detectedZoneDropdown then
+                                settingZoneFromDetection = true
+                                pcall(function()
+                                    if type(detectedZoneDropdown.Set) == "function" then
+                                        detectedZoneDropdown:Set({zoneLabel(key)})
+                                    elseif type(detectedZoneDropdown.SetValue) == "function" then
+                                        detectedZoneDropdown:SetValue(zoneLabel(key))
+                                    end
+                                end)
+                                settingZoneFromDetection = false
+                            end
+                        end
+                        return
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- Observe the cleared-area HUD and active boss health bar only.
+-- This does not attack, move toward, or interact with bosses.
+local function readBossProgress()
+    local state = { cleared = false, progress = nil, marker = nil, name = nil, hp = nil, timerVisible = false }
+    local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not gui then return state end
+    local camera = workspace.CurrentCamera
+    local viewport = camera and camera.ViewportSize or Vector2.new(1920,1080)
+    local labels = {}
+    for _, node in ipairs(gui:GetDescendants()) do
+        if visibleHudLabel(node) then
+            local text = cleanAreaHudText(node.Text)
+            local pos = node.AbsolutePosition
+            -- The normal day/night HUD displays a countdown such as "4m 46s".
+            -- Check visible upper-screen text, independently from the boss HP bar.
+            local timerText = text:lower():gsub("%s+", " ")
+            if pos.Y <= viewport.Y * 0.28
+                and (timerText:match("%d+%s*m%s*%d+%s*s")
+                    or timerText:match("%d+%s*m%s*$")
+                    or timerText:match("%d+%s*s%s*$")) then
+                state.timerVisible = true
+            end
+            if pos.X >= viewport.X * 0.50 and pos.Y <= viewport.Y * 0.35 then
+                local pct = areaProgress(text)
+                if pct then
+                    state.progress = pct
+                    state.cleared = pct >= 99.9
+                end
+                local area, total = text:lower():match("area%s*(%d+)%s*/%s*(%d+)")
+                if area and total then state.marker = area .. "/" .. total end
+            end
+            if pos.Y <= viewport.Y * 0.24 then
+                table.insert(labels, { node = node, text = text, pos = pos, size = node.AbsoluteSize })
+            end
+        end
+    end
+    local best = math.huge
+    for _, healthLabel in ipairs(labels) do
+        local a, b = healthLabel.text:match("^%s*([%d,%.]+)%s*/%s*([%d,%.]+)%s*$")
+        local hp, maximum = tonumber(a and a:gsub(",", "")), tonumber(b and b:gsub(",", ""))
+        if hp and maximum and maximum >= 20 and hp >= 0 and hp <= maximum then
+            for _, nameLabel in ipairs(labels) do
+                if nameLabel ~= healthLabel then
+                    local name = nameLabel.text:match("^%s*(.-)%s*$") or ""
+                    local lower = name:lower()
+                    local gap = healthLabel.pos.Y - (nameLabel.pos.Y + nameLabel.size.Y)
+                    local dx = math.abs((healthLabel.pos.X + healthLabel.size.X/2) - (nameLabel.pos.X + nameLabel.size.X/2))
+                    if #name >= 3 and #name <= 32 and name:match("^[%a][%a%s%-']+$")
+                        and not lower:find("clear", 1, true) and not lower:find("wake", 1, true)
+                        and not lower:find("area", 1, true) and not lower:find("chopping", 1, true)
+                        and gap >= -4 and gap <= 48 and dx <= 220 then
+                        local score = math.abs(gap) + dx * 0.15
+                        if score < best then
+                            best = score
+                            state.name, state.hp = name, hp
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return state
+end
+
+
+-- Working standalone Boss Test v7: rig verification, tracking and attack style.
+local function getPlayerRootForBoss() return getRoot() end
+local BossV7 = (function()
+    local player = LocalPlayer
+    local function getRoot() return select(2, getPlayerRootForBoss()) end
+local Game = {areaBossName = nil}
+local LocalPlayer = player
+local function normalizedName(value)
+    return string.gsub(string.lower(tostring(value or "")), "[^%w]", "")
+end
+local function modelHealth(model)
+    if not model or not model.Parent then return 0 end
+    local humanoid = model:FindFirstChildOfClass("Humanoid")
+    if humanoid then return humanoid.Health end
+    local hp = tonumber(model:GetAttribute("HP"))
+    if hp == nil then hp = tonumber(model:GetAttribute("Health")) end
+    if hp == nil then
+        local value = model:FindFirstChild("HP") or model:FindFirstChild("Health")
+        if value and (value:IsA("NumberValue") or value:IsA("IntValue")) then hp = value.Value end
+    end
+    return hp
+end
+-- Only actual character rigs qualify as boss targets. Never fall back to an
+-- arbitrary BasePart (that was making map structures into attack targets).
+local function modelRootPart(model)
+    if not model or not model:IsA("Model") then return nil end
+    local humanoid = model:FindFirstChildOfClass("Humanoid")
+    local root = model:FindFirstChild("HumanoidRootPart")
+        or model:FindFirstChild("RootPart")
+        or (humanoid and humanoid.RootPart)
+        or model:FindFirstChild("UpperTorso")
+        or model:FindFirstChild("Torso")
+    if root and root:IsA("BasePart") then return root end
+    -- Custom non-Humanoid bosses must expose a direct, identifiable root
+    -- and actual health data, rather than borrowing a building's PrimaryPart.
+    local hp = modelHealth(model)
+    if hp ~= nil and hp > 0 and model.PrimaryPart and model.PrimaryPart:IsA("BasePart") then
+        return model.PrimaryPart
+    end
+    return nil
+end
+
+local function isBossRig(model)
+    if not model or not model:IsA("Model") or model == player.Character then return false end
+    local n = normalizedName(model.Name)
+    for _, token in ipairs({"shed", "cabin", "house", "building", "hut", "shop", "garage", "station", "barn", "decor", "healthbar", "billboard", "nameplate"}) do
+        if n:find(token, 1, true) then return false end
+    end
+    local hum = model:FindFirstChildOfClass("Humanoid")
+    if hum then return hum.Health > 0 and modelRootPart(model) ~= nil end
+    return modelHealth(model) ~= nil and modelHealth(model) > 0 and modelRootPart(model) ~= nil
+end
+
+local function findActiveBoss(preferredName)
+        preferredName = preferredName or Game.areaBossName
+        local preferred = normalizedName(preferredName)
+        local preferredCore = string.gsub(preferred, "^the", "")
+        local playerRoot = getRoot()
+        local bestModel, bestScore = nil, -math.huge
+
+        -- Do not let short nested-model names such as "Old" or UI models such
+        -- as "OldBarkbackHealthBar" masquerade as the live boss. Only accept a
+        -- name that exactly matches the HUD name or contains the full HUD name.
+        local function matchesPreferred(value)
+            local normalized = normalizedName(value)
+            if normalized == "" or preferred == "" then return false, 0 end
+            if normalized == preferred or (preferredCore ~= "" and normalized == preferredCore) then
+                return true, 2
+            end
+            if #preferred >= 6 and #normalized >= #preferred
+                and string.find(normalized, preferred, 1, true) ~= nil then
+                return true, 1
+            end
+            if #preferredCore >= 6 and #normalized >= #preferredCore
+                and string.find(normalized, preferredCore, 1, true) ~= nil then
+                return true, 1
+            end
+            return false, 0
+        end
+
+        local function isUiOrEffectModel(value)
+            local n = normalizedName(value)
+            for _, token in ipairs({ "healthbar", "bossbar", "healthui", "billboard", "nameplate", "nametag", "indicator", "displaygui", "effect", "vfx" }) do
+                if string.find(n, token, 1, true) ~= nil then return true end
+            end
+            return false
+        end
+
+        local function explicitRigRoot(model)
+            local humanoid = model:FindFirstChildOfClass("Humanoid")
+                or model:FindFirstChildWhichIsA("Humanoid", true)
+            local root = model:FindFirstChild("HumanoidRootPart", true)
+                or model:FindFirstChild("RootPart", true)
+                or model:FindFirstChild("PrimaryPart", true)
+                or model:FindFirstChild("UpperTorso", true)
+                or model:FindFirstChild("Torso", true)
+                or model.PrimaryPart
+                or (humanoid and humanoid.RootPart)
+            if root and root:IsA("BasePart") then return root, humanoid end
+            return nil, humanoid
+        end
+
+        local function consider(model, kind, strength)
+            if not model or not model:IsA("Model") or model == LocalPlayer.Character
+                or not model.Parent or isUiOrEffectModel(model.Name) then
+                return
+            end
+            local targetRoot, humanoid = explicitRigRoot(model)
+            -- A real NPC rig should expose either a Humanoid or a stable named
+            -- root part. Do not use the first arbitrary BasePart in a building,
+            -- accessory, or HUD model as a teleport destination.
+            if not targetRoot or not isBossRig(model) then return end
+            local hp = modelHealth(model)
+            if hp ~= nil and hp <= 0 then return end
+            local distance = playerRoot and (targetRoot.Position - playerRoot.Position).Magnitude or 1000
+            local score = strength - distance
+            if humanoid then score += 2500 end
+            if targetRoot.Name == "HumanoidRootPart" or targetRoot.Name == "RootPart" then score += 1000 end
+            local boxOk, _, boxSize = pcall(function() return model:GetBoundingBox() end)
+            if boxOk and boxSize and typeof(boxSize) == "Vector3" then
+                -- Only a tiny tie-breaker: huge buildings should never beat a rig match.
+                score += math.min(boxSize.Magnitude, 80) * 0.1
+            end
+            if score > bestScore then
+                bestModel, bestScore = model, score
+            end
+        end
+
+        for _, inst in ipairs(workspace:GetDescendants()) do
+            if inst:IsA("Model") then
+                local candidate = normalizedName(inst.Name)
+                local namedMatch, nameStrength = matchesPreferred(candidate)
+                local displayMatch = false
+                local displayStrength = 0
+                local genericMatch = string.find(candidate, "boss", 1, true) ~= nil
+                    or string.find(candidate, "barkback", 1, true) ~= nil
+
+                local function inspectDisplay(value)
+                    if value == nil then return end
+                    local display = normalizedName(value)
+                    local match, strength = matchesPreferred(display)
+                    if match then
+                        displayMatch = true
+                        displayStrength = math.max(displayStrength, strength)
+                    end
+                    if string.find(display, "boss", 1, true) ~= nil
+                        or string.find(display, "barkback", 1, true) ~= nil then
+                        genericMatch = true
+                    end
+                end
+                for _, attributeName in ipairs({ "DisplayName", "BossName", "NPCType", "MobType", "EnemyType", "MonsterType" }) do
+                    inspectDisplay(inst:GetAttribute(attributeName))
+                end
+                local hum = inst:FindFirstChildOfClass("Humanoid")
+                    or inst:FindFirstChildWhichIsA("Humanoid", true)
+                if hum and hum.DisplayName and hum.DisplayName ~= "" then
+                    inspectDisplay(hum.DisplayName)
+                end
+
+                if namedMatch then
+                    consider(inst, "name", nameStrength == 2 and 20000 or 16000)
+                elseif displayMatch then
+                    consider(inst, "display", displayStrength == 2 and 18000 or 15000)
+                elseif genericMatch and preferred == "" then
+                    -- Only use generic Boss/Barkback names when the HUD has not
+                    -- supplied an identifying name. If it has, substring-only
+                    -- generic matches tend to hit unrelated props and nameplates.
+                    consider(inst, "generic", 6000)
+                elseif genericMatch and (hum ~= nil) then
+                    -- A properly-rigged generic BossNPC is a fallback when the
+                    -- HUD gives a specific name that the rig does not expose.
+                    consider(inst, "generic-rig", 5500)
+                end
+            elseif (inst:IsA("TextLabel") or inst:IsA("TextButton")) and preferred ~= "" then
+                -- World-space boss name tags often live under the model rather
+                -- than using the same name. Follow the tag upward and accept the
+                -- nearest ancestor that is genuinely an NPC rig, never a shed or
+                -- arbitrary map model that merely contains the label.
+                local labelMatch = matchesPreferred(inst.Text)
+                if labelMatch then
+                    local ancestor = inst.Parent
+                    while ancestor and ancestor ~= workspace do
+                        if ancestor:IsA("Model") and ancestor ~= LocalPlayer.Character then
+                            local rootPart, humanoid = explicitRigRoot(ancestor)
+                            if humanoid and rootPart and isBossRig(ancestor) and not isUiOrEffectModel(ancestor.Name) then
+                                consider(ancestor, "world-name-tag", 17000)
+                                break
+                            end
+                        end
+                        ancestor = ancestor.Parent
+                    end
+                end
+            end
+        end
+
+        return bestModel
+    end
+
+-- Boss positioning derived from the user's working script: stable approach in front of the boss.
+local approachDirection
+local function placeAtBossWeakpoint(boss)
+    local playerRoot = getRoot()
+    local targetRoot = modelRootPart(boss)
+    if not playerRoot or not targetRoot then return false end
+    local ok, boxCf, boxSize = pcall(function() return boss:GetBoundingBox() end)
+    if not ok then boxCf, boxSize = targetRoot.CFrame, targetRoot.Size end
+    if not approachDirection then
+        local look = targetRoot.CFrame.LookVector
+        local flat = Vector3.new(look.X, 0, look.Z)
+        approachDirection = flat.Magnitude > 0.05 and flat.Unit or Vector3.new(0, 0, -1)
+    end
+    local frontDistance = 3.5 -- Nighttime-style melee range; original uses 15 for gun fire.
+    local bossFeetY = boxCf.Position.Y - boxSize.Y * 0.5
+    local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+    local rootToFeet = (hum and hum.HipHeight or 2) + playerRoot.Size.Y * 0.5
+    local destination = Vector3.new(
+        boxCf.Position.X + approachDirection.X * frontDistance,
+        bossFeetY + rootToFeet + 0.5,
+        boxCf.Position.Z + approachDirection.Z * frontDistance
+    )
+    local aimHeight = math.clamp(boxSize.Y * 0.19, 1.5, 5)
+    local aimPoint = boxCf.Position - Vector3.new(0, boxSize.Y * 0.5 - aimHeight, 0)
+        - boxCf.RightVector * (boxSize.X * 0.22)
+    local flatAim = Vector3.new(aimPoint.X, destination.Y, aimPoint.Z)
+    playerRoot.AssemblyLinearVelocity = Vector3.zero
+    playerRoot.CFrame = CFrame.lookAt(destination, flatAim)
+    return true
+end
+
+-- Matches the nighttime combat method in Deforestation v0.9.
+local function clickAttack()
+    local char = player.Character
+    local tool = char and char:FindFirstChildOfClass("Tool")
+    if tool then pcall(function() tool:Activate() end) end
+    local camera = workspace.CurrentCamera
+    local size = camera and camera.ViewportSize or Vector2.new(1600,900)
+    local x,y = math.floor(size.X/2), math.floor(size.Y/2)
+    local ok = pcall(function()
+        local vim = game:GetService("VirtualInputManager")
+        vim:SendMouseButtonEvent(x,y,0,true,game,0)
+        task.wait(0.05)
+        vim:SendMouseButtonEvent(x,y,0,false,game,0)
+    end)
+    if not ok and type(mouse1click) == "function" then pcall(mouse1click) end
+end
+
+
+    return {find = findActiveBoss, valid = isBossRig, root = modelRootPart,
+        position = placeAtBossWeakpoint, attack = clickAttack, health = modelHealth}
+end)()
+
+local bossTarget = nil
+local bossNextScan = 0
+local bossLastPosition = 0
+local bossNextAttack = 0
+local bossCombatRunning = false
+local function bossCombatStep()
+    if unloaded or not Flags.AutoChop or not Game.bossPhase or Game.bossDefeated or Game.finalSequence then return end
+    if bossCombatRunning then return end
+    bossCombatRunning = true
+    local ok, err = pcall(function()
+        local state = readBossProgress()
+        if state.marker and Game.bossAreaKey ~= tostring(Flags.Zone) .. "|" .. state.marker then return end
+        -- A 0 HP HUD can still need a final hit/animation. Do not end here.
+        -- Completion is confirmed by the vanished boss HUD and returned cycle timer.
+        if state.name and Game.bossName and normalizeZoneLabel(state.name) ~= normalizeZoneLabel(Game.bossName) then
+            bossTarget = nil
+            bossNextScan = 0
+            Game.bossName = state.name
+        end
+        if not Game.bossName then
+            Game.status = "Area cleared; waiting for boss bar"
+            return
+        end
+        if bossTarget and (not bossTarget.Parent or not BossV7.root(bossTarget)) then
+            bossTarget = nil
+        end
+        if not bossTarget and os.clock() >= bossNextScan then
+            bossNextScan = os.clock() + 3
+            bossTarget = BossV7.find(Game.bossName)
+        end
+        if not bossTarget then
+            Game.status = "Boss detected; waiting for verified NPC"
+            return
+        end
+        local targetRoot = BossV7.root(bossTarget)
+        -- The model was validated when first acquired. Retain that lock if
+        -- its health reaches zero while the boss bar is still onscreen.
+        if not targetRoot then
+            bossTarget = nil
+            return
+        end
+        Game.status = "Boss combat: " .. tostring(bossTarget.Name)
+        if os.clock() - bossLastPosition >= 0.3 then
+            bossLastPosition = os.clock()
+            BossV7.position(bossTarget)
+        end
+        if os.clock() >= bossNextAttack then
+            bossNextAttack = os.clock() + 0.30
+            BossV7.attack()
+        end
+    end)
+    bossCombatRunning = false
+    if not ok then
+        Game.status = "Boss combat error: " .. tostring(err)
+        if not Game.bossErrorAt or os.clock() - Game.bossErrorAt >= 8 then
+            Game.bossErrorAt = os.clock()
+            warn("[Deforestation] Boss combat: " .. tostring(err))
+        end
+    end
+end
+
+-- End-of-run objective: a checkmark next to Golden Aspens in the upper-right HUD.
+-- Also accept the checkmark as a neighboring label in the same HUD row.
+local function goldenAspensCheckVisible()
+    local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not gui then return false end
+    local camera = workspace.CurrentCamera
+    local viewport = camera and camera.ViewportSize or Vector2.new(1920, 1080)
+    local labels = {}
+    -- The end-of-area records are in the top-right portion of the game HUD.
+    -- They may consist of several TextLabels and an ImageLabel checkmark.
+    for _, node in ipairs(gui:GetDescendants()) do
+        if (node:IsA("TextLabel") or node:IsA("TextButton")) and visibleHudLabel(node) then
+            local pos = node.AbsolutePosition
+            if pos.X >= viewport.X * 0.35 and pos.Y <= viewport.Y * 0.48 then
+                local content = cleanAreaHudText(node.Text):lower()
+                if content ~= "" then
+                    table.insert(labels, {
+                        text = content,
+                        x = pos.X, y = pos.Y,
+                        parent = node.Parent,
+                    })
+                end
+            end
+        end
+    end
+    local function completedMark(text)
+        return text:find("✓", 1, true) ~= nil
+            or text:find("✔", 1, true) ~= nil
+            or text:find("☑", 1, true) ~= nil
+            or text:find("✅", 1, true) ~= nil
+            or text:find("√", 1, true) ~= nil
+    end
+    local function hasRunTime(text)
+        -- Completed-area record examples: 1:21:00 and -1:54:27.
+        -- Unlike the current-area countdown, these appear on the same
+        -- horizontal row as the zone name.
+        return text:match("%d+:%d%d:%d%d") ~= nil
+    end
+    for _, label in ipairs(labels) do
+        if label.text:find("golden%s*aspens") then
+            -- The zone title at the top of the HUD is not a completion signal.
+            -- Look for either a checkmark or a completed-run time in its row.
+            if completedMark(label.text) or hasRunTime(label.text) then
+                return true
+            end
+            for _, other in ipairs(labels) do
+                if other ~= label
+                    and math.abs(other.y - label.y) <= 22
+                    and math.abs(other.x - label.x) <= 320
+                    and (completedMark(other.text) or hasRunTime(other.text)) then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+local function beginFinalBusinessman(reason)
+    if Game.finalSequence or Game.finalDone then return end
+    local _, previousRoot = getRoot()
+    if previousRoot then Game.finalReturnCFrame = previousRoot.CFrame end
+    Game.finalSequence = true
+    Game.bossPhase = true -- immediately pause ongoing farming, pickup and selling
+    Game.goldenAspensChecked = true
+    Game.finalStartedAt = os.clock()
+    Game.finalStage = "FindBusinessman"
+    Game.finalNextAction = 0
+    Game.status = "Golden Aspens cleared; visiting Businessman"
+    print("[Deforestation] " .. reason .. "; starting Businessman interaction")
+end
+
+local function monitorBossAndAdvance()
+    if not Flags.AutoChop and not Flags.AutoSell and not Flags.AutoPickup then return end
+    local zone = Flags.Zone
+    local state = readBossProgress()
+    -- The final-area checkmark is authoritative: begin the Businessman flow
+    -- even when the boss HUD or regular day/night timer has disappeared.
+    if not Game.finalSequence and not Game.finalDone and not Game.finalRejected
+        and Game.bossDefeated
+        and (zone == "GoldenAspens" or state.marker == "8/8" or Game.bossAreaMarker == "8/8" or Game.sellAreaNumber == 8)
+        and goldenAspensCheckVisible() then
+        beginFinalBusinessman("Golden Aspens checkmark detected")
+        return
+    end
+    -- Area number is authoritative for log selling when the top-right HUD is present.
+    -- Keep the last number while the HUD temporarily disappears for boss animations.
+    if state.marker then
+        local currentArea = tonumber(state.marker:match("^(%d+)/"))
+        if currentArea then Game.sellAreaNumber = currentArea end
+    end
+    if not Flags.AutoChop then return end
+    if Game.finalSequence then return end
+    -- A disappearing area label during the defeat animation is not a new area.
+    local areaKey = tostring(zone) .. "|" .. tostring(state.marker or (Game.bossPhase and Game.bossAreaMarker) or "")
+    if Game.bossAreaKey ~= areaKey then
+        Game.bossAreaKey = areaKey
+        Game.bossSeen, Game.bossDefeated, Game.bossCleared = false, false, false
+        Game.bossPhase = false
+        Game.bossAreaMarker = state.marker
+        Game.bossEndConfirmedAt = nil
+        bossTarget = nil
+        bossNextScan = 0
+        Game.bossName = nil
+        Game.bossBaselineUnlock = tonumber(workspace:GetAttribute("AreasUnlocked")) or 1
+    end
+    -- A genuine 100% top-right progress label is required before boss handling.
+    if state.progress ~= nil and state.cleared then Game.bossCleared = true end
+    if not Game.bossCleared then return end
+    if Game.finalRejected and state.cleared and state.name then
+        Game.finalRejected = false
+        print("[Deforestation] Confirmed new Golden Aspens boss encounter")
+    end
+    if state.name then
+        Game.bossPhase = true -- 100% + a spawned boss bar; pause the farming/day-night cycle
+        if not Game.bossSeen or Game.bossName ~= state.name then
+            Game.bossName = state.name
+            print("[Deforestation] Boss detected: " .. state.name .. "; switching to Boss Test v7 combat")
+        end
+        Game.bossSeen = true
+    end
+    local unlocked = tonumber(workspace:GetAttribute("AreasUnlocked")) or 1
+    -- Do not trust 0 HP or a zone-unlock attribute by themselves. The boss
+    -- bar must vanish AND the normal day/night timer must be visible again.
+    if Game.bossPhase and Game.bossSeen and state.name == nil and state.timerVisible then
+        Game.bossEndConfirmedAt = Game.bossEndConfirmedAt or os.clock()
+        if os.clock() - Game.bossEndConfirmedAt >= 0.6 then
+            Game.bossDefeated = true
+        end
+    else
+        Game.bossEndConfirmedAt = nil
+    end
+    if not Game.bossDefeated then
+        if Game.bossPhase then
+            if state.hp ~= nil and state.hp <= 0 then
+                Game.status = "Boss at 0 HP; attacking until bar disappears and timer returns"
+            elseif state.name == nil then
+                Game.status = "Boss bar gone; waiting for day/night timer"
+            else
+                Game.status = Game.status:find("Boss combat", 1, true) and Game.status or "Area cleared; boss combat active"
+            end
+        else
+            Game.status = "Area cleared; waiting for boss to spawn"
+        end
+        return
+    end
+    -- The last boss ends the forest run; finish at the Businessman instead
+    -- of trying to advance beyond Golden Aspens.
+    if not Game.finalRejected and (zone == "GoldenAspens" or Game.bossAreaMarker == "8/8" or state.marker == "8/8") then
+        beginFinalBusinessman("Golden Aspens boss defeat confirmed")
+        return
+    end
+    if not Flags.AutoAdvanceZone then
+        Game.status = "Boss defeated; auto advance disabled"
+        return
+    end
+    local order, index = zoneOrder(), zoneIndex(zone)
+    if not index then return end
+    for i = index + 1, #order do
+        if zoneUnlocked(order[i]) then
+            local nextZone = order[i]
+            Flags.Zone = nextZone
+            table.clear(Game.badTrees)
+            Game.bossAreaKey = nil
+            Game.bossPhase = false
+            Game.bossEndConfirmedAt = nil
+            bossTarget = nil
+            Game.bossSeen, Game.bossDefeated, Game.bossCleared = false, false, false
+            Game.bossName = nil
+            Game.bossBaselineUnlock = unlocked
+            if detectedZoneDropdown then
+                settingZoneFromDetection = true
+                pcall(function()
+                    if type(detectedZoneDropdown.Set) == "function" then
+                        detectedZoneDropdown:Set({zoneLabel(nextZone)})
+                    elseif type(detectedZoneDropdown.SetValue) == "function" then
+                        detectedZoneDropdown:SetValue(zoneLabel(nextZone))
+                    end
+                end)
+                settingZoneFromDetection = false
+            end
+            Game.status = "Advanced to " .. zoneLabel(nextZone)
+            print("[Deforestation] Boss defeated; advanced to " .. zoneLabel(nextZone))
+            return
+        end
+    end
+    Game.status = "Boss defeated; waiting for next zone unlock"
+end
+
+-- Final Golden Aspens interaction.  The businessman position shown in the
+-- user's screenshot is a fallback, not a guarantee of where the NPC is.
+local BUSINESSMAN_FALLBACK = Vector3.new(330.1, 3.2, 181.9)
+local finalNpcScanAt = 0
+
+local function visibleFinalGui(node)
+    if not node or not node:IsA("GuiObject") then return false end
+    local current = node
+    while current do
+        if current:IsA("GuiObject") and not current.Visible then return false end
+        if current:IsA("ScreenGui") and not current.Enabled then return false end
+        current = current.Parent
+    end
+    return true
+end
+
+local finalLastDialogueSnapshot = nil
+local function logBusinessmanDialogue()
+    local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not gui then return end
+    local entries = {}
+    local seen = {}
+    for _, node in ipairs(gui:GetDescendants()) do
+        if (node:IsA("TextLabel") or node:IsA("TextButton") or node:IsA("TextBox"))
+            and visibleFinalGui(node) then
+            local inDialogue = false
+            local cursor = node
+            while cursor and cursor ~= gui do
+                local name = cursor.Name:lower()
+                if name:find("dialog", 1, true) or name:find("conversation", 1, true) then
+                    inDialogue = true
+                    break
+                end
+                cursor = cursor.Parent
+            end
+            if inDialogue then
+                local content = tostring(node.Text or ""):gsub("<[^>]->", "")
+                    :gsub("%s+", " "):match("^%s*(.-)%s*$")
+                if content and content ~= "" and not seen[content] then
+                    seen[content] = true
+                    table.insert(entries, (node:IsA("TextButton") and "[CHOICE] " or "")
+                        .. content:sub(1, 220))
+                end
+            end
+        end
+    end
+    if #entries == 0 then return end
+    local maxEntries = math.min(#entries, 20)
+    local snapshot = table.concat(entries, " | ", 1, maxEntries)
+    if snapshot ~= finalLastDialogueSnapshot then
+        finalLastDialogueSnapshot = snapshot
+        print("[Deforestation][Businessman dialogue] " .. snapshot)
+    end
+end
+
+local function finalGuiState()
+    local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local state = {won = false, unfinished = false, returnButton = nil, dialogueVisible = false, nextButton = nil}
+    if not gui then return state end
+    local labels = {}
+    local buttons = {}
+    for _, node in ipairs(gui:GetDescendants()) do
+        if (node:IsA("TextLabel") or node:IsA("TextButton")) and visibleFinalGui(node) then
+            local content = tostring(node.Text or ""):lower():gsub("<[^>]->", "")
+            table.insert(labels, {node = node, text = content})
+            if node:IsA("TextButton") then
+                table.insert(buttons, {button = node, text = content})
+            end
+            local ancestry = node
+            while ancestry and ancestry ~= gui do
+                local name = ancestry.Name:lower()
+                if name:find("dialog", 1, true) or name:find("conversation", 1, true) then
+                    state.dialogueVisible = true
+                    break
+                end
+                ancestry = ancestry.Parent
+            end
+        elseif node:IsA("ImageButton") and visibleFinalGui(node) then
+            table.insert(buttons, {button = node, text = node.Name:lower()})
+        end
+    end
+    for _, label in ipairs(labels) do
+        if label.text:find("forest cleared", 1, true) then state.won = true end
+        if label.text:find("go finish your job first", 1, true) then
+            state.unfinished = true
+        end
+    end
+    for _, item in ipairs(buttons) do
+        local t = item.text:gsub("^%s+", ""):gsub("%s+$", "")
+        if t:find("return to lobby", 1, true) or t:find("returntolobby", 1, true) then
+            state.returnButton = item.button
+        elseif t == "continue" or t == "next" or t == "okay" or t == "ok" or t == "yes"
+            or t == "finish" or t == "thanks" or t == "thank you" or t == "goodbye"
+            or t == "proceed" or t == "..." or t == "[next]" then
+            state.nextButton = state.nextButton or item.button
+        end
+    end
+    -- Victory UI often puts the visible caption in a TextLabel inside an
+    -- ImageButton. The TextLabel itself is not the clickable surface.
+    if state.won and not state.returnButton then
+        for _, entry in ipairs(labels) do
+            local normalized = entry.text:gsub("%s+", " ")
+            if normalized:find("return to lobby", 1, true) then
+                local ancestor = entry.node
+                while ancestor and ancestor ~= gui do
+                    if ancestor:IsA("GuiButton") and visibleFinalGui(ancestor) then
+                        state.returnButton = ancestor
+                        break
+                    end
+                    ancestor = ancestor.Parent
+                end
+                if not state.returnButton then
+                    -- Some games place the caption beside a GuiButton rather
+                    -- than beneath it. Match a visible button occupying the
+                    -- same on-screen rectangle as the caption.
+                    local center = entry.node.AbsolutePosition + entry.node.AbsoluteSize * 0.5
+                    for _, item in ipairs(buttons) do
+                        local button = item.button
+                        local topLeft, size = button.AbsolutePosition, button.AbsoluteSize
+                        if size.X > 20 and size.Y > 15
+                            and center.X >= topLeft.X and center.X <= topLeft.X + size.X
+                            and center.Y >= topLeft.Y and center.Y <= topLeft.Y + size.Y then
+                            state.returnButton = button
+                            break
+                        end
+                    end
+                end
+                if state.returnButton then break end
+            end
+        end
+    end
+    return state
+end
+
+local function pressFinalInteract()
+    local ok = pcall(function()
+        local input = game:GetService("VirtualInputManager")
+        input:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+        task.wait(0.08)
+        input:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+    end)
+    if not ok and type(keypress) == "function" and type(keyrelease) == "function" then
+        pcall(function()
+            keypress(0x45)
+            task.wait(0.08)
+            keyrelease(0x45)
+        end)
+    end
+end
+
+local function clickFinalButton(button)
+    if not button or not visibleFinalGui(button) or button.AbsoluteSize.Magnitude < 5 then return false end
+    local at = button.AbsolutePosition + button.AbsoluteSize * 0.5
+    local ok = pcall(function()
+        local input = game:GetService("VirtualInputManager")
+        input:SendMouseButtonEvent(math.floor(at.X), math.floor(at.Y), 0, true, game, 0)
+        task.wait(0.06)
+        input:SendMouseButtonEvent(math.floor(at.X), math.floor(at.Y), 0, false, game, 0)
+    end)
+    return ok
+end
+
+local function locateBusinessman()
+    if Game.finalTarget and Game.finalTarget.Parent then
+        return Game.finalTarget
+    end
+    if os.clock() < finalNpcScanAt then return nil end
+    finalNpcScanAt = os.clock() + 3
+    local best, dist = nil, math.huge
+    for _, node in ipairs(workspace:GetDescendants()) do
+        if (node:IsA("Model") or node:IsA("BasePart"))
+            and node.Name:lower():find("businessman", 1, true) then
+            local point
+            if node:IsA("BasePart") then point = node.Position
+            elseif node.PrimaryPart then point = node.PrimaryPart.Position
+            else
+                local ok, pivot = pcall(function() return node:GetPivot() end)
+                if ok then point = pivot.Position end
+            end
+            if point then
+                local d = (point - BUSINESSMAN_FALLBACK).Magnitude
+                if d < dist then best, dist = node, d end
+            end
+        end
+    end
+    Game.finalTarget = best
+    return best
+end
+
+local function finalBusinessmanStep()
+    if unloaded or not Game.finalSequence or Game.finalDone then return end
+    local now = os.clock()
+    local ui = finalGuiState()
+    -- The NPC can reject an incomplete run despite an apparent completion row.
+    -- Handle that before dialogue auto-advance or further E presses.
+    if ui.unfinished and not ui.won then
+        Game.finalRejected = true
+        Game.finalSequence = false
+        Game.finalDone = false
+        Game.goldenAspensChecked = false
+        Game.finalStage = nil
+        Game.finalTarget = nil
+        Game.finalTalkAttempts = 0
+        Game.finalNextAction = 0
+        Game.bossPhase = false
+        Game.bossCleared = false
+        Game.bossDefeated = false
+        Game.bossSeen = false
+        Game.bossName = nil
+        Game.bossAreaKey = nil
+        Game.bossAreaMarker = nil
+        Game.bossEndConfirmedAt = nil
+        bossTarget = nil
+        bossNextScan = 0
+        Flags.Zone = "GoldenAspens"
+        if detectedZoneDropdown then
+            settingZoneFromDetection = true
+            pcall(function()
+                if type(detectedZoneDropdown.Set) == "function" then
+                    detectedZoneDropdown:Set({zoneLabel("GoldenAspens")})
+                elseif type(detectedZoneDropdown.SetValue) == "function" then
+                    detectedZoneDropdown:SetValue(zoneLabel("GoldenAspens"))
+                end
+            end)
+            settingZoneFromDetection = false
+        end
+        table.clear(Game.badTrees)
+        Game.treeSearchStep = 0
+        Game.treeSearchAnchor = nil
+        Game.treeSearchNextAt = 0
+        Game.treeSearchZone = nil
+        Game.treeSearchLastArea = nil
+        Game.status = "Businessman rejected: returning to Golden Aspens trees"
+        print("[Deforestation] Businessman: Go finish your job first; returning to Golden Aspens trees")
+        local _, root = getRoot()
+        local folder = workspace:FindFirstChild("Map")
+        folder = folder and folder:FindFirstChild("Trees")
+        local destination = nil
+        if folder then
+            for _, tree in ipairs(folder:GetChildren()) do
+                local trunk = tree:FindFirstChild("TrunkBase")
+                if tree:GetAttribute("Biome") == "GoldenAspens"
+                    and trunk and trunk:IsA("BasePart")
+                    and (tonumber(tree:GetAttribute("HP")) or 0) > 0 then
+                    destination = CFrame.new(trunk.Position + Vector3.new(4, 3, 0))
+                    break
+                end
+            end
+        end
+        destination = destination or Game.finalReturnCFrame
+        if root and destination then
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.CFrame = destination
+            Game.treeSearchAnchor = root.Position
+        else
+            Game.status = "Golden Aspens unfinished; searching for trees"
+        end
+        Game.finalReturnCFrame = nil
+        return
+    end
+    -- Hide our overlay as soon as the results screen appears, so it cannot
+    -- obscure/intercept the game's Return to Lobby button.
+    if ui.won and not Game.finalGuiHidden then
+        Game.finalGuiHidden = true
+        if Window then
+            local hidden, err = pcall(function() Window:Toggle(false) end)
+            if not hidden then warn("[Deforestation] Could not hide window: " .. tostring(err)) end
+        end
+        print("[Deforestation] Forest Cleared screen detected; hiding Deforestation GUI")
+    end
+    -- The end-of-run screen is authoritative, even if the NPC interaction
+    -- has already advanced beyond a visible dialogue panel.
+    if ui.won and ui.returnButton then
+        Game.finalStage = "ReturnToLobby"
+        Game.status = "Forest cleared! Selecting Return to Lobby"
+        if now >= Game.finalNextAction then
+            Game.finalNextAction = now + 2
+            if clickFinalButton(ui.returnButton) then
+                Game.finalReturnClickedAt = now
+                Game.status = "Return to Lobby clicked; awaiting transition"
+                print("[Deforestation] Clicked Return to Lobby; waiting for game transition")
+            else
+                Game.status = "Forest cleared; waiting to click Return to Lobby"
+            end
+        end
+        return
+    end
+    if ui.won then
+        Game.status = "Forest cleared; waiting for Return to Lobby button"
+        return
+    end
+    if ui.dialogueVisible then
+        logBusinessmanDialogue()
+        Game.finalStage = "Dialogue"
+        Game.status = "Businessman dialogue: advancing"
+        if now >= Game.finalNextAction then
+            Game.finalNextAction = now + 1.2
+            if ui.nextButton then
+                clickFinalButton(ui.nextButton)
+            else
+                -- Games using E-to-advance dialogue may expose no TextButton.
+                pressFinalInteract()
+            end
+        end
+        return
+    end
+    local npc = locateBusinessman()
+    local destination = BUSINESSMAN_FALLBACK
+    if npc then
+        if npc:IsA("BasePart") then destination = npc.Position
+        else
+            local ok, pivot = pcall(function() return npc:GetPivot() end)
+            if ok then destination = pivot.Position end
+        end
+    end
+    local _, root = getRoot()
+    if not root then
+        Game.status = "Waiting for character before Businessman interaction"
+        return
+    end
+    if (root.Position - destination).Magnitude > 11 then
+        -- Stand near the NPC rather than inside the NPC model.
+        Game.status = "Moving to Businessman"
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.CFrame = CFrame.new(destination + Vector3.new(0, 3, 5))
+        Game.finalNextAction = now + 0.8
+        return
+    end
+    Game.status = "Businessman: pressing E / waiting for dialogue"
+    if now >= Game.finalNextAction then
+        Game.finalNextAction = now + 2
+        Game.finalTalkAttempts += 1
+        local nearbyPrompt
+        for _, part in ipairs(workspace:GetPartBoundsInRadius(root.Position, 16)) do
+            for _, node in ipairs(part:GetDescendants()) do
+                if node:IsA("ProximityPrompt") and node.Enabled then
+                    local text = (node.ActionText .. " " .. node.ObjectText):lower()
+                    if text:find("talk", 1, true) or text:find("businessman", 1, true) then
+                        nearbyPrompt = node
+                        break
+                    end
+                end
+            end
+            if nearbyPrompt then break end
+        end
+        if nearbyPrompt and type(fireproximityprompt) == "function" then
+            pcall(fireproximityprompt, nearbyPrompt)
+        else
+            pressFinalInteract()
+        end
+        if Game.finalTalkAttempts >= 8 then
+            Game.status = "Waiting for Businessman dialogue; check interaction"
+        end
+    end
+end
+
+local function detectCycle()
+    local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if gui then
+        local cam = workspace.CurrentCamera
+        local height = cam and cam.ViewportSize.Y or 1080
+        for _, node in ipairs(gui:GetDescendants()) do
+            if visibleHudLabel(node) and node.AbsolutePosition.Y < height * 0.20 then
+                local text = tostring(node.Text or ""):lower():gsub("[^%a ]", " ")
+                text = text:gsub("^%s+", ""):gsub("%s+$", "")
+                if text == "day" or text == "daytime" then return "Day" end
+                if text == "dusk" or text == "dusktime" then return "Dusk" end
+                if text == "night" or text == "nighttime" then return "Night" end
+                if text == "dawn" or text == "dawntime" then return "Dawn" end
+            end
+        end
+    end
+    local t = Lighting.ClockTime
+    if t >= 6 and t < 18 then return "Day" end
+    if t >= 18 and t < 19 then return "Dusk" end
+    if t >= 5 and t < 6 then return "Dawn" end
+    return "Night"
+end
+
+local NIGHT_MOB_TOKENS = {"sprout", "biter", "thief", "monster", "minion"}
+local function liveNightMob(model)
+    if not model or not model:IsA("Model") or not model.Parent or model == LocalPlayer.Character then return false end
+    local name = normalizeZoneLabel(model.Name)
+    for _, attr in ipairs({"MobType", "MonsterType", "EnemyType", "NPCType", "DisplayName"}) do
+        name ..= normalizeZoneLabel(model:GetAttribute(attr))
+    end
+    -- Do not select bosses, including area bosses without a humanoid.
+    if name:find("boss", 1, true) or name:find("barkback", 1, true)
+        or name:find("king", 1, true) or name:find("goldenaspens", 1, true) then return false end
+    local identified = false
+    for _, token in ipairs(NIGHT_MOB_TOKENS) do
+        if name:find(token, 1, true) then
+            identified = true
+            break
+        end
+    end
+    if not identified then return false end
+    local hum = model:FindFirstChildOfClass("Humanoid")
+    if hum and hum.Health <= 0 then return false end
+    local hp = tonumber(model:GetAttribute("HP") or model:GetAttribute("Health"))
+    if hp and hp <= 0 then return false end
+    local root = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+        or model:FindFirstChild("RootPart") or model:FindFirstChild("Torso")
+    return root and root:IsA("BasePart") and root or nil
+end
+
+local function nearestNightMob(maxDist)
+    local _, root = getRoot()
+    if not root then return nil end
+    local closest, distance = nil, maxDist
+    for _, inst in ipairs(workspace:GetDescendants()) do
+        if inst:IsA("Model") then
+            local mobRoot = liveNightMob(inst)
+            if mobRoot then
+                local d = (root.Position - mobRoot.Position).Magnitude
+                if d < distance then closest, distance = inst, d end
+            end
+        end
+    end
+    return closest
+end
+
+local function clickNightAttack()
+    local char = LocalPlayer.Character
+    local tool = char and char:FindFirstChildOfClass("Tool")
+    if tool then pcall(function() tool:Activate() end) end
+    local cam = workspace.CurrentCamera
+    local size = cam and cam.ViewportSize or Vector2.new(1600, 900)
+    local x, y = math.floor(size.X / 2), math.floor(size.Y / 2)
+    local ok = pcall(function()
+        local vim = game:GetService("VirtualInputManager")
+        vim:SendMouseButtonEvent(x, y, 0, true, game, 0)
+        task.wait(0.05)
+        vim:SendMouseButtonEvent(x, y, 0, false, game, 0)
+    end)
+    if not ok and type(mouse1click) == "function" then pcall(mouse1click) end
+end
+
+local function fightNightMob(mob)
+    local _, root = getRoot()
+    if not root then return end
+    local original = root.CFrame
+    local started, lastAdjust = os.clock(), 0
+    local approach = 1
+    Game.status = "Fighting nighttime mob"
+    -- A brief local encounter, not a boss fight or a map-wide kill aura.
+    while not unloaded and Flags.AutoChop and Flags.AutoFightMobs and not Game.bossPhase
+        and Game.dayNight == "Night" and os.clock() - started < 12 do
+        local mobRoot = liveNightMob(mob)
+        local _, playerRoot = getRoot()
+        if not mobRoot or not playerRoot then break end
+        if (mobRoot.Position - playerRoot.Position).Magnitude > 60 then break end
+        if os.clock() - lastAdjust > 0.3 then
+            local cf = mobRoot.CFrame
+            local directions = {cf.LookVector, -cf.LookVector, cf.RightVector, -cf.RightVector}
+            local dir = directions[approach]
+            local flat = Vector3.new(dir.X, 0, dir.Z)
+            if flat.Magnitude < 0.1 then flat = Vector3.new(0, 0, 1) end
+            local stand = mobRoot.Position + flat.Unit * 3 + Vector3.new(0, 0.5, 0)
+            playerRoot.AssemblyLinearVelocity = Vector3.zero
+            playerRoot.CFrame = CFrame.lookAt(stand, mobRoot.Position + Vector3.new(0, 1, 0))
+            lastAdjust = os.clock()
+            approach = approach % 4 + 1
+        end
+        clickNightAttack()
+        task.wait(0.15)
+    end
+    local _, playerRoot = getRoot()
+    if playerRoot and Game.dayNight == "Night" and not Game.bossPhase then
+        playerRoot.AssemblyLinearVelocity = Vector3.zero
+        playerRoot.CFrame = original
+    end
+end
+
+local function treesFolder()
+    local map = workspace:FindFirstChild("Map")
+    return map and map:FindFirstChild("Trees")
+end
+
+local function nearestTree()
+    local folder = treesFolder()
+    local _, root = getRoot()
+    if not folder or not root then
+        return nil
+    end
+    local best, bestDist
+    for _, tree in ipairs(folder:GetChildren()) do
+        local base = tree:FindFirstChild("TrunkBase")
+        if base and tree:GetAttribute("Biome") == Flags.Zone and (tonumber(tree:GetAttribute("HP")) or 0) > 0 and not Game.badTrees[tree] then
+            local dist = (base.Position - root.Position).Magnitude
+            if not bestDist or dist < bestDist then
+                best, bestDist = tree, dist
+            end
+        end
+    end
+    return best
+end
+
+-- Explore nearby points when the currently streamed/eligible tree list is empty.
+-- This runs at ANY unfinished progress value, not only at high percentages.
+local SEARCH_OFFSETS = {
+    Vector3.new(45, 0, 0), Vector3.new(0, 0, 45),
+    Vector3.new(-45, 0, 0), Vector3.new(0, 0, -45),
+    Vector3.new(90, 0, 45), Vector3.new(-90, 0, 45),
+    Vector3.new(-90, 0, -45), Vector3.new(90, 0, -45),
+    Vector3.new(0, 0, 115), Vector3.new(115, 0, 0),
+    Vector3.new(0, 0, -115), Vector3.new(-115, 0, 0),
+}
+
+local function searchForMissingTrees()
+    if unloaded or isLobbyPlace() or not Flags.AutoChop or Game.bossPhase then return end
+    if os.clock() < (Game.treeSearchNextAt or 0) then return end
+
+    -- Don't roam after the area is fully cleared or when the boss bar is visible.
+    local hud = readBossProgress()
+    if hud.name ~= nil or (hud.progress ~= nil and hud.progress >= 99.9) then
+        Game.status = "Waiting for boss / area transition"
+        return
+    end
+    local _, root = getRoot()
+    if not root then return end
+    local areaId = tostring(Flags.Zone) .. "|" .. tostring(hud.marker or "")
+    if Game.treeSearchZone ~= Flags.Zone or Game.treeSearchLastArea ~= areaId then
+        Game.treeSearchZone = Flags.Zone
+        Game.treeSearchLastArea = areaId
+        Game.treeSearchAnchor = root.Position
+        Game.treeSearchStep = 0
+    end
+    -- A new sweep retries trees marked unresponsive on an earlier pass.
+    local step = (Game.treeSearchStep or 0) + 1
+    if step > #SEARCH_OFFSETS then
+        step = 1
+        Game.treeSearchAnchor = root.Position
+        table.clear(Game.badTrees)
+    end
+    Game.treeSearchStep = step
+    local anchor = Game.treeSearchAnchor or root.Position
+    local destination = anchor + SEARCH_OFFSETS[step]
+    Game.status = string.format("Searching %s for trees (%d/%d)", zoneLabel(Flags.Zone), step, #SEARCH_OFFSETS)
+    -- Allow the nearby portion of the map to stream in after repositioning.
+    -- Keep the player at their current height; never move if boss combat started.
+    if not isLobbyPlace() and not Game.bossPhase and Flags.AutoChop then
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.CFrame = CFrame.new(destination)
+    end
+    Game.treeSearchNextAt = os.clock() + 0.8
+    task.wait(0.5)
+    if not isLobbyPlace() and not Game.bossPhase and Flags.AutoChop then
+        local tree = nearestTree()
+        if tree then
+            Game.status = "Tree found in " .. zoneLabel(Flags.Zone)
+        end
+    end
+end
+
+local function groundLogs()
+    local folder = workspace:FindFirstChild("Logs")
+    local out = {}
+    if not folder then
+        return out
+    end
+    local _, root = getRoot()
+    if not root then
+        return out
+    end
+    local dist = {}
+    for _, log in ipairs(folder:GetChildren()) do
+        local wood = log:FindFirstChild("Wood")
+        if wood and wood:IsA("BasePart") and log:GetAttribute("ThrownBy") == nil and (Game.badLogs[log] or 0) < 2 then
+            local d = (wood.Position - root.Position).Magnitude
+            if d <= 250 then
+                dist[log] = d
+                table.insert(out, log)
+            end
+        end
+    end
+    table.sort(out, function(a, b)
+        return dist[a] < dist[b]
+    end)
+    return out
+end
+
+local function sellSpots()
+    local out = {}
+    local map = workspace:FindFirstChild("Map")
+    local main = map and map:FindFirstChild("SellSpot")
+    if main then
+        table.insert(out, main)
+    end
+    local huts = workspace:FindFirstChild("ForestHuts")
+    if huts then
+        for _, d in ipairs(huts:GetDescendants()) do
+            if d.Name == "SellOutpost" then
+                table.insert(out, d)
+            end
+        end
+    end
+    return out
+end
+
+local function nearestPad()
+    local _, root = getRoot()
+    if not root then
+        return nil
+    end
+    local best, bestDist
+    for _, spot in ipairs(sellSpots()) do
+        local pad = spot:FindFirstChild("DepositPad")
+        if pad and pad:IsA("BasePart") then
+            local dist = (pad.Position - root.Position).Magnitude
+            if not bestDist or dist < bestDist then
+                best, bestDist = pad, dist
+            end
+        end
+    end
+    return best
+end
+
+local function farmActive()
+    return Flags.AutoChop or Flags.AutoPickup or Flags.AutoSell
+end
+
+local function sellLogs()
+    if Game.bossPhase or carried() <= 0 or not Remotes then
+        return false
+    end
+    local pad = nearestPad()
+    if not pad then
+        return false
+    end
+    Game.status = "Selling"
+    teleport(pad.Position + Vector3.new(0, 3, 0))
+    task.wait(0.4)
+    if unloaded or Game.bossPhase then
+        return false
+    end
+    Remotes.DepositLogs:FireServer(false)
+    Game.sells += 1
+    task.wait(0.6)
+    return true
+end
+
+local function pickupLogs()
+    local limit = sellThreshold()
+    local picked = false
+    for _, log in ipairs(groundLogs()) do
+        if unloaded or Game.bossPhase or not Flags.AutoPickup or pickupDisabledForZone() or carried() >= limit then
+            break
+        end
+        local wood = log:FindFirstChild("Wood")
+        if wood and log.Parent then
+            Game.status = "Picking Up Logs"
+            local before = carried()
+            teleport(wood.Position + Vector3.new(0, 3, 0))
+            task.wait(0.15)
+            if unloaded or Game.bossPhase or pickupDisabledForZone() then break end
+            Remotes.PickUpLog:FireServer(log)
+            task.wait(0.2)
+            if carried() > before or not log.Parent then
+                picked = true
+            else
+                Game.badLogs[log] = (Game.badLogs[log] or 0) + 1
+            end
+        end
+    end
+    for log in pairs(Game.badLogs) do
+        if not log.Parent then
+            Game.badLogs[log] = nil
+        end
+    end
+    return picked
+end
+
+local function chopTree(tree)
+    local base = tree:FindFirstChild("TrunkBase")
+    local _, root = getRoot()
+    if not base or not root then
+        return
+    end
+    Game.status = "Chopping " .. tostring(tree:GetAttribute("TreeType") or "Tree")
+    local standAt = base.Position + Vector3.new(3, 2, 0)
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.CFrame = CFrame.lookAt(standAt, Vector3.new(base.Position.X, standAt.Y, base.Position.Z))
+    task.wait(0.2)
+    local lastHp = tonumber(tree:GetAttribute("HP")) or 0
+    local stuck = 0
+    local started = os.clock()
+    while not unloaded and Flags.AutoChop and not Game.bossPhase and tree.Parent == treesFolder() and (tonumber(tree:GetAttribute("HP")) or 0) > 0 do
+        if os.clock() - started > 60 then
+            Game.badTrees[tree] = true
+            return
+        end
+        local _, r = getRoot()
+        if not r then
+            return
+        end
+        if (r.Position - standAt).Magnitude > 6 then
+            r.CFrame = CFrame.lookAt(standAt, Vector3.new(base.Position.X, standAt.Y, base.Position.Z))
+        end
+        if Game.bossPhase then return end
+        Game.hitSeq += 1
+        Remotes.Chop:FireServer(tree, base.Position + Vector3.new(1, 1, 0), 1, Game.hitSeq)
+        task.wait(math.max(0.1, Flags.ChopDelay))
+        local hp = tonumber(tree:GetAttribute("HP")) or 0
+        if hp < lastHp then
+            lastHp = hp
+            stuck = 0
+        else
+            stuck += 1
+            if stuck >= 15 then
+                Game.badTrees[tree] = true
+                return
+            end
+        end
+    end
+    if (tonumber(tree:GetAttribute("HP")) or 0) <= 0 then
+        Game.trees += 1
+        -- No log collection is needed in this zone: immediately find the next tree.
+        -- Keep the normal post-chop delay when collecting logs is enabled.
+        if not pickupDisabledForZone() then
+            task.wait(1)
+        end
+    end
+end
+
+local function stepFarm()
+    -- Never roam, chop, pick up or sell in the lobby; preserve lobby-only workers.
+    if isLobbyPlace() then
+        Game.treeSearchStep = 0
+        Game.treeSearchAnchor = nil
+        Game.status = "In lobby; forest farming paused"
+        return
+    end
+    if Game.bossPhase or not Remotes or not farmActive() or Game.busy then
+        return
+    end
+    if not getRoot() then
+        return
+    end
+    Game.busy = true
+    local ok, err = pcall(function()
+        if Game.bossPhase then
+            Game.status = Game.bossDefeated and "Boss defeated; waiting for next zone" or "Boss combat active"
+            return
+        end
+        if Flags.AutoChop and Flags.AutoFightMobs and Game.dayNight == "Night" then
+            local mob = nearestNightMob(20)
+            if mob then
+                fightNightMob(mob)
+                return
+            end
+        end
+        local full = carried() >= sellThreshold()
+        if Flags.AutoSell and (full or (carried() > 0 and not Flags.AutoChop and not (Flags.AutoPickup and not pickupDisabledForZone() and #groundLogs() > 0))) then
+            sellLogs()
+            return
+        end
+        if Flags.AutoPickup and not pickupDisabledForZone() and not full and #groundLogs() > 0 then
+            pickupLogs()
+            return
+        end
+        if Flags.AutoChop then
+            if not zoneUnlocked(Flags.Zone) then
+                Game.status = zoneLabel(Flags.Zone) .. " is locked"
+                return
+            end
+            if full and not Flags.AutoSell then
+                Game.status = "Bag full"
+                return
+            end
+            local tree = nearestTree()
+            if tree then
+                Game.treeSearchStep = 0
+                Game.treeSearchAnchor = nil
+                Game.treeSearchNextAt = 0
+                chopTree(tree)
+            else
+                searchForMissingTrees()
+            end
+            return
+        end
+        Game.status = "Idle"
+    end)
+    Game.busy = false
+    if not ok then
+        error(err, 0)
+    end
+end
+
+local function stepCoins()
+    if not Remotes then
+        return
+    end
+    for _, spot in ipairs(sellSpots()) do
+        local folder = spot:FindFirstChild("Cash")
+        if folder then
+            for _, coin in ipairs(folder:GetChildren()) do
+                if unloaded or not Flags.AutoCoins then
+                    return
+                end
+                if coin:GetAttribute("Owner") == LocalPlayer.UserId then
+                    Remotes.CollectCash:FireServer(coin)
+                end
+            end
+        end
+    end
+end
+
+local function withLock(fn)
+    local started = os.clock()
+    while Game.busy and os.clock() - started < 70 and not unloaded do
+        task.wait(0.1)
+    end
+    if Game.busy or unloaded then
+        return nil
+    end
+    Game.busy = true
+    local ok, a, b = pcall(fn)
+    Game.busy = false
+    if not ok then
+        warn("[Deforestation] " .. tostring(a))
+        return nil
+    end
+    return a, b
+end
+
+local function stationPosition(name)
+    local map = workspace:FindFirstChild("Map")
+    local cabin = map and map:FindFirstChild("LogCabin")
+    local shop = cabin and cabin:FindFirstChild("Shop")
+    local stations = shop and shop:FindFirstChild("Stations")
+    local station = stations and stations:FindFirstChild(name)
+    local anchor = station and station:FindFirstChild("PromptAnchor")
+    return partPosition(anchor) or partPosition(station)
+end
+
+local function buyAtStation(stationName, invoke)
+    local pos = stationPosition(stationName)
+    if not pos then
+        return false
+    end
+    return withLock(function()
+        local _, root = getRoot()
+        if not root then
+            return false
+        end
+        local back = root.CFrame
+        Game.status = "Buying"
+        teleport(pos + Vector3.new(0, 1, 0))
+        task.wait(0.4)
+        local result = invoke()
+        task.wait(0.2)
+        local _, r = getRoot()
+        if r and farmActive() == false then
+            r.CFrame = back
+        end
+        return result
+    end)
+end
+
+local function toolOwned(name)
+    return LocalPlayer:GetAttribute("Owns" .. name) == true
+end
+
+local function buyTool(name)
+    local def = Config and Config.Tools[name]
+    local price = def and tonumber(def.Price)
+    local station = TOOL_STATIONS[name] or ("Station_" .. name)
+    if name == "Dynamite" then
+        station = "Station_Explosives"
+    end
+    if not price or toolOwned(name) or cashValue() < price or not stationPosition(station) then
+        return
+    end
+    if def.RequiresItem and backpackLevel() <= 0 then
+        return
+    end
+    buyAtStation(station, function()
+        local ok, result = pcall(Remotes.BuyTool.InvokeServer, Remotes.BuyTool, name)
+        if ok and type(result) == "table" and result.Ok then
+            Game.bought += 1
+            notify("Bought " .. tostring(def.DisplayName or name), "Success")
+        end
+        return ok and result
+    end)
+end
+
+local function stepTools()
+    if not Remotes or not Config then
+        return
+    end
+    for _, name in ipairs(Flags.BuyTools) do
+        if unloaded or not Flags.AutoTools then
+            return
+        end
+        buyTool(name)
+    end
+end
+
+local function stepDynamite()
+    if Remotes and Config then
+        buyTool("Dynamite")
+    end
+end
+
+local function nextUpgradePrice(id)
+    local item = upgradeDef(id)
+    if not item then
+        return nil
+    end
+    local level = math.floor(tonumber(LocalPlayer:GetAttribute("Up_" .. id)) or 0)
+    return item.Prices[level + 1], item
+end
+
+local function stepUpgrades()
+    if not Remotes or not Config then
+        return
+    end
+    for _, id in ipairs(Flags.BuyUpgrades) do
+        if unloaded or not Flags.AutoUpgrades then
+            return
+        end
+        local price, item = nextUpgradePrice(id)
+        local _, section = upgradeDef(id)
+        local needs = section and section.Requires
+        if price and item and cashValue() >= price and (not needs or toolOwned(needs)) then
+            local level = LocalPlayer:GetAttribute("Up_" .. id)
+            Remotes.BuyUpgrade:FireServer(id)
+            task.wait(0.5)
+            if LocalPlayer:GetAttribute("Up_" .. id) ~= level then
+                Game.bought += 1
+            end
+        end
+    end
+end
+
+local function stepBackpack()
+    if not Remotes or not Config then
+        return
+    end
+    local price = nextUpgradePrice("GearBackpack")
+    if not price or cashValue() < price then
+        return
+    end
+    local level = backpackLevel()
+    buyAtStation("Station_Backpack", function()
+        Remotes.BuyUpgrade:FireServer("GearBackpack")
+        task.wait(0.5)
+        if backpackLevel() > level then
+            Game.bought += 1
+            notify("Backpack upgraded", "Success")
+        end
+        return true
+    end)
+end
+
+local function vehicleDef(id)
+    for _, v in ipairs(Config and Config.Vehicles.List or {}) do
+        if v.Id == id then
+            return v
+        end
+    end
+    return nil
+end
+
+local function stepCars()
+    if not Remotes or not Config then
+        return
+    end
+    local map = workspace:FindFirstChild("Map")
+    local garage = map and map:FindFirstChild("Garage")
+    local enter = garage and garage:FindFirstChild("Enter")
+    local pos = partPosition(enter)
+    if not pos then
+        return
+    end
+    for _, id in ipairs(Flags.BuyCars) do
+        if unloaded or not Flags.AutoCars then
+            return
+        end
+        local def = vehicleDef(id)
+        local state = Game.carBuys[id] or 0
+        if def and state >= 0 and state < 3 then
+            local have = def.Currency == "Gems" and gemsValue() or cashValue()
+            if (def.Currency == "Coins" or def.Currency == "Gems") and have >= def.Price then
+                withLock(function()
+                    Game.status = "Buying " .. id
+                    teleport(pos + Vector3.new(0, 3, 0))
+                    task.wait(0.4)
+                    local ok, result = pcall(Remotes.BuyVehicle.InvokeServer, Remotes.BuyVehicle, id)
+                    if ok and (result == true or (type(result) == "table" and result.Ok)) then
+                        Game.carBuys[id] = -1
+                        Game.bought += 1
+                        notify("Bought " .. id, "Success")
+                    else
+                        Game.carBuys[id] = state + 1
+                    end
+                end)
+            end
+        end
+    end
+end
+
+local Lobby = {
+    saves = {},
+    pad = nil,
+    joining = false,
+    classTries = {},
+    wins = 0,
+    onSavesChanged = nil,
+}
+
+local LobbyRemotes = ReplicatedStorage:FindFirstChild("Lobby") and ReplicatedStorage.Lobby:FindFirstChild("Remotes")
+local LobbyConfig
+pcall(function()
+    LobbyConfig = require(ReplicatedStorage.Lobby.LobbyConfig)
+end)
+
+local function inLobby()
+    local lobby = workspace:FindFirstChild("Lobby")
+    return LobbyRemotes ~= nil and lobby ~= nil and lobby:FindFirstChild("LobbyPads") ~= nil
+end
+
+local function playerWins()
+    return tonumber(LocalPlayer:GetAttribute("Wins")) or Lobby.wins or 0
+end
+
+local function difficultyWins(name)
+    for _, d in ipairs(LobbyConfig and LobbyConfig.Difficulties or {}) do
+        if d.Name == name then
+            return d.Wins or 0
+        end
+    end
+    return 0
+end
+
+local function idlePad()
+    local pads = workspace.Lobby.LobbyPads
+    for i = 1, 8 do
+        local pad = pads:FindFirstChild("Pad" .. i)
+        if pad and pad:GetAttribute("Status") == "Idle" then
+            return pad
+        end
+    end
+    return nil
+end
+
+local function enterPad()
+    local pad = idlePad()
+    local floor = pad and pad:FindFirstChild("Floor")
+    if not floor then
+        return nil
+    end
+    Lobby.pad = nil
+    teleport(floor.Position + Vector3.new(0, 4, 0))
+    local started = os.clock()
+    while not Lobby.pad and os.clock() - started < 6 and not unloaded do
+        task.wait(0.1)
+    end
+    return Lobby.pad
+end
+
+local function leavePad(padId)
+    if padId then
+        LobbyRemotes.CancelParty:FireServer(padId)
+    end
+    local _, root = getRoot()
+    if root then
+        root.CFrame = root.CFrame + Vector3.new(0, 0, 25)
+    end
+    local gui = LocalPlayer:FindFirstChild("PlayerGui") and LocalPlayer.PlayerGui:FindFirstChild("LobbyParty")
+    if gui then
+        gui.Enabled = false
+    end
+end
+
+local function onOpenCreate(padId, info)
+    if type(padId) == "string" then
+        Lobby.pad = padId
+        if type(info) == "table" and tonumber(info.Wins) then
+            Lobby.wins = tonumber(info.Wins)
+        end
+    end
+end
+
+local function saveLabel(entry)
+    local felled = math.floor(tonumber(entry.Felled) or 0)
+    return string.format("%s %s - %d trees (%s)", tostring(entry.Map or "Forest"), tostring(entry.Difficulty or "?"), felled, tostring(entry.Key))
+end
+
+local function onSaves(_, list)
+    if type(list) ~= "table" then
+        return
+    end
+    table.clear(Lobby.saves)
+    for _, entry in ipairs(list) do
+        if type(entry) == "table" and entry.Key then
+            table.insert(Lobby.saves, { label = saveLabel(entry), key = entry.Key })
+        end
+    end
+    if Lobby.onSavesChanged then
+        Lobby.onSavesChanged()
+    end
+end
+
+local function refreshSaves()
+    if not inLobby() or Lobby.joining then
+        return false
+    end
+    return withLock(function()
+        Game.status = "Reading saved runs"
+        local padId = enterPad()
+        if padId then
+            task.wait(1.5)
+        end
+        leavePad(padId)
+        Game.status = "Idle"
+        return padId ~= nil
+    end)
+end
+
+local function joinRun(saveKey)
+    if not inLobby() or Lobby.joining then
+        return false
+    end
+    return withLock(function()
+        Lobby.joining = true
+        Game.status = saveKey and "Loading saved run" or "Creating run"
+        local padId = enterPad()
+        local ok, result = false, nil
+        if padId then
+            if saveKey then
+                ok, result = pcall(LobbyRemotes.LoadParty.InvokeServer, LobbyRemotes.LoadParty, padId, saveKey)
+            else
+                local diff = Flags.Difficulty
+                if difficultyWins(diff) > playerWins() then
+                    diff = "NORMAL"
+                end
+                local size = math.clamp(math.floor(tonumber(Flags.PartySize) or 1), 1, LobbyConfig and LobbyConfig.MaxParty or 4)
+                ok, result = pcall(LobbyRemotes.CreateParty.InvokeServer, LobbyRemotes.CreateParty, padId, diff, size, "Forest")
+            end
+        end
+        local success = ok and type(result) == "table" and result.Ok == true
+        if success then
+            Game.status = "Waiting for teleport"
+            local gui = LocalPlayer.PlayerGui:FindFirstChild("LobbyParty")
+            if gui then
+                gui.Enabled = false
+            end
+        else
+            Game.status = "Join failed: " .. tostring(type(result) == "table" and result.Why or result)
+            leavePad(padId)
+            Lobby.joining = false
+        end
+        return success
+    end)
+end
+
+local function stepAutoJoin()
+    if not inLobby() or Lobby.joining then
+        return
+    end
+    joinRun(nil)
+    task.wait(5)
+end
+
+local function stepDaily()
+    if not inLobby() then
+        return
+    end
+    local today = math.floor(workspace:GetServerTimeNow() / 86400)
+    if (tonumber(LocalPlayer:GetAttribute("DailyDay")) or 0) >= today then
+        return
+    end
+    local booth = workspace.Lobby:FindFirstChild("RewardBooth")
+    local zone = booth and booth:FindFirstChild("DailyReward") and booth.DailyReward:FindFirstChild("Zone")
+    if not zone then
+        return
+    end
+    withLock(function()
+        local _, root = getRoot()
+        local back = root and root.CFrame
+        Game.status = "Claiming daily"
+        local started = os.clock()
+        while os.clock() - started < 6 and not unloaded and (tonumber(LocalPlayer:GetAttribute("DailyDay")) or 0) < today do
+            teleport(zone.Position + Vector3.new(0, 3, 0))
+            task.wait(0.3)
+        end
+        if (tonumber(LocalPlayer:GetAttribute("DailyDay")) or 0) >= today then
+            notify("Daily reward claimed", "Success")
+        end
+        local _, r = getRoot()
+        if r and back then
+            r.CFrame = back
+        end
+        Game.status = "Idle"
+    end)
+end
+
+local function classOwned(id)
+    local owned = "," .. tostring(LocalPlayer:GetAttribute("ClassesOwned") or "") .. ","
+    return string.find(owned, "," .. id .. ",", 1, true) ~= nil
+end
+
+local function classInStock(id)
+    local stock = "," .. tostring(workspace:GetAttribute("ClassStock") or "") .. ","
+    return string.find(stock, "," .. id .. ",", 1, true) ~= nil
+end
+
+local function stepClasses()
+    local stand = workspace:FindFirstChild("Lobby") and workspace.Lobby:FindFirstChild("LobbyClassStand")
+    if not stand or not Remotes or not Config then
+        return
+    end
+    local prices = Config.Classes.Stock.Prices
+    for _, id in ipairs(Flags.BuyClasses) do
+        if unloaded or not Flags.AutoClasses then
+            return
+        end
+        local price = tonumber(prices[id])
+        local restock = tostring(workspace:GetAttribute("ClassRestockAt"))
+        if price and not classOwned(id) and classInStock(id) and gemsValue() >= price and Lobby.classTries[id .. restock] == nil then
+            withLock(function()
+                local _, root = getRoot()
+                local back = root and root.CFrame
+                Game.status = "Buying class " .. id
+                teleport(stand:GetPivot().Position + Vector3.new(0, 4, 0))
+                task.wait(0.5)
+                local ok, result = pcall(Remotes.BuyClass.InvokeServer, Remotes.BuyClass, id)
+                if ok and type(result) == "table" and result.Ok then
+                    Game.bought += 1
+                    notify("Bought class " .. id, "Success")
+                else
+                    Lobby.classTries[id .. restock] = true
+                end
+                local _, r = getRoot()
+                if r and back then
+                    r.CFrame = back
+                end
+                Game.status = "Idle"
+            end)
+        end
+    end
+end
+
+local function stepGemPerks()
+    if not Remotes or not Config then
+        return
+    end
+    for _, id in ipairs(Flags.BuyGemPerks) do
+        if unloaded or not Flags.AutoGemPerks then
+            return
+        end
+        for _, perk in ipairs(Config.Shop.Perks) do
+            if perk.Id == id then
+                local level = math.floor(tonumber(LocalPlayer:GetAttribute("GemPerk_" .. id)) or 0)
+                local price = perk.Prices[level + 1]
+                if price and gemsValue() >= price then
+                    local ok, result = pcall(Remotes.BuyGemPerk.InvokeServer, Remotes.BuyGemPerk, id)
+                    if ok and type(result) == "table" and result.Ok then
+                        Game.bought += 1
+                    end
+                    task.wait(0.5)
+                end
+            end
+        end
+    end
+end
+
+local function short(n)
+    n = tonumber(n) or 0
+    local units = { { 1e15, "Qa" }, { 1e12, "T" }, { 1e9, "B" }, { 1e6, "M" }, { 1e3, "K" } }
+    for _, u in ipairs(units) do
+        if math.abs(n) >= u[1] then
+            return string.format("%.2f%s", n / u[1], u[2])
+        end
+    end
+    return tostring(math.floor(n))
+end
+
+local function overviewRows()
+    return {
+        { Text = "Status", Value = Game.status },
+        { Text = "Cash", Value = "$" .. short(cashValue()) .. "  Gems " .. short(gemsValue()) },
+        { Text = "Logs", Value = tostring(carried()) .. (Flags.AutoSell and (pickupDisabledForZone() and "  (pickup disabled)" or ("  (sell at " .. tostring(sellThreshold()) .. ")")) or (" / " .. tostring(capacity()) .. " normal cap")) },
+        { Text = "Zone", Value = zoneLabel(Flags.Zone) .. (zoneUnlocked(Flags.Zone) and "" or " (locked)") },
+        { Text = "Cycle", Value = Game.dayNight },
+        { Text = "Session", Value = Game.trees .. " trees, " .. Game.sells .. " sells, " .. Game.bought .. " buys" },
+    }
+end
+
+local function applyWalkSpeed()
+    local humanoid = select(1, getRoot())
+    if not humanoid then
+        return
+    end
+    if Flags.WalkSpeedEnabled then
+        if walkSpeedRestore[humanoid] == nil then
+            walkSpeedRestore[humanoid] = humanoid.WalkSpeed
+        end
+        humanoid.WalkSpeed = Flags.WalkSpeed
+    elseif walkSpeedRestore[humanoid] ~= nil then
+        humanoid.WalkSpeed = walkSpeedRestore[humanoid]
+        walkSpeedRestore[humanoid] = nil
+    end
+end
+
+local function setWalkSpeedEnabled(value)
+    Flags.WalkSpeedEnabled = value == true
+    applyWalkSpeed()
+end
+
+local function setWalkSpeed(value)
+    Flags.WalkSpeed = tonumber(value) or Flags.WalkSpeed
+    if Flags.WalkSpeedEnabled then
+        applyWalkSpeed()
+    end
+end
+
+local function setInfJump(value)
+    Flags.InfJump = value == true
+    if infJumpConn then
+        infJumpConn:Disconnect()
+        infJumpConn = nil
+    end
+    if not Flags.InfJump then
+        return
+    end
+    infJumpConn = track(UserInputService.JumpRequest:Connect(function()
+        if unloaded or not Flags.InfJump then
+            return
+        end
+        local humanoid = select(1, getRoot())
+        if humanoid then
+            humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+        end
+    end))
+end
+
+local function setNoClip(value)
+    Flags.NoClip = value == true
+    if noclipConn then
+        noclipConn:Disconnect()
+        noclipConn = nil
+    end
+    if not Flags.NoClip then
+        for part, canCollide in pairs(noclipRestore) do
+            if part.Parent then
+                part.CanCollide = canCollide
+            end
+        end
+        table.clear(noclipRestore)
+        return
+    end
+    noclipConn = track(RunService.Stepped:Connect(function()
+        if unloaded or not Flags.NoClip then
+            return
+        end
+        local character = LocalPlayer.Character
+        if not character then
+            return
+        end
+        for _, part in ipairs(character:GetDescendants()) do
+            if part:IsA("BasePart") then
+                if noclipRestore[part] == nil then
+                    noclipRestore[part] = part.CanCollide
+                end
+                part.CanCollide = false
+            end
+        end
+    end))
+end
+
+local function snapshotPrompt(prompt)
+    if promptRestore[prompt] == nil then
+        promptRestore[prompt] = {
+            HoldDuration = prompt.HoldDuration,
+            MaxActivationDistance = prompt.MaxActivationDistance,
+            RequiresLineOfSight = prompt.RequiresLineOfSight,
+        }
+    end
+    prompt.HoldDuration = 0
+    prompt.MaxActivationDistance = 50
+    prompt.RequiresLineOfSight = false
+end
+
+local function setInstantProximityPrompt(value)
+    Flags.InstantProximityPrompt = value == true
+    if promptConn then
+        promptConn:Disconnect()
+        promptConn = nil
+    end
+    if not Flags.InstantProximityPrompt then
+        for prompt, prev in pairs(promptRestore) do
+            if prompt.Parent then
+                prompt.HoldDuration = prev.HoldDuration
+                prompt.MaxActivationDistance = prev.MaxActivationDistance
+                prompt.RequiresLineOfSight = prev.RequiresLineOfSight
+            end
+        end
+        table.clear(promptRestore)
+        return
+    end
+    for _, inst in ipairs(workspace:GetDescendants()) do
+        if inst:IsA("ProximityPrompt") then
+            snapshotPrompt(inst)
+        end
+    end
+    promptConn = track(workspace.DescendantAdded:Connect(function(inst)
+        if unloaded or not Flags.InstantProximityPrompt then
+            return
+        end
+        if inst:IsA("ProximityPrompt") then
+            snapshotPrompt(inst)
+        end
+    end))
+end
+
+local function stopFly()
+    if flyState and flyState.conn then
+        flyState.conn:Disconnect()
+    end
+    local humanoid = flyState and flyState.humanoid
+    if humanoid and humanoid.Parent and flyState.platformStand ~= nil then
+        humanoid.PlatformStand = flyState.platformStand
+    end
+    flyState = nil
+end
+
+local function setFly(value)
+    Flags.Fly = value == true
+    stopFly()
+    if not Flags.Fly then
+        return
+    end
+    local humanoid, root = getRoot()
+    if not (humanoid and root) then
+        return
+    end
+    flyState = {
+        humanoid = humanoid,
+        root = root,
+        platformStand = humanoid.PlatformStand,
+    }
+    humanoid.PlatformStand = true
+    flyState.conn = track(RunService.RenderStepped:Connect(function()
+        if unloaded or not Flags.Fly then
+            return
+        end
+        if UserInputService:GetFocusedTextBox() then
+            return
+        end
+        local hum, hrp = getRoot()
+        if not (hum and hrp) then
+            return
+        end
+        local cam = workspace.CurrentCamera
+        if not cam then
+            return
+        end
+        local move = Vector3.zero
+        if UserInputService:IsKeyDown(Enum.KeyCode.W) then
+            move += cam.CFrame.LookVector
+        end
+        if UserInputService:IsKeyDown(Enum.KeyCode.S) then
+            move -= cam.CFrame.LookVector
+        end
+        if UserInputService:IsKeyDown(Enum.KeyCode.A) then
+            move -= cam.CFrame.RightVector
+        end
+        if UserInputService:IsKeyDown(Enum.KeyCode.D) then
+            move += cam.CFrame.RightVector
+        end
+        if UserInputService:IsKeyDown(Enum.KeyCode.Space) then
+            move += Vector3.yAxis
+        end
+        if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then
+            move -= Vector3.yAxis
+        end
+        if move.Magnitude > 0 then
+            hrp.AssemblyLinearVelocity = move.Unit * Flags.FlySpeed
+        else
+            hrp.AssemblyLinearVelocity = Vector3.zero
+        end
+        hum.PlatformStand = true
+    end))
+end
+
+local function setFlySpeed(value)
+    Flags.FlySpeed = tonumber(value) or Flags.FlySpeed
+end
+
+local function setNoGameplayPaused(value)
+    Flags.AntiGameplayPause = value == true
+    if gameplayPauseConn then
+        gameplayPauseConn:Disconnect()
+        gameplayPauseConn = nil
+    end
+    if not Flags.AntiGameplayPause then
+        return
+    end
+    pcall(function()
+        StarterGui:SetCore("ResetButtonCallback", true)
+    end)
+    gameplayPauseConn = track(GuiService.MenuOpened:Connect(function()
+        if unloaded or not Flags.AntiGameplayPause then
+            return
+        end
+        pcall(function()
+            GuiService.SelectedObject = nil
+        end)
+    end))
+end
+
+local function setAutoReconnect(value)
+    Flags.AutoReconnect = value == true
+    if reconnectConn then
+        reconnectConn:Disconnect()
+        reconnectConn = nil
+    end
+    if reconnectFailedConn then
+        reconnectFailedConn:Disconnect()
+        reconnectFailedConn = nil
+    end
+    if not Flags.AutoReconnect then
+        reconnectToken += 1
+        return
+    end
+    reconnectConn = track(GuiService.ErrorMessageChanged:Connect(function()
+        if unloaded or not Flags.AutoReconnect then
+            return
+        end
+        local token = reconnectToken + 1
+        reconnectToken = token
+        task.delay(1.5, function()
+            if unloaded or not Flags.AutoReconnect or reconnectToken ~= token then
+                return
+            end
+            pcall(function()
+                TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+            end)
+        end)
+    end))
+    reconnectFailedConn = track(TeleportService.TeleportInitFailed:Connect(function(player)
+        if player ~= LocalPlayer or unloaded or not Flags.AutoReconnect then
+            return
+        end
+        task.delay(2, function()
+            if unloaded or not Flags.AutoReconnect then
+                return
+            end
+            pcall(function()
+                TeleportService:Teleport(game.PlaceId, LocalPlayer)
+            end)
+        end)
+    end))
+end
+
+local function setDisable3D(value)
+    Flags.Disable3DRendering = value == true
+    if Flags.Disable3DRendering then
+        pcall(function()
+            RunService:Set3dRenderingEnabled(false)
+        end)
+        if not renderBacking then
+            local gui = Instance.new("ScreenGui")
+            gui.Name = "OuroborosRenderBacking"
+            gui.IgnoreGuiInset = true
+            gui.DisplayOrder = -100
+            gui.ResetOnSpawn = false
+            local frame = Instance.new("Frame")
+            frame.BackgroundColor3 = Color3.new(0, 0, 0)
+            frame.Size = UDim2.fromScale(1, 1)
+            frame.BorderSizePixel = 0
+            frame.Parent = gui
+            gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+            renderBacking = gui
+        end
+    else
+        pcall(function()
+            RunService:Set3dRenderingEnabled(true)
+        end)
+        if renderBacking then
+            renderBacking:Destroy()
+            renderBacking = nil
+        end
+    end
+end
+
+local function captureFps(inst)
+    if fpsRestore[inst] ~= nil then
+        return
+    end
+    local snap = {}
+    if inst:IsA("ParticleEmitter") or inst:IsA("Trail") or inst:IsA("Beam") or inst:IsA("Fire") or inst:IsA("Smoke") or inst:IsA("Sparkles") then
+        snap.Enabled = inst.Enabled
+        inst.Enabled = false
+    elseif inst:IsA("Explosion") then
+        snap.Visible = inst.Visible
+        inst.Visible = false
+    end
+    fpsRestore[inst] = snap
+end
+
+
+local function setFpsBoost(value)
+    Flags.FpsBoost = value == true
+    if fpsConn then
+        fpsConn:Disconnect()
+        fpsConn = nil
+    end
+    if not Flags.FpsBoost then
+        for inst, snap in pairs(fpsRestore) do
+            if typeof(inst) == "Instance" and inst.Parent then
+                for key, prev in pairs(snap) do
+                    pcall(function()
+                        inst[key] = prev
+                    end)
+                end
+            end
+        end
+        local light = fpsRestore.Lighting
+        if light then
+            Lighting.GlobalShadows = light.GlobalShadows
+            Lighting.FogEnd = light.FogEnd
+        end
+        table.clear(fpsRestore)
+        return
+    end
+    if fpsRestore.Lighting == nil then
+        fpsRestore.Lighting = {
+            GlobalShadows = Lighting.GlobalShadows,
+            FogEnd = Lighting.FogEnd,
+        }
+        Lighting.GlobalShadows = false
+        Lighting.FogEnd = 1e6
+    end
+    for _, inst in ipairs(workspace:GetDescendants()) do
+        captureFps(inst)
+    end
+    fpsConn = track(workspace.DescendantAdded:Connect(function(inst)
+        if unloaded or not Flags.FpsBoost then
+            return
+        end
+        captureFps(inst)
+    end))
+end
+
+local function pulseAntiAfk()
+    if unloaded or not Flags.AntiAfk then
+        return
+    end
+    local cam = workspace.CurrentCamera
+    if not cam then
+        return
+    end
+    pcall(function()
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.new(), cam.CFrame)
+    end)
+end
+
+local function setAntiAfk(value)
+    Flags.AntiAfk = value == true
+    if antiAfkConn then
+        antiAfkConn:Disconnect()
+        antiAfkConn = nil
+    end
+    if not Flags.AntiAfk then
+        stopWorker("AntiAfk")
+        return
+    end
+    antiAfkLast = os.clock()
+    antiAfkConn = track(LocalPlayer.Idled:Connect(function()
+        pulseAntiAfk()
+    end))
+    startWorker("AntiAfk", 1, function()
+        if not Flags.AntiAfk then
+            return
+        end
+        if os.clock() - antiAfkLast >= 60 then
+            antiAfkLast = os.clock()
+            pulseAntiAfk()
+        end
+    end)
+end
+
+
+local function setNoCustomCursor(value)
+    Flags.NoCustomCursor = value == true
+    if cursorBound then
+        pcall(RunService.UnbindFromRenderStep, RunService, "OuroborosCursor")
+        cursorBound = false
+    end
+    if not Flags.NoCustomCursor then
+        return
+    end
+    cursorBound = true
+    RunService:BindToRenderStep("OuroborosCursor", Enum.RenderPriority.Last.Value + 10, function()
+        if unloaded or not Flags.NoCustomCursor then
+            return
+        end
+        UserInputService.MouseIconEnabled = true
+        local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        local hud = playerGui and playerGui:FindFirstChild("ChopHud")
+        if hud then
+            for _, name in ipairs({ "Ring", "Dot" }) do
+                local item = hud:FindFirstChild(name)
+                if item and item:IsA("GuiObject") and item.Visible then
+                    item.Visible = false
+                end
+            end
+        end
+    end)
+end
+
+local function menuOpen()
+    return Window ~= nil and Window.Open == true and Window.Minimized ~= true
+end
+
+local function setFreeCursorMenu(value)
+    Flags.FreeCursorMenu = value == true
+    if menuCursor then
+        pcall(RunService.UnbindFromRenderStep, RunService, "OuroborosMenuCursor")
+        if menuCursor.gui then
+            menuCursor.gui:Destroy()
+        end
+        menuCursor = nil
+    end
+    if not Flags.FreeCursorMenu then
+        return
+    end
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "OuroborosMenuCursor"
+    gui.ResetOnSpawn = false
+    local button = Instance.new("TextButton")
+    button.BackgroundTransparency = 1
+    button.Text = ""
+    button.Size = UDim2.fromOffset(0, 0)
+    button.Modal = false
+    button.Parent = gui
+    gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+    menuCursor = { gui = gui, button = button }
+    RunService:BindToRenderStep("OuroborosMenuCursor", Enum.RenderPriority.Last.Value + 20, function()
+        if unloaded or not Flags.FreeCursorMenu or not menuCursor then
+            return
+        end
+        local shown = menuOpen()
+        if menuCursor.button.Modal ~= shown then
+            menuCursor.button.Modal = shown
+        end
+        if shown then
+            UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+            UserInputService.MouseIconEnabled = true
+        end
+    end)
+end
+
+local function bindCharacter(character)
+    task.defer(function()
+        if unloaded then
+            return
+        end
+        applyWalkSpeed()
+        if Flags.Fly then
+            setFly(true)
+        end
+    end)
+    local humanoid = character:FindFirstChildOfClass("Humanoid") or character:WaitForChild("Humanoid", 5)
+    if humanoid then
+        track(humanoid:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+            if Flags.WalkSpeedEnabled and not unloaded then
+                if humanoid.WalkSpeed ~= Flags.WalkSpeed then
+                    humanoid.WalkSpeed = Flags.WalkSpeed
+                end
+            end
+        end))
+    end
+end
+
+WORKER_STEPS = {
+    AutoCoins = { 1, stepCoins },
+    AutoTools = { 3, stepTools },
+    AutoUpgrades = { 2, stepUpgrades },
+    AutoDynamite = { 3, stepDynamite },
+    AutoCars = { 4, stepCars },
+    AutoBackpack = { 3, stepBackpack },
+    AutoJoin = { 2, stepAutoJoin },
+    AutoDaily = { 10, stepDaily },
+    AutoClasses = { 5, stepClasses },
+    AutoGemPerks = { 3, stepGemPerks },
+}
+
+local FARM_KEYS = { AutoChop = true, AutoPickup = true, AutoSell = true }
+
+local Setters = {}
+
+function Setters.feature(key, value)
+    Flags[key] = value == true
+    if FARM_KEYS[key] then
+        setWorker("Farm", farmActive(), 0.1, stepFarm)
+        if not farmActive() then
+            Game.status = "Idle"
+        end
+        return
+    end
+    local spec = WORKER_STEPS[key]
+    if spec then
+        setWorker(key, Flags[key], spec[1], spec[2])
+    end
+end
+
+local function stopAllFeatures()
+    for key in pairs(workers) do
+        workers[key] = false
+    end
+    for key in pairs(WORKER_STEPS) do
+        Flags[key] = false
+    end
+    for key in pairs(FARM_KEYS) do
+        Flags[key] = false
+    end
+    setWalkSpeedEnabled(false)
+    setInfJump(false)
+    setNoClip(false)
+    setInstantProximityPrompt(false)
+    setFly(false)
+    setNoGameplayPaused(false)
+    setAutoReconnect(false)
+    setDisable3D(false)
+    setFpsBoost(false)
+    setAntiAfk(false)
+    setNoCustomCursor(false)
+    setFreeCursorMenu(false)
+end
+
+local function unloadScript()
+    if unloaded then
+        return
+    end
+    unloaded = true
+    local ok, err = pcall(stopAllFeatures)
+    if not ok then
+        warn("[Deforestation] cleanup: " .. tostring(err))
+    end
+    for _, conn in ipairs(connections) do
+        pcall(function()
+            conn:Disconnect()
+        end)
+    end
+    table.clear(connections)
+    if Window then
+        pcall(function()
+            Window:Destroy()
+        end)
+        Window = nil
+    end
+end
+
+-- Keep GUI locals inside a separate function scope. The old monolithic
+-- top-level chunk exceeded Luau's 200-register local limit near its end.
+-- Existing gameplay helpers remain captured as upvalues; behavior is unchanged.
+local function initializeGUI()
+
+-- GUI library loaded from the requested GitHub source.
+local UI_SOURCE_URL = "https://raw.githubusercontent.com/meowmerp/bbbb/main/gui"
+local function loadGuiLibrary()
+    if type(loadstring) ~= "function" then
+        error("GUI loader requires loadstring", 0)
+    end
+    print("[Deforestation] Startup: downloading GUI library")
+    local source = game:HttpGet(UI_SOURCE_URL)
+    if type(source) ~= "string" or source == "" then
+        error("GUI library download returned empty content", 0)
+    end
+    print("[Deforestation] Startup: compiling GUI library (" .. tostring(#source) .. " bytes)")
+    local compiled, compileError = loadstring(source, "=DeforestationGUI")
+    if not compiled then
+        error("GUI library compilation failed: " .. tostring(compileError), 0)
+    end
+    print("[Deforestation] Startup: executing GUI library")
+    local runOk, result = xpcall(compiled, function(err)
+        local trace = (debug and type(debug.traceback) == "function")
+            and debug.traceback(tostring(err), 2) or tostring(err)
+        return trace
+    end)
+    if not runOk then
+        error("Downloaded GUI library failed while executing: " .. tostring(result), 0)
+    end
+    return result
+end
+
+local okLibrary, libraryOrErr = xpcall(loadGuiLibrary, function(err)
+    local trace = (debug and type(debug.traceback) == "function")
+        and debug.traceback(tostring(err), 2) or tostring(err)
+    return trace
+end)
+if not okLibrary or type(libraryOrErr) ~= "table" then
+    error("[Deforestation] GUI startup failed: " .. tostring(libraryOrErr), 0)
+end
+Library = libraryOrErr
+print("[Deforestation] Startup: GUI loaded successfully")
+
+track(LocalPlayer.CharacterAdded:Connect(bindCharacter))
+if LobbyRemotes then
+    track(LobbyRemotes.OpenCreate.OnClientEvent:Connect(onOpenCreate))
+    track(LobbyRemotes.Saves.OnClientEvent:Connect(onSaves))
+end
+if LocalPlayer.Character then
+    bindCharacter(LocalPlayer.Character)
+end
+
+Library:LoadFont({ Name = "ValleySans" })
+Library:SetDefaultTheme("Rose")
+
+Window = Library:CreateWindow({
+    Name = "Deforestation",
+    LoadingSubtitle = SCRIPT_VERSION,
+    ToggleUIKeybind = "RightControl",
+    ConfigurationSaving = {
+        Enabled = true,
+        FolderName = "Ouroboros/" .. GAME_KEY,
+        FileName = "default",
+    },
+    ToggleButton = { Platform = "Mobile" },
+    Home = {
+        Title = "Welcome to " .. GAME_NAME .. "!",
+        Tier = SCRIPT_VERSION,
+        Discord = DISCORD_INVITE,
+        Website = WEBSITE_LINK,
+        Stats = { "Players", "Session", "FPS", "Ping" },
+    },
+})
+
+local MainTab = Window:CreateTab({ Name = "Main", Icon = "house" })
+local LobbyTab = Window:CreateTab({ Name = "Lobby", Icon = "users" })
+local ShopTab = Window:CreateTab({ Name = "Shop", Icon = "store" })
+local Player = Window:CreateTab({ Name = "Player", Icon = "user" })
+local Settings = Window:CreateTab({ Name = "Settings", Icon = "settings" })
+
+local Lists = {
+    zoneByLabel = {},
+    zoneLabels = {},
+    upgradeById = {},
+    upgradeLabels = {},
+    upgradeByLabel = {},
+    toolLabels = {},
+    carByLabel = {},
+    carLabels = {},
+    classByLabel = {},
+    classLabels = {},
+    perkByLabel = {},
+    perkLabels = {},
+    diffLabels = {},
+}
+
+for _, key in ipairs(zoneOrder()) do
+    local label = zoneLabel(key)
+    Lists.zoneByLabel[label] = key
+    table.insert(Lists.zoneLabels, label)
+end
+
+if Config then
+    for _, section in ipairs(Config.Upgrades.Sections) do
+        if not section.Hidden and not section.ComingSoon then
+            for _, item in ipairs(section.Items) do
+                local label = tostring(section.DisplayName) .. ": " .. tostring(item.Name)
+                Lists.upgradeByLabel[label] = item.Id
+                table.insert(Lists.upgradeLabels, label)
+            end
+        end
+    end
+    for _, name in ipairs(Config.Tools.Order) do
+        local def = Config.Tools[name]
+        if def and tonumber(def.Price) and name ~= "Dynamite" then
+            table.insert(Lists.toolLabels, name)
+        end
+    end
+    for _, v in ipairs(Config.Vehicles.List) do
+        if v.Currency == "Coins" or v.Currency == "Gems" then
+            local label = v.Id:gsub("^Truck%d+_", "") .. " (" .. short(v.Price) .. " " .. v.Currency .. ")"
+            Lists.carByLabel[label] = v.Id
+            table.insert(Lists.carLabels, label)
+        end
+    end
+end
+
+local function mapLabels(option, lookup)
+    local out = {}
+    for _, label in ipairs(asList(option)) do
+        table.insert(out, lookup and lookup[label] or label)
+    end
+    return out
+end
+
+local function featureToggle(box, name, flag)
+    box:CreateToggle({
+        Name = name,
+        CurrentValue = false,
+        Flag = flag,
+        Callback = function(value)
+            Setters.feature(flag, value)
+        end,
+    })
+end
+
+local function setZone(option)
+    if settingZoneFromDetection then return end
+    local label = firstOption(option)
+    Flags.Zone = Lists.zoneByLabel[label] or Flags.Zone
+    table.clear(Game.badTrees)
+end
+
+local function setupMainTab()
+    local Overview = MainTab:AddLeftGroupbox({ Name = "Overview", Icon = "activity" })
+    Overview:CreateStatusList({
+        Name = "Status",
+        MaxRows = 5,
+        UpdateRate = 0.5,
+        Update = overviewRows,
+    })
+
+    local Chop = MainTab:AddLeftGroupbox({ Name = "Chopping", Icon = "axe" })
+    detectedZoneDropdown = Chop:CreateDropdown({
+        Name = "Zone",
+        Options = Lists.zoneLabels,
+        CurrentOption = Lists.zoneLabels[1],
+        AllowNone = false,
+        Flag = "Zone",
+        Callback = setZone,
+    })
+    featureToggle(Chop, "Auto Chop Trees", "AutoChop")
+    featureToggle(Chop, "Auto Fight Night Mobs", "AutoFightMobs")
+    featureToggle(Chop, "Auto Advance Zone After Boss", "AutoAdvanceZone")
+    Chop:CreateSlider({
+        Name = "Chop Delay",
+        Range = { 0.1, 1.5 },
+        Increment = 0.05,
+        CurrentValue = 0.4,
+        Flag = "ChopDelay",
+        Callback = function(value)
+            Flags.ChopDelay = tonumber(value) or Flags.ChopDelay
+        end,
+    })
+
+    local Logs = MainTab:AddRightGroupbox({ Name = "Logs & Cash", Icon = "coins" })
+    featureToggle(Logs, "Auto Pick Up Logs", "AutoPickup")
+    featureToggle(Logs, "Auto Sell Logs", "AutoSell")
+    featureToggle(Logs, "Auto Pick Up Coins", "AutoCoins")
+
+    -- Independent, saved threshold for each zone (including future zones in the game config).
+    local Targets = MainTab:AddRightGroupbox({ Name = "Sell Amount by Zone", Icon = "list-filter" })
+    for index, zoneKey in ipairs(zoneOrder()) do
+        local initial = index == 1 and "60" or "100"
+        sellByZone[zoneKey] = initial
+        Targets:CreateDropdown({
+            Name = zoneLabel(zoneKey),
+            Options = SELL_OPTIONS,
+            CurrentOption = initial,
+            AllowNone = false,
+            Flag = "SellZone_" .. zoneKey,
+            Callback = function(selection)
+                local picked = tostring(firstOption(selection) or initial)
+                if table.find(SELL_OPTIONS, picked) then
+                    sellByZone[zoneKey] = picked
+                end
+            end,
+        })
+    end
+end
+
+if Config then
+    for _, c in ipairs(Config.Classes.List) do
+        local price = tonumber(Config.Classes.Stock.Prices[c.Id])
+        if price and price > 0 then
+            local label = tostring(c.Name) .. " (" .. tostring(c.Tier) .. ", " .. short(price) .. " gems)"
+            Lists.classByLabel[label] = c.Id
+            table.insert(Lists.classLabels, label)
+        end
+    end
+    for _, perk in ipairs(Config.Shop.Perks) do
+        local label = (tostring(perk.Name):lower():gsub("(%a)(%w*)", function(a, b)
+            return a:upper() .. b
+        end))
+        Lists.perkByLabel[label] = perk.Id
+        table.insert(Lists.perkLabels, label)
+    end
+end
+for _, d in ipairs(LobbyConfig and LobbyConfig.Difficulties or {}) do
+    table.insert(Lists.diffLabels, d.Name)
+end
+
+local function savedRunLabels()
+    local out = {}
+    for _, s in ipairs(Lobby.saves) do
+        table.insert(out, s.label)
+    end
+    return out
+end
+
+local function setupLobbyTab()
+    local Join = LobbyTab:AddLeftGroupbox({ Name = "Auto Join", Icon = "play" })
+    Join:CreateDropdown({
+        Name = "Difficulty",
+        Options = Lists.diffLabels,
+        CurrentOption = Lists.diffLabels[1],
+        AllowNone = false,
+        Flag = "Difficulty",
+        Callback = function(option)
+            Flags.Difficulty = firstOption(option) or Flags.Difficulty
+        end,
+    })
+    Join:CreateSlider({
+        Name = "Player Limit",
+        Range = { 1, LobbyConfig and LobbyConfig.MaxParty or 4 },
+        Increment = 1,
+        CurrentValue = 1,
+        Flag = "PartySize",
+        Callback = function(value)
+            Flags.PartySize = tonumber(value) or Flags.PartySize
+        end,
+    })
+    featureToggle(Join, "Auto Join", "AutoJoin")
+
+    local Saved = LobbyTab:AddLeftGroupbox({ Name = "Saved Runs", Icon = "save" })
+    local savedDropdown = Saved:CreateDropdown({
+        Name = "Saved Run",
+        Options = savedRunLabels(),
+        CurrentOption = {},
+        Callback = function(option)
+            Flags.SavedRun = firstOption(option)
+        end,
+    })
+    Lobby.onSavesChanged = function()
+        if savedDropdown and type(savedDropdown.Refresh) == "function" then
+            pcall(savedDropdown.Refresh, savedDropdown, savedRunLabels())
+        end
+    end
+    Saved:CreateButton({
+        Name = "Refresh Saved Runs",
+        Icon = "refresh-cw",
+        Callback = function()
+            task.spawn(function()
+                if not inLobby() then
+                    notify("Only works in the lobby", "Warning")
+                    return
+                end
+                refreshSaves()
+                notify(#Lobby.saves .. " saved run(s) found", "Info")
+            end)
+        end,
+    })
+    Saved:CreateButton({
+        Name = "Join Saved Run",
+        Icon = "log-in",
+        Callback = function()
+            task.spawn(function()
+                local key
+                for _, s in ipairs(Lobby.saves) do
+                    if s.label == Flags.SavedRun then
+                        key = s.key
+                    end
+                end
+                if not inLobby() then
+                    notify("Only works in the lobby", "Warning")
+                elseif not key then
+                    notify("Pick a saved run first", "Warning")
+                elseif not joinRun(key) then
+                    notify(Game.status, "Error")
+                end
+            end)
+        end,
+    })
+
+    local Rewards = LobbyTab:AddRightGroupbox({ Name = "Rewards & Shop", Icon = "gift" })
+    featureToggle(Rewards, "Auto Claim Daily Rewards", "AutoDaily")
+    Rewards:CreateDropdown({
+        Name = "Classes To Buy",
+        Options = Lists.classLabels,
+        MultipleOptions = true,
+        CurrentOption = {},
+        Flag = "BuyClasses",
+        Callback = function(option)
+            Flags.BuyClasses = mapLabels(option, Lists.classByLabel)
+        end,
+    })
+    featureToggle(Rewards, "Auto Buy Classes", "AutoClasses")
+    Rewards:CreateDropdown({
+        Name = "Gem Perks To Buy",
+        Options = Lists.perkLabels,
+        MultipleOptions = true,
+        CurrentOption = {},
+        Flag = "BuyGemPerks",
+        Callback = function(option)
+            Flags.BuyGemPerks = mapLabels(option, Lists.perkByLabel)
+        end,
+    })
+    featureToggle(Rewards, "Auto Buy Gem Perks", "AutoGemPerks")
+end
+
+local function setupShopTab()
+    local Tools = ShopTab:AddLeftGroupbox({ Name = "Tools", Icon = "hammer" })
+    Tools:CreateDropdown({
+        Name = "Tools To Buy",
+        Options = Lists.toolLabels,
+        MultipleOptions = true,
+        CurrentOption = {},
+        Flag = "BuyTools",
+        Callback = function(option)
+            Flags.BuyTools = mapLabels(option)
+        end,
+    })
+    featureToggle(Tools, "Auto Buy Tools", "AutoTools")
+    featureToggle(Tools, "Auto Buy Dynamite", "AutoDynamite")
+    featureToggle(Tools, "Auto Buy Backpacks", "AutoBackpack")
+
+    local Upgrades = ShopTab:AddRightGroupbox({ Name = "Upgrades", Icon = "trending-up" })
+    Upgrades:CreateDropdown({
+        Name = "Upgrades To Buy",
+        Options = Lists.upgradeLabels,
+        MultipleOptions = true,
+        CurrentOption = {},
+        Flag = "BuyUpgrades",
+        Callback = function(option)
+            Flags.BuyUpgrades = mapLabels(option, Lists.upgradeByLabel)
+        end,
+    })
+    featureToggle(Upgrades, "Auto Buy Upgrades", "AutoUpgrades")
+
+    local Cars = ShopTab:AddRightGroupbox({ Name = "Cars", Icon = "truck" })
+    Cars:CreateDropdown({
+        Name = "Cars To Buy",
+        Options = Lists.carLabels,
+        MultipleOptions = true,
+        CurrentOption = {},
+        Flag = "BuyCars",
+        Callback = function(option)
+            Flags.BuyCars = mapLabels(option, Lists.carByLabel)
+        end,
+    })
+    featureToggle(Cars, "Auto Buy Cars", "AutoCars")
+end
+
+local function setupPlayerTab()
+    local Movement = Player:AddLeftGroupbox({ Name = "Movement", Icon = "move" })
+    Movement:CreateToggle({
+        Name = "WalkSpeed",
+        CurrentValue = false,
+        Flag = "WalkSpeedEnabled",
+        Callback = function(value)
+            setWalkSpeedEnabled(value)
+        end,
+    })
+    Movement:CreateSlider({
+        Name = "Speed",
+        Range = { 16, 250 },
+        Increment = 1,
+        CurrentValue = 32,
+        Flag = "WalkSpeed",
+        Callback = function(value)
+            setWalkSpeed(value)
+        end,
+    })
+    Movement:CreateToggle({
+        Name = "Infinite Jump",
+        CurrentValue = false,
+        Flag = "InfJump",
+        Callback = function(value)
+            setInfJump(value)
+        end,
+    })
+    Movement:CreateToggle({
+        Name = "Noclip",
+        CurrentValue = false,
+        Flag = "NoClip",
+        Callback = function(value)
+            setNoClip(value)
+        end,
+    })
+    Movement:CreateToggle({
+        Name = "Instant ProximityPrompt",
+        CurrentValue = false,
+        Flag = "InstantProximityPrompt",
+        Callback = function(value)
+            setInstantProximityPrompt(value)
+        end,
+    })
+
+    local FlyBox = Player:AddRightGroupbox({ Name = "Fly", Icon = "plane" })
+    FlyBox:CreateToggle({
+        Name = "Fly",
+        CurrentValue = false,
+        Flag = "Fly",
+        Callback = function(value)
+            setFly(value)
+        end,
+    })
+    FlyBox:CreateSlider({
+        Name = "Fly Speed",
+        Range = { 10, 400 },
+        Increment = 1,
+        CurrentValue = 60,
+        Flag = "FlySpeed",
+        Callback = function(value)
+            setFlySpeed(value)
+        end,
+    })
+
+    local Client = Player:AddLeftGroupbox({ Name = "Client", Icon = "monitor" })
+    Client:CreateToggle({
+        Name = "No Gameplay Paused",
+        CurrentValue = true,
+        Flag = "AntiGameplayPause",
+        Callback = function(value)
+            setNoGameplayPaused(value)
+        end,
+    })
+    Client:CreateToggle({
+        Name = "Auto Reconnect on Kick",
+        CurrentValue = false,
+        Flag = "AutoReconnect",
+        Callback = function(value)
+            setAutoReconnect(value)
+        end,
+    })
+    Client:CreateToggle({
+        Name = "Disable 3D Rendering",
+        CurrentValue = false,
+        Flag = "Disable3DRendering",
+        Callback = function(value)
+            setDisable3D(value)
+        end,
+    })
+    Client:CreateToggle({
+        Name = "FPS Boost",
+        CurrentValue = false,
+        Flag = "FpsBoost",
+        Callback = function(value)
+            setFpsBoost(value)
+        end,
+    })
+    Client:CreateToggle({
+        Name = "Disable Custom Cursor",
+        CurrentValue = false,
+        Flag = "NoCustomCursor",
+        Callback = function(value)
+            setNoCustomCursor(value)
+        end,
+    })
+    Client:CreateToggle({
+        Name = "Hide UI On Start",
+        CurrentValue = false,
+        Flag = "HideUIOnStart",
+        Callback = function() end,
+    })
+end
+
+local function setupSettingsTab()
+    local Interface = Settings:AddLeftGroupbox({ Name = "Menu", Icon = "monitor" })
+    Interface:CreateKeybind({
+        Name = "Toggle UI",
+        CurrentKeybind = "RightControl",
+        Flag = "ToggleUIKey",
+        Callback = function() end,
+        OnChanged = function(key)
+            Window:SetKeybind(key)
+        end,
+    })
+    Interface:CreateDropdown({
+        Name = "Toggle button",
+        Options = { "Mobile only", "Mobile & PC" },
+        CurrentOption = "Mobile only",
+        AllowNone = false,
+        Flag = "ToggleButtonPlatform",
+        Callback = function(option)
+            Window:SetToggleButtonPlatform(firstOption(option) == "Mobile & PC" and "Both" or "Mobile")
+        end,
+    })
+    Interface:CreateToggle({
+        Name = "Free Cursor While Menu Open",
+        CurrentValue = true,
+        Flag = "FreeCursorMenu",
+        Callback = function(value)
+            setFreeCursorMenu(value)
+        end,
+    })
+    Interface:CreateToggle({
+        Name = "Anti AFK",
+        CurrentValue = true,
+        Flag = "AntiAfk",
+        Callback = function(value)
+            setAntiAfk(value)
+        end,
+    })
+    Interface:CreateButton({
+        Name = "Unload",
+        Icon = "power",
+        Callback = function()
+            Library:Confirm({
+                Title = "Unload?",
+                ConfirmText = "Unload",
+                Callback = function()
+                    unloadScript()
+                end,
+            })
+        end,
+    })
+    Settings:CreateConfigManager({ Name = "Configs", Side = "Left" })
+    Settings:CreateThemeManager({ Name = "Themes", Side = "Right" })
+end
+
+setupMainTab()
+-- Read area HUD, then switch from farming to the v7 boss combat phase.
+startWorker("ZoneAndCycle", 0.25, function()
+    if not Game.bossPhase then
+        detectCurrentZone()
+        Game.dayNight = detectCycle()
+    end
+    monitorBossAndAdvance()
+end)
+startWorker("BossCombatV7", 0.18, bossCombatStep)
+startWorker("FinalBusinessman", 0.45, finalBusinessmanStep)
+setupLobbyTab()
+setupShopTab()
+setupPlayerTab()
+setupSettingsTab()
+
+setNoGameplayPaused(true)
+setAntiAfk(true)
+
+Window:LoadAutoload()
+-- Apply persisted per-zone dropdowns even when the GUI library does not fire
+-- callbacks when loading saved settings.
+for index, zoneKey in ipairs(zoneOrder()) do
+    local defaultValue = index == 1 and "60" or "100"
+    local saved = tostring(firstOption(readFlag("SellZone_" .. zoneKey, defaultValue)) or defaultValue)
+    sellByZone[zoneKey] = table.find(SELL_OPTIONS, saved) and saved or defaultValue
+end
+
+setZone(readFlag("Zone", Lists.zoneLabels[1]))
+detectCurrentZone()
+Game.dayNight = detectCycle()
+Flags.ChopDelay = tonumber(readFlag("ChopDelay", Flags.ChopDelay)) or Flags.ChopDelay
+Flags.SellAt = tonumber(readFlag("SellAt", Flags.SellAt)) or Flags.SellAt
+Flags.BuyTools = mapLabels(readFlag("BuyTools", {}))
+Flags.BuyUpgrades = mapLabels(readFlag("BuyUpgrades", {}), Lists.upgradeByLabel)
+Flags.BuyCars = mapLabels(readFlag("BuyCars", {}), Lists.carByLabel)
+Flags.Difficulty = firstOption(readFlag("Difficulty", Flags.Difficulty)) or Flags.Difficulty
+Flags.PartySize = tonumber(readFlag("PartySize", Flags.PartySize)) or Flags.PartySize
+Flags.BuyClasses = mapLabels(readFlag("BuyClasses", {}), Lists.classByLabel)
+Flags.BuyGemPerks = mapLabels(readFlag("BuyGemPerks", {}), Lists.perkByLabel)
+Flags.AutoFightMobs = readFlag("AutoFightMobs", true) ~= false
+Flags.AutoAdvanceZone = readFlag("AutoAdvanceZone", true) ~= false
+for key in pairs(FARM_KEYS) do
+    Setters.feature(key, readFlag(key, false) == true)
+end
+for key in pairs(WORKER_STEPS) do
+    Setters.feature(key, readFlag(key, false) == true)
+end
+setWalkSpeed(readFlag("WalkSpeed", Flags.WalkSpeed))
+setWalkSpeedEnabled(readFlag("WalkSpeedEnabled", false) == true)
+setInfJump(readFlag("InfJump", false) == true)
+setNoClip(readFlag("NoClip", false) == true)
+setInstantProximityPrompt(readFlag("InstantProximityPrompt", false) == true)
+setFlySpeed(readFlag("FlySpeed", Flags.FlySpeed))
+setFly(readFlag("Fly", false) == true)
+setNoGameplayPaused(readFlag("AntiGameplayPause", true) == true)
+setAutoReconnect(readFlag("AutoReconnect", false) == true)
+setDisable3D(readFlag("Disable3DRendering", false) == true)
+setFpsBoost(readFlag("FpsBoost", false) == true)
+setAntiAfk(readFlag("AntiAfk", true) == true)
+setNoCustomCursor(readFlag("NoCustomCursor", false) == true)
+setFreeCursorMenu(readFlag("FreeCursorMenu", true) == true)
+
+if not Remotes or not Config then
+    notify("Game modules not found; features are disabled", "Error")
+end
+
+if readFlag("HideUIOnStart", false) == true then
+    Window:Toggle(false)
+end
+
+end -- initializeGUI
+initializeGUI()
