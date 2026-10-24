@@ -11,7 +11,7 @@ do
     end
 end
 
-local SCRIPT_VERSION = "v3.5"
+local SCRIPT_VERSION = "v3.7"
 local GAME_NAME = "Deforestation"
 local GAME_KEY = "TheForest"
 local DISCORD_INVITE = "https://discord.gg/synapsex"
@@ -323,8 +323,28 @@ local function currentSellZone()
     return (areaNumber and order[areaNumber]) or Flags.Zone
 end
 
+-- Only selected Auto Buy Upgrades count toward the automatic pickup cutoff.
+-- An empty selection or a disabled Auto Buy Upgrades toggle must not disable pickup.
+-- If an upgrade is unknown or its level cannot be verified, keep collecting.
+local function selectedUpgradesMaxed()
+    if not Flags.AutoUpgrades or not Config or type(Flags.BuyUpgrades) ~= "table" or #Flags.BuyUpgrades == 0 then
+        return false
+    end
+    for _, id in ipairs(Flags.BuyUpgrades) do
+        local item = upgradeDef(id)
+        if not item or type(item.Prices) ~= "table" then
+            return false
+        end
+        local level = tonumber(LocalPlayer:GetAttribute("Up_" .. id))
+        if not level or level < #item.Prices then
+            return false
+        end
+    end
+    return true
+end
+
 local function pickupDisabledForZone()
-    return sellByZone[currentSellZone()] == "Don't Pick Up Logs"
+    return sellByZone[currentSellZone()] == "Don't Pick Up Logs" or selectedUpgradesMaxed()
 end
 
 local function sellThreshold()
@@ -1043,7 +1063,7 @@ local function worldCompletionRoute(zone)
     -- Known World 2 finale; its completion interaction is not known yet.
     -- This deliberately does NOT run World 1's NPC / return-to-lobby flow.
     local name = zoneLabel(zone)
-    if normalizedName(name) == "cardongiants" then
+    if normalizeZoneLabel(name) == "cardongiants" then
         return "PendingWorld2"
     end
     return nil
