@@ -11,7 +11,7 @@ do
     end
 end
 
-local SCRIPT_VERSION = "v4.1"
+local SCRIPT_VERSION = "v4.2"
 local GAME_NAME = "Deforestation"
 local GAME_KEY = "TheForest"
 local DISCORD_INVITE = "https://discord.gg/synapsex"
@@ -1042,7 +1042,42 @@ local function returnToGoldenMatriarch(state)
     Game.finalReturnCFrame = nil
 end
 
+-- Protect the World 1-only Businessman against World 2 HUD/zone changes.
+-- The HUD is preferred; zone keys and configuration order provide a fallback
+-- when the HUD does not explicitly print "World 2".
+local function isWorld2Active()
+    local context = Game.dynamicContext
+    local zone = normalizeZoneLabel(Flags.Zone)
+    if zone == "scrubflats" or zone == "cardongiants" then return true end
+    if context and context.world == 2 then return true end
+    if context and context.world == 1 then return false end
+    local index = zoneIndex(Flags.Zone)
+    -- World 1 has eight configured zones. The additional area entries
+    -- belong to the newer world when the game exposes a combined order.
+    if index and index > 8 then return true end
+    return false
+end
+
+local function cancelWorld1BusinessmanInWorld2()
+    if not isWorld2Active() then return false end
+    if Game.finalStage or (Game.finalSequence and not Game.world2CashOut
+        and not Game.world2CashOutFinished) then
+        Game.finalStage = nil
+        Game.finalTarget = nil
+        Game.finalNextAction = 0
+        Game.finalTalkAttempts = 0
+        Game.finalSequence = false
+        Game.finalDone = false
+        Game.goldenAspensChecked = false
+        Game.finalReturnCFrame = nil
+        Game.status = "World 2 detected; World 1 Businessman disabled"
+        print("[Deforestation] World 2: cancelled World 1 Businessman sequence")
+    end
+    return true
+end
+
 local function beginFinalBusinessman(reason)
+    if cancelWorld1BusinessmanInWorld2() then return end
     if Game.finalSequence or Game.finalDone then return end
     local _, previousRoot = getRoot()
     if previousRoot then Game.finalReturnCFrame = previousRoot.CFrame end
@@ -1062,7 +1097,7 @@ end
 local function worldCompletionRoute(zone)
     local context = Game.dynamicContext
     local world = context and context.world
-    if zone == "GoldenAspens" and (world == nil or world == 1) then
+    if zone == "GoldenAspens" and not isWorld2Active() and (world == nil or world == 1) then
         return "Businessman"
     end
     -- Known World 2 finale; its completion interaction is not known yet.
@@ -1075,6 +1110,7 @@ local function worldCompletionRoute(zone)
 end
 
 local function monitorBossAndAdvance()
+    cancelWorld1BusinessmanInWorld2()
     if not Flags.AutoChop and not Flags.AutoSell and not Flags.AutoPickup then return end
     local zone = Flags.Zone
     local state = readBossProgress()
@@ -1403,6 +1439,8 @@ local function locateBusinessman()
 end
 
 local function finalBusinessmanStep()
+    -- Cash Out uses finalSequence to pause farming: do not mistake it for Businessman.
+    if cancelWorld1BusinessmanInWorld2() or Game.world2CashOut or Game.world2CashOutFinished then return end
     if unloaded or not Game.finalSequence or Game.finalDone then return end
     local now = os.clock()
     local ui = finalGuiState()
