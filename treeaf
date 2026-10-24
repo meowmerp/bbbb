@@ -11,7 +11,7 @@ do
     end
 end
 
-local SCRIPT_VERSION = "v4.6"
+local SCRIPT_VERSION = "v4.7"
 local GAME_NAME = "Deforestation"
 local GAME_KEY = "TheForest"
 local DISCORD_INVITE = "https://discord.gg/synapsex"
@@ -3841,39 +3841,84 @@ startWorker("World2CashOut", 0.6, function()
         return
     end
 
+    local function promptPosition(prompt)
+        local parent = prompt.Parent
+        if parent and parent:IsA("Attachment") then return parent.WorldPosition end
+        if parent and parent:IsA("BasePart") then return parent.Position end
+        if parent and parent:IsA("Model") then return parent:GetPivot().Position end
+        return nil
+    end
+
+    -- Search real prompts rather than blindly pressing E at a coordinate.
+    -- A prompt may be attached to an Attachment inside the detonator.
     local cashPrompt
-    for _, part in ipairs(workspace:GetPartBoundsInRadius(root.Position, 13)) do
-        for _, node in ipairs(part:GetDescendants()) do
-            if node:IsA("ProximityPrompt") and node.Enabled then
-                local action = (node.ActionText .. " " .. node.ObjectText):lower()
-                if action:find("cash out", 1, true) or action:find("detonator", 1, true)
-                    or action:find("cashout", 1, true) then
-                    cashPrompt = node
-                    break
+    local bestDistance = math.huge
+    for _, node in ipairs(workspace:GetDescendants()) do
+        if node:IsA("ProximityPrompt") and node.Enabled then
+            local action = (tostring(node.ActionText) .. " " .. tostring(node.ObjectText)):lower()
+            if action:find("cash out", 1, true) or action:find("cashout", 1, true)
+                or action:find("detonator", 1, true) then
+                local at = promptPosition(node)
+                local distance = at and (root.Position - at).Magnitude or math.huge
+                if distance < bestDistance then
+                    bestDistance, cashPrompt = distance, node
                 end
             end
         end
-        if cashPrompt then break end
     end
 
-    if cashPrompt then
-        if Game.world2CashOutTries == 0 then
-            Game.world2CashOutBaseline = visible
-        end
-        Game.world2CashOutTries += 1
-        Game.status = "Detonator Cash Out: try " .. Game.world2CashOutTries .. "/8"
-        if type(fireproximityprompt) == "function" then
-            pcall(fireproximityprompt, cashPrompt)
-        else
-            pressFinalInteract()
-        end
-        -- Allow the interaction/dialogue to open before the next attempt.
-        Game.world2CashOutLastTry = os.clock() + 3
-    else
-        Game.status = "World 2 complete: waiting for Detonator Cash Out prompt"
-        -- Prompt not loaded yet; do not send E to an unrelated object.
-        Game.world2CashOutLastTry = os.clock() + 1.5
+    if not cashPrompt then
+        Game.status = "Detonator: Cash Out prompt not found (waiting for load)"
+        Game.world2CashOutLastTry = os.clock() + 2
+        return
     end
+
+    local at = promptPosition(cashPrompt)
+    local activationRange = math.max(3, cashPrompt.MaxActivationDistance - 2)
+    if at and bestDistance > activationRange then
+        -- Get within the game's actual prompt range before attempting E.
+        -- Stand alongside the device, avoiding the prompt's exact coordinates.
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.CFrame = CFrame.new(at + Vector3.new(0, 1.5, math.min(3, activationRange * 0.5)))
+        Game.world2CashOutLastTry = os.clock() + 1.5
+        Game.status = "Detonator: moving within Cash Out prompt range"
+        return
+    end
+
+    if Game.world2CashOutTries == 0 then
+        Game.world2CashOutBaseline = visible
+    end
+    Game.world2CashOutTries += 1
+    local attempt = Game.world2CashOutTries
+    Game.status = "Detonator: activating Cash Out (" .. attempt .. "/8)"
+
+    -- The old version used a quick 0.08-second tap or silently relied on
+    -- fireproximityprompt. Hold E for the prompt's actual HoldDuration and
+    -- try the executor prompt function separately if available.
+    local holdTime = math.clamp((tonumber(cashPrompt.HoldDuration) or 0) + 0.35, 0.35, 3.5)
+    local sentInput = pcall(function()
+        local vim = game:GetService("VirtualInputManager")
+        vim:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+        task.wait(holdTime)
+        vim:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+    end)
+    if not sentInput and type(keypress) == "function" and type(keyrelease) == "function" then
+        pcall(function()
+            keypress(0x45)
+            task.wait(holdTime)
+            keyrelease(0x45)
+        end)
+    end
+    if type(fireproximityprompt) == "function" then
+        local ok, err = pcall(fireproximityprompt, cashPrompt)
+        if not ok then
+            warn("[Deforestation] Detonator prompt function failed: " .. tostring(err))
+        end
+    end
+    print(string.format("[Deforestation] Detonator attempt %d/8; prompt=%s; distance=%.1f; hold=%.2fs; input=%s",
+        attempt, cashPrompt:GetFullName(), bestDistance, holdTime, tostring(sentInput)))
+    Game.world2CashOutLastTry = os.clock() + 3
+
 end)
 
 setupLobbyTab()
