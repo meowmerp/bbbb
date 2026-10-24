@@ -11,7 +11,7 @@ do
     end
 end
 
-local SCRIPT_VERSION = "v4.0"
+local SCRIPT_VERSION = "v4.1"
 local GAME_NAME = "Deforestation"
 local GAME_KEY = "TheForest"
 local DISCORD_INVITE = "https://discord.gg/synapsex"
@@ -155,6 +155,11 @@ local Game = {
     dynamicContext = nil,
     finalRejected = false,
     finalReturnCFrame = nil,
+    world2CashOut = false,
+    world2CashOutFinished = false,
+    world2CashOutStartedAt = nil,
+    world2CashOutLastTry = 0,
+    world2CashOutTries = 0,
 }
 local WORKER_STEPS
 
@@ -1064,7 +1069,7 @@ local function worldCompletionRoute(zone)
     -- This deliberately does NOT run World 1's NPC / return-to-lobby flow.
     local name = zoneLabel(zone)
     if normalizeZoneLabel(name) == "cardongiants" then
-        return "PendingWorld2"
+        return "World2CashOut"
     end
     return nil
 end
@@ -1157,8 +1162,18 @@ local function monitorBossAndAdvance()
         beginFinalBusinessman("Golden Aspens boss defeat confirmed")
         return
     end
-    if completionRoute == "PendingWorld2" then
-        Game.status = "Cardon Giants cleared; World 2 completion interaction not configured"
+    if completionRoute == "World2CashOut" then
+        -- The existing boss-bar + day/night timer verification has passed.
+        -- Do not use 100% cleared alone; the boss must really be defeated.
+        if not Game.world2CashOut and not Game.world2CashOutFinished then
+            Game.world2CashOut = true
+            Game.world2CashOutStartedAt = os.clock()
+            Game.world2CashOutLastTry = 0
+            Game.world2CashOutTries = 0
+            Game.finalSequence = true -- pause farming, pickup and selling
+            Game.status = "Cardon Giants boss defeated; heading to Detonator"
+            print("[Deforestation] World 2 complete; starting Detonator Cash Out")
+        end
         return
     end
     if not Flags.AutoAdvanceZone then
@@ -3641,6 +3656,70 @@ startWorker("ZoneAndCycle", 0.25, function()
 end)
 startWorker("BossCombatV7", 0.18, bossCombatStep)
 startWorker("FinalBusinessman", 0.45, finalBusinessmanStep)
+startWorker("World2CashOut", 0.6, function()
+    if unloaded or not Game.world2CashOut then return end
+    local target = Vector3.new(389.11, 3.11, 224.00)
+    local _, root = getRoot()
+    if not root then
+        Game.status = "World 2 Cash Out: waiting for character"
+        return
+    end
+    -- Do not resume navigation to the Detonator if the game has already
+    -- returned to the lobby or teleported to another place.
+    if isLobbyPlace() then
+        Game.world2CashOut = false
+        Game.finalSequence = false
+        return
+    end
+    if (root.Position - target).Magnitude > 9 then
+        Game.status = "World 2 complete: moving to Detonator"
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.CFrame = CFrame.new(target + Vector3.new(0, 2.5, 4))
+        Game.world2CashOutLastTry = os.clock() + 1
+        return
+    end
+    if os.clock() < Game.world2CashOutLastTry then return end
+    -- Match the visible prompt from the screenshot rather than activating
+    -- unrelated nearby interactions.
+    local cashPrompt
+    for _, part in ipairs(workspace:GetPartBoundsInRadius(root.Position, 13)) do
+        for _, node in ipairs(part:GetDescendants()) do
+            if node:IsA("ProximityPrompt") and node.Enabled then
+                local action = (node.ActionText .. " " .. node.ObjectText):lower()
+                if action:find("cash out", 1, true) or action:find("detonator", 1, true)
+                    or action:find("cashout", 1, true) then
+                    cashPrompt = node
+                    break
+                end
+            end
+        end
+        if cashPrompt then break end
+    end
+    Game.world2CashOutLastTry = os.clock() + 2
+    if cashPrompt then
+        Game.status = "World 2 complete: activating Detonator Cash Out"
+        if type(fireproximityprompt) == "function" then
+            pcall(fireproximityprompt, cashPrompt)
+        else
+            pressFinalInteract()
+        end
+        Game.world2CashOutTries += 1
+    else
+        Game.status = "World 2 complete: waiting for Detonator Cash Out prompt"
+        -- E is only used when a matching prompt was located; never press
+        -- unknown interactions just because the character is near the point.
+    end
+    -- The result of Cash Out is not yet known; keep the existing UI and
+    -- world completion flow untouched until the user confirms its outcome.
+    if Game.world2CashOutTries >= 3 then
+        Game.status = "Detonator activated; waiting for World 2 completion result"
+        Game.world2CashOut = false
+        Game.world2CashOutFinished = true
+        -- Leave the run paused after cash-out; its resulting UI/transition
+        -- is not yet known and must not be guessed.
+    end
+end)
+
 setupLobbyTab()
 setupShopTab()
 setupPlayerTab()
