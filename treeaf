@@ -11,7 +11,7 @@ do
     end
 end
 
-local SCRIPT_VERSION = "v3.1"
+local SCRIPT_VERSION = "v3.2"
 local GAME_NAME = "Deforestation"
 local GAME_KEY = "TheForest"
 local DISCORD_INVITE = "https://discord.gg/synapsex"
@@ -885,6 +885,70 @@ local function goldenAspensCheckVisible()
     return false
 end
 
+-- A live Golden Matriarch announcement overrides older completion/checkmark records.
+-- Unlike the objective hint ("wake the ..."), this is the actual active boss message.
+local function goldenMatriarchAwakeVisible()
+    local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not gui then return false end
+    local camera = workspace.CurrentCamera
+    local viewport = camera and camera.ViewportSize or Vector2.new(1920, 1080)
+    for _, node in ipairs(gui:GetDescendants()) do
+        if visibleHudLabel(node) then
+            local pos = node.AbsolutePosition
+            if pos.X >= viewport.X * 0.45 and pos.Y <= viewport.Y * 0.38 then
+                local text = cleanAreaHudText(node.Text):lower():gsub("%s+", " ")
+                if text:find("golden matriarch is awake", 1, true) then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+local function returnToGoldenMatriarch(state)
+    if Game.finalSequence then
+        print("[Deforestation] Golden Matriarch is AWAKE; cancelling Businessman and returning to boss")
+    end
+    Game.finalSequence = false
+    Game.finalDone = false
+    Game.finalStage = nil
+    Game.finalTarget = nil
+    Game.finalTalkAttempts = 0
+    Game.finalNextAction = 0
+    Game.goldenAspensChecked = false
+    Game.finalRejected = false
+    Game.bossPhase = true
+    Game.bossCleared = true
+    Game.bossDefeated = false
+    Game.bossSeen = true
+    Game.bossName = (state and state.name) or "THE GOLDEN MATRIARCH"
+    Game.bossAreaMarker = (state and state.marker) or Game.bossAreaMarker or "8/8"
+    Flags.Zone = "GoldenAspens"
+    Game.bossAreaKey = tostring(Flags.Zone) .. "|" .. tostring(Game.bossAreaMarker)
+    Game.bossEndConfirmedAt = nil
+    bossTarget = nil
+    bossNextScan = 0
+    Game.status = "Golden Matriarch awake; returning to boss combat"
+    -- Use the verified NPC rig for the destination, not map decorations.
+    local boss = BossV7.find("THE GOLDEN MATRIARCH")
+    local targetRoot = boss and BossV7.root(boss)
+    local _, root = getRoot()
+    if root and targetRoot then
+        local forward = targetRoot.CFrame.LookVector
+        local flat = Vector3.new(forward.X, 0, forward.Z)
+        if flat.Magnitude < 0.05 then flat = Vector3.new(0, 0, -1) end
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.CFrame = CFrame.new(targetRoot.Position + flat.Unit * 6 + Vector3.new(0, 2, 0))
+        bossTarget = boss
+        bossNextScan = os.clock() + 3
+    elseif root and Game.finalReturnCFrame then
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.CFrame = Game.finalReturnCFrame
+    end
+    Game.finalReturnCFrame = nil
+end
+
 local function beginFinalBusinessman(reason)
     if Game.finalSequence or Game.finalDone then return end
     local _, previousRoot = getRoot()
@@ -903,6 +967,14 @@ local function monitorBossAndAdvance()
     if not Flags.AutoChop and not Flags.AutoSell and not Flags.AutoPickup then return end
     local zone = Flags.Zone
     local state = readBossProgress()
+    -- A live boss overrides stale checkmarks and premature victory state.
+    if (zone == "GoldenAspens" or state.marker == "8/8" or Game.bossAreaMarker == "8/8")
+        and goldenMatriarchAwakeVisible() then
+        if Game.finalSequence or Game.bossDefeated or not Game.bossPhase then
+            returnToGoldenMatriarch(state)
+        end
+        return
+    end
     -- The final-area checkmark is authoritative: begin the Businessman flow
     -- even when the boss HUD or regular day/night timer has disappeared.
     if not Game.finalSequence and not Game.finalDone and not Game.finalRejected
@@ -1209,6 +1281,10 @@ local function finalBusinessmanStep()
     if unloaded or not Game.finalSequence or Game.finalDone then return end
     local now = os.clock()
     local ui = finalGuiState()
+    if goldenMatriarchAwakeVisible() then
+        returnToGoldenMatriarch(readBossProgress())
+        return
+    end
     -- The NPC can reject an incomplete run despite an apparent completion row.
     -- Handle that before dialogue auto-advance or further E presses.
     if ui.unfinished and not ui.won then
