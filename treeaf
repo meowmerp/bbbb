@@ -11,7 +11,7 @@ do
     end
 end
 
-local SCRIPT_VERSION = "v4.5"
+local SCRIPT_VERSION = "v4.6"
 local GAME_NAME = "Deforestation"
 local GAME_KEY = "TheForest"
 local DISCORD_INVITE = "https://discord.gg/synapsex"
@@ -3770,23 +3770,77 @@ startWorker("World2CashOut", 0.6, function()
         Game.status = "World 2 Cash Out: waiting for character"
         return
     end
-    -- Do not resume navigation to the Detonator if the game has already
-    -- returned to the lobby or teleported to another place.
     if isLobbyPlace() then
         Game.world2CashOut = false
         Game.finalSequence = false
         return
     end
+
+    -- The interaction sometimes needs time to become available after teleport.
+    -- Detect a newly shown dialogue/completion GUI rather than counting E presses
+    -- as proof of success. Take a baseline immediately before the first press.
+    local function visibleResultGui()
+        local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        if not pg then return nil end
+        for _, gui in ipairs(pg:GetDescendants()) do
+            if gui:IsA("GuiObject") and gui.Visible then
+                local key = tostring(gui.Name):lower()
+                local isDialog = key:find("dialog", 1, true)
+                    or key:find("conversation", 1, true)
+                    or key:find("completion", 1, true)
+                    or key:find("victory", 1, true)
+                if isDialog then
+                    local screen = gui:FindFirstAncestorOfClass("ScreenGui")
+                    if screen and screen.Enabled then
+                        local visibleChain = true
+                        local parent = gui.Parent
+                        while parent and parent ~= screen do
+                            if parent:IsA("GuiObject") and not parent.Visible then
+                                visibleChain = false
+                                break
+                            end
+                            parent = parent.Parent
+                        end
+                        if visibleChain then return gui:GetFullName() end
+                    end
+                end
+            end
+        end
+        return nil
+    end
+
     if (root.Position - target).Magnitude > 9 then
         Game.status = "World 2 complete: moving to Detonator"
         root.AssemblyLinearVelocity = Vector3.zero
         root.CFrame = CFrame.new(target + Vector3.new(0, 2.5, 4))
-        Game.world2CashOutLastTry = os.clock() + 1
+        Game.world2CashOutLastTry = os.clock() + 2.5
+        Game.world2CashOutBaseline = nil
+        Game.world2CashOutMoved = true
         return
     end
-    if os.clock() < Game.world2CashOutLastTry then return end
-    -- Match the visible prompt from the screenshot rather than activating
-    -- unrelated nearby interactions.
+
+    -- Check for a newly opened dialogue before attempting another E press.
+    local visible = visibleResultGui()
+    if Game.world2CashOutTries > 0 and visible
+        and visible ~= Game.world2CashOutBaseline then
+        Game.status = "Detonator dialogue opened; waiting for completion"
+        Game.world2CashOut = false
+        Game.world2CashOutFinished = true
+        print("[Deforestation] World 2: Detonator dialogue detected")
+        return
+    end
+
+    if os.clock() < (Game.world2CashOutLastTry or 0) then return end
+    if Game.world2CashOutTries >= 8 then
+        -- Do not mark the interaction completed when no dialogue was detected.
+        -- Farming remains paused so a missed prompt can't restart the run.
+        Game.status = "Detonator: no dialogue detected after 8 tries; check manually"
+        Game.world2CashOut = false
+        Game.world2CashOutFinished = true
+        warn("[Deforestation] World 2: Detonator attempts exhausted; completion NOT confirmed")
+        return
+    end
+
     local cashPrompt
     for _, part in ipairs(workspace:GetPartBoundsInRadius(root.Position, 13)) do
         for _, node in ipairs(part:GetDescendants()) do
@@ -3801,28 +3855,24 @@ startWorker("World2CashOut", 0.6, function()
         end
         if cashPrompt then break end
     end
-    Game.world2CashOutLastTry = os.clock() + 2
+
     if cashPrompt then
-        Game.status = "World 2 complete: activating Detonator Cash Out"
+        if Game.world2CashOutTries == 0 then
+            Game.world2CashOutBaseline = visible
+        end
+        Game.world2CashOutTries += 1
+        Game.status = "Detonator Cash Out: try " .. Game.world2CashOutTries .. "/8"
         if type(fireproximityprompt) == "function" then
             pcall(fireproximityprompt, cashPrompt)
         else
             pressFinalInteract()
         end
-        Game.world2CashOutTries += 1
+        -- Allow the interaction/dialogue to open before the next attempt.
+        Game.world2CashOutLastTry = os.clock() + 3
     else
         Game.status = "World 2 complete: waiting for Detonator Cash Out prompt"
-        -- E is only used when a matching prompt was located; never press
-        -- unknown interactions just because the character is near the point.
-    end
-    -- The result of Cash Out is not yet known; keep the existing UI and
-    -- world completion flow untouched until the user confirms its outcome.
-    if Game.world2CashOutTries >= 3 then
-        Game.status = "Detonator activated; waiting for World 2 completion result"
-        Game.world2CashOut = false
-        Game.world2CashOutFinished = true
-        -- Leave the run paused after cash-out; its resulting UI/transition
-        -- is not yet known and must not be guessed.
+        -- Prompt not loaded yet; do not send E to an unrelated object.
+        Game.world2CashOutLastTry = os.clock() + 1.5
     end
 end)
 
