@@ -11,7 +11,7 @@ do
     end
 end
 
-local SCRIPT_VERSION = "v3.8"
+local SCRIPT_VERSION = "v4.0"
 local GAME_NAME = "Deforestation"
 local GAME_KEY = "TheForest"
 local DISCORD_INVITE = "https://discord.gg/synapsex"
@@ -2485,22 +2485,20 @@ end
 local function overviewRows()
     local upgradePickupStatus
     if selectedUpgradesMaxed() then
-        upgradePickupStatus = "MAX — Not picking up logs"
+        upgradePickupStatus = "MAX - Logs OFF"
     elseif not Flags.AutoUpgrades then
         upgradePickupStatus = "Auto upgrades OFF"
     elseif type(Flags.BuyUpgrades) ~= "table" or #Flags.BuyUpgrades == 0 then
         upgradePickupStatus = "No upgrades selected"
     else
-        upgradePickupStatus = "Upgrades remaining — Picking up logs"
+        upgradePickupStatus = "Needed - Logs ON"
     end
     if sellByZone[currentSellZone()] == "Don't Pick Up Logs" then
-        upgradePickupStatus = upgradePickupStatus .. " (zone pickup OFF)"
+        upgradePickupStatus = upgradePickupStatus .. " (Zone OFF)"
     end
     return {
         { Text = "Status", Value = Game.status },
-        { Text = "Cash", Value = "$" .. short(cashValue()) .. "  Gems " .. short(gemsValue()) },
-        { Text = "Logs", Value = tostring(carried()) .. (Flags.AutoSell and (pickupDisabledForZone() and "  (pickup disabled)" or ("  (sell at " .. tostring(sellThreshold()) .. ")")) or (" / " .. tostring(capacity()) .. " normal cap")) },
-        { Text = "Upgrade Pickup", Value = upgradePickupStatus },
+        { Text = "Upgrades", Value = upgradePickupStatus },
         { Text = "Zone", Value = zoneLabel(Flags.Zone) .. (zoneUnlocked(Flags.Zone) and "" or " (locked)") },
         { Text = "World / Area", Value = (Game.dynamicContext and Game.dynamicContext.world and ("World " .. Game.dynamicContext.world) or "World auto")
             .. " | " .. (Game.dynamicContext and Game.dynamicContext.area and (tostring(Game.dynamicContext.area) .. "/" .. tostring(Game.dynamicContext.totalAreas or "?")) or "Area unknown") },
