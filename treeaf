@@ -11,7 +11,7 @@ do
     end
 end
 
-local SCRIPT_VERSION = "v3.3"
+local SCRIPT_VERSION = "v3.5"
 local GAME_NAME = "Deforestation"
 local GAME_KEY = "TheForest"
 local DISCORD_INVITE = "https://discord.gg/synapsex"
@@ -152,6 +152,7 @@ local Game = {
     goldenAspensChecked = false,
     nextBossHint = nil,
     nextBossArea = nil,
+    dynamicContext = nil,
     finalRejected = false,
     finalReturnCFrame = nil,
 }
@@ -531,6 +532,56 @@ local function readBossProgress()
     return state
 end
 
+
+-- Dynamic world/area snapshot (observation only). Existing movement, boss combat,
+-- log handling and World 1 finale keep their original implementations.
+-- A world number is reported only when the game HUD explicitly supplies one.
+local function updateDynamicContext()
+    local previous = Game.dynamicContext
+    local context = {
+        placeId = game.PlaceId,
+        zoneKey = Flags.Zone,
+        zoneName = zoneLabel(Flags.Zone),
+        zoneIndex = zoneIndex(Flags.Zone),
+        world = nil,
+        area = nil,
+        totalAreas = nil,
+        progress = nil,
+        nextBoss = Game.bossName or Game.nextBossHint,
+        activeBoss = Game.bossPhase == true,
+        stage = Game.finalSequence and "World completion"
+            or Game.bossPhase and "Boss combat"
+            or "Farming / waiting",
+    }
+    local hud = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local camera = workspace.CurrentCamera
+    local size = camera and camera.ViewportSize or Vector2.new(1920, 1080)
+    if hud then
+        for _, node in ipairs(hud:GetDescendants()) do
+            if visibleHudLabel(node) then
+                local pos = node.AbsolutePosition
+                if pos.X >= size.X * 0.48 and pos.Y <= size.Y * 0.37 then
+                    local content = cleanAreaHudText(node.Text)
+                    local area, total = content:lower():match("area%s*(%d+)%s*/%s*(%d+)")
+                    if area and total then
+                        context.area = tonumber(area)
+                        context.totalAreas = tonumber(total)
+                    end
+                    local world = content:lower():match("world%s*#?%s*(%d+)")
+                    if world then context.world = tonumber(world) end
+                    local pct = areaProgress(content)
+                    if pct then context.progress = pct end
+                end
+            end
+        end
+    end
+    -- Keep the previous world only inside the same zone; never invent World 2/3
+    -- by assuming that each world necessarily contains eight areas.
+    if not context.world and previous and previous.zoneKey == context.zoneKey then
+        context.world = previous.world
+    end
+    Game.dynamicContext = context
+end
 
 -- Working standalone Boss Test v7: rig verification, tracking and attack style.
 local function getPlayerRootForBoss() return getRoot() end
@@ -980,13 +1031,31 @@ local function beginFinalBusinessman(reason)
     print("[Deforestation] " .. reason .. "; starting Businessman interaction")
 end
 
+-- World-end routing: World 1's existing Businessman flow is only for Golden
+-- Aspens. Other worlds can add their own completion rule later. Area 8/8 is
+-- never sufficient to identify a world, since area numbers restart per world.
+local function worldCompletionRoute(zone)
+    local context = Game.dynamicContext
+    local world = context and context.world
+    if zone == "GoldenAspens" and (world == nil or world == 1) then
+        return "Businessman"
+    end
+    -- Known World 2 finale; its completion interaction is not known yet.
+    -- This deliberately does NOT run World 1's NPC / return-to-lobby flow.
+    local name = zoneLabel(zone)
+    if normalizedName(name) == "cardongiants" then
+        return "PendingWorld2"
+    end
+    return nil
+end
+
 local function monitorBossAndAdvance()
     if not Flags.AutoChop and not Flags.AutoSell and not Flags.AutoPickup then return end
     local zone = Flags.Zone
     local state = readBossProgress()
+    local completionRoute = worldCompletionRoute(zone)
     -- A live boss overrides stale checkmarks and premature victory state.
-    if (zone == "GoldenAspens" or state.marker == "8/8" or Game.bossAreaMarker == "8/8")
-        and goldenMatriarchAwakeVisible() then
+    if completionRoute == "Businessman" and goldenMatriarchAwakeVisible() then
         if Game.finalSequence or Game.bossDefeated or not Game.bossPhase then
             returnToGoldenMatriarch(state)
         end
@@ -996,7 +1065,7 @@ local function monitorBossAndAdvance()
     -- even when the boss HUD or regular day/night timer has disappeared.
     if not Game.finalSequence and not Game.finalDone and not Game.finalRejected
         and Game.bossDefeated
-        and (zone == "GoldenAspens" or state.marker == "8/8" or Game.bossAreaMarker == "8/8" or Game.sellAreaNumber == 8)
+        and completionRoute == "Businessman"
         and goldenAspensCheckVisible() then
         beginFinalBusinessman("Golden Aspens checkmark detected")
         return
@@ -1064,8 +1133,12 @@ local function monitorBossAndAdvance()
     end
     -- The last boss ends the forest run; finish at the Businessman instead
     -- of trying to advance beyond Golden Aspens.
-    if not Game.finalRejected and (zone == "GoldenAspens" or Game.bossAreaMarker == "8/8" or state.marker == "8/8") then
+    if not Game.finalRejected and completionRoute == "Businessman" then
         beginFinalBusinessman("Golden Aspens boss defeat confirmed")
+        return
+    end
+    if completionRoute == "PendingWorld2" then
+        Game.status = "Cardon Giants cleared; World 2 completion interaction not configured"
         return
     end
     if not Flags.AutoAdvanceZone then
@@ -2395,6 +2468,9 @@ local function overviewRows()
         { Text = "Cash", Value = "$" .. short(cashValue()) .. "  Gems " .. short(gemsValue()) },
         { Text = "Logs", Value = tostring(carried()) .. (Flags.AutoSell and (pickupDisabledForZone() and "  (pickup disabled)" or ("  (sell at " .. tostring(sellThreshold()) .. ")")) or (" / " .. tostring(capacity()) .. " normal cap")) },
         { Text = "Zone", Value = zoneLabel(Flags.Zone) .. (zoneUnlocked(Flags.Zone) and "" or " (locked)") },
+        { Text = "World / Area", Value = (Game.dynamicContext and Game.dynamicContext.world and ("World " .. Game.dynamicContext.world) or "World auto")
+            .. " | " .. (Game.dynamicContext and Game.dynamicContext.area and (tostring(Game.dynamicContext.area) .. "/" .. tostring(Game.dynamicContext.totalAreas or "?")) or "Area unknown") },
+        { Text = "Area Progress", Value = Game.dynamicContext and Game.dynamicContext.progress and (string.format("%.1f%%", Game.dynamicContext.progress)) or "Waiting for HUD" },
         { Text = "Next Boss", Value = Game.bossPhase and (Game.bossName or Game.nextBossHint or "Unknown") or (Game.nextBossHint or "Waiting for HUD") },
         { Text = "Cycle", Value = Game.dayNight },
         { Text = "Session", Value = Game.trees .. " trees, " .. Game.sells .. " sells, " .. Game.bought .. " buys" },
@@ -3529,6 +3605,7 @@ startWorker("ZoneAndCycle", 0.25, function()
         Game.dayNight = detectCycle()
     end
     monitorBossAndAdvance()
+    updateDynamicContext()
 end)
 startWorker("BossCombatV7", 0.18, bossCombatStep)
 startWorker("FinalBusinessman", 0.45, finalBusinessmanStep)
