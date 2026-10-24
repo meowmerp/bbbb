@@ -11,7 +11,7 @@ do
     end
 end
 
-local SCRIPT_VERSION = "v4.0"
+local SCRIPT_VERSION = "v4.7"
 local GAME_NAME = "Deforestation"
 local GAME_KEY = "TheForest"
 local DISCORD_INVITE = "https://discord.gg/synapsex"
@@ -155,6 +155,11 @@ local Game = {
     dynamicContext = nil,
     finalRejected = false,
     finalReturnCFrame = nil,
+    world2CashOut = false,
+    world2CashOutFinished = false,
+    world2CashOutStartedAt = nil,
+    world2CashOutLastTry = 0,
+    world2CashOutTries = 0,
 }
 local WORKER_STEPS
 
@@ -1037,7 +1042,81 @@ local function returnToGoldenMatriarch(state)
     Game.finalReturnCFrame = nil
 end
 
+-- Protect the World 1-only Businessman against World 2 HUD/zone changes.
+-- The HUD is preferred; zone keys and configuration order provide a fallback
+-- when the HUD does not explicitly print "World 2".
+local WORLD2_ZONES = {
+    scrubflats = true,
+    pearpatch = true,
+    saguarofield = true,
+    deadvlei = true,
+    redcanyon = true,
+    joshuagrove = true,
+    petrifiedforest = true,
+    cardongiants = true,
+}
+
+-- Independently read the LIVE top-right area name. During boss/completion
+-- phases AutoDetectZone is intentionally paused, so Flags.Zone can be stale.
+local function liveWorld2Zone()
+    local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not gui then return nil end
+    local camera = workspace.CurrentCamera
+    local size = camera and camera.ViewportSize or Vector2.new(1920, 1080)
+    for _, node in ipairs(gui:GetDescendants()) do
+        if visibleHudLabel(node) then
+            local pos = node.AbsolutePosition
+            if pos.X >= size.X * 0.48 and pos.Y <= size.Y * 0.38 then
+                local content = cleanAreaHudText(node.Text)
+                local prefix = content:match("^(.-)%s+[Aa][Rr][Ee][Aa]%s*%d+%s*/%s*%d+")
+                local candidate = normalizeZoneLabel(prefix or content)
+                if WORLD2_ZONES[candidate] then return candidate end
+            end
+        end
+    end
+    return nil
+end
+
+local function isWorld2Active()
+    if liveWorld2Zone() then return true end
+    local context = Game.dynamicContext
+    if WORLD2_ZONES[normalizeZoneLabel(Flags.Zone)] then return true end
+    if context and WORLD2_ZONES[normalizeZoneLabel(context.zoneKey)] then return true end
+    if context and WORLD2_ZONES[normalizeZoneLabel(context.zoneName)] then return true end
+    if context and context.world == 2 then return true end
+    if context and context.world == 1 then return false end
+    local index = zoneIndex(Flags.Zone)
+    if index and index > 8 then return true end
+    return false
+end
+
+local function cancelWorld1BusinessmanInWorld2()
+    if not isWorld2Active() then return false end
+    if Game.finalStage or (Game.finalSequence and not Game.world2CashOut
+        and not Game.world2CashOutFinished)
+        or (type(Game.status) == "string" and Game.status:find("Businessman", 1, true)) then
+        Game.finalStage = nil
+        Game.finalTarget = nil
+        Game.finalNextAction = 0
+        Game.finalTalkAttempts = 0
+        Game.finalSequence = false
+        Game.finalDone = false
+        Game.goldenAspensChecked = false
+        Game.finalReturnCFrame = nil
+        -- This pause belonged to the cancelled World 1 finale, not a boss.
+        Game.bossPhase = false
+        Game.bossDefeated = false
+        Game.bossCleared = false
+        Game.bossSeen = false
+        Game.bossAreaKey = nil
+        Game.status = "World 2 detected; World 1 Businessman disabled"
+        print("[Deforestation] World 2: cancelled World 1 Businessman sequence")
+    end
+    return true
+end
+
 local function beginFinalBusinessman(reason)
+    if cancelWorld1BusinessmanInWorld2() then return end
     if Game.finalSequence or Game.finalDone then return end
     local _, previousRoot = getRoot()
     if previousRoot then Game.finalReturnCFrame = previousRoot.CFrame end
@@ -1057,21 +1136,34 @@ end
 local function worldCompletionRoute(zone)
     local context = Game.dynamicContext
     local world = context and context.world
-    if zone == "GoldenAspens" and (world == nil or world == 1) then
+    if zone == "GoldenAspens" and not isWorld2Active() and (world == nil or world == 1) then
         return "Businessman"
     end
     -- Known World 2 finale; its completion interaction is not known yet.
     -- This deliberately does NOT run World 1's NPC / return-to-lobby flow.
     local name = zoneLabel(zone)
     if normalizeZoneLabel(name) == "cardongiants" then
-        return "PendingWorld2"
+        return "World2CashOut"
     end
     return nil
 end
 
 local function monitorBossAndAdvance()
+    cancelWorld1BusinessmanInWorld2()
     if not Flags.AutoChop and not Flags.AutoSell and not Flags.AutoPickup then return end
     local zone = Flags.Zone
+    -- AutoDetectZone pauses during boss combat; never use a stale GoldenAspens
+    -- value when the top-right HUD confirms a World 2 area.
+    local hudW2 = liveWorld2Zone()
+    if hudW2 then
+        for _, key in ipairs(zoneOrder()) do
+            if normalizeZoneLabel(key) == hudW2 or normalizeZoneLabel(zoneLabel(key)) == hudW2 then
+                zone = key
+                if Flags.Zone ~= key then Flags.Zone = key end
+                break
+            end
+        end
+    end
     local state = readBossProgress()
     local completionRoute = worldCompletionRoute(zone)
     -- A live boss overrides stale checkmarks and premature victory state.
@@ -1157,8 +1249,18 @@ local function monitorBossAndAdvance()
         beginFinalBusinessman("Golden Aspens boss defeat confirmed")
         return
     end
-    if completionRoute == "PendingWorld2" then
-        Game.status = "Cardon Giants cleared; World 2 completion interaction not configured"
+    if completionRoute == "World2CashOut" then
+        -- The existing boss-bar + day/night timer verification has passed.
+        -- Do not use 100% cleared alone; the boss must really be defeated.
+        if not Game.world2CashOut and not Game.world2CashOutFinished then
+            Game.world2CashOut = true
+            Game.world2CashOutStartedAt = os.clock()
+            Game.world2CashOutLastTry = 0
+            Game.world2CashOutTries = 0
+            Game.finalSequence = true -- pause farming, pickup and selling
+            Game.status = "Cardon Giants boss defeated; heading to Detonator"
+            print("[Deforestation] World 2 complete; starting Detonator Cash Out")
+        end
         return
     end
     if not Flags.AutoAdvanceZone then
@@ -1388,6 +1490,8 @@ local function locateBusinessman()
 end
 
 local function finalBusinessmanStep()
+    -- Cash Out uses finalSequence to pause farming: do not mistake it for Businessman.
+    if cancelWorld1BusinessmanInWorld2() or Game.world2CashOut or Game.world2CashOutFinished then return end
     if unloaded or not Game.finalSequence or Game.finalDone then return end
     local now = os.clock()
     local ui = finalGuiState()
@@ -1753,6 +1857,23 @@ local function searchForMissingTrees()
         local tree = nearestTree()
         if tree then
             Game.status = "Tree found in " .. zoneLabel(Flags.Zone)
+        elseif step == #SEARCH_OFFSETS
+            and isWorld2Active()
+            and (liveWorld2Zone() == "cardongiants"
+                or normalizeZoneLabel(zoneLabel(Flags.Zone)) == "cardongiants")
+            and not Game.finalSequence
+            and not Game.world2CashOut
+            and not Game.world2CashOutFinished then
+            -- World 2 final-area fallback: after all 12 exploration points
+            -- found no remaining tree, use the existing Detonator sequence.
+            -- Do not alter v7 boss targeting or World 1's ending.
+            Game.world2CashOut = true
+            Game.world2CashOutStartedAt = os.clock()
+            Game.world2CashOutLastTry = 0
+            Game.world2CashOutTries = 0
+            Game.finalSequence = true
+            Game.status = "Cardon Giants: 12 searches found no trees; heading to Detonator"
+            print("[Deforestation] Cardon Giants: 12 searches found no trees; starting Detonator Cash Out")
         end
     end
 end
@@ -3641,6 +3762,165 @@ startWorker("ZoneAndCycle", 0.25, function()
 end)
 startWorker("BossCombatV7", 0.18, bossCombatStep)
 startWorker("FinalBusinessman", 0.45, finalBusinessmanStep)
+startWorker("World2CashOut", 0.6, function()
+    if unloaded or not Game.world2CashOut then return end
+    local target = Vector3.new(389.11, 3.11, 224.00)
+    local _, root = getRoot()
+    if not root then
+        Game.status = "World 2 Cash Out: waiting for character"
+        return
+    end
+    if isLobbyPlace() then
+        Game.world2CashOut = false
+        Game.finalSequence = false
+        return
+    end
+
+    -- The interaction sometimes needs time to become available after teleport.
+    -- Detect a newly shown dialogue/completion GUI rather than counting E presses
+    -- as proof of success. Take a baseline immediately before the first press.
+    local function visibleResultGui()
+        local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        if not pg then return nil end
+        for _, gui in ipairs(pg:GetDescendants()) do
+            if gui:IsA("GuiObject") and gui.Visible then
+                local key = tostring(gui.Name):lower()
+                local isDialog = key:find("dialog", 1, true)
+                    or key:find("conversation", 1, true)
+                    or key:find("completion", 1, true)
+                    or key:find("victory", 1, true)
+                if isDialog then
+                    local screen = gui:FindFirstAncestorOfClass("ScreenGui")
+                    if screen and screen.Enabled then
+                        local visibleChain = true
+                        local parent = gui.Parent
+                        while parent and parent ~= screen do
+                            if parent:IsA("GuiObject") and not parent.Visible then
+                                visibleChain = false
+                                break
+                            end
+                            parent = parent.Parent
+                        end
+                        if visibleChain then return gui:GetFullName() end
+                    end
+                end
+            end
+        end
+        return nil
+    end
+
+    if (root.Position - target).Magnitude > 9 then
+        Game.status = "World 2 complete: moving to Detonator"
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.CFrame = CFrame.new(target + Vector3.new(0, 2.5, 4))
+        Game.world2CashOutLastTry = os.clock() + 2.5
+        Game.world2CashOutBaseline = nil
+        Game.world2CashOutMoved = true
+        return
+    end
+
+    -- Check for a newly opened dialogue before attempting another E press.
+    local visible = visibleResultGui()
+    if Game.world2CashOutTries > 0 and visible
+        and visible ~= Game.world2CashOutBaseline then
+        Game.status = "Detonator dialogue opened; waiting for completion"
+        Game.world2CashOut = false
+        Game.world2CashOutFinished = true
+        print("[Deforestation] World 2: Detonator dialogue detected")
+        return
+    end
+
+    if os.clock() < (Game.world2CashOutLastTry or 0) then return end
+    if Game.world2CashOutTries >= 8 then
+        -- Do not mark the interaction completed when no dialogue was detected.
+        -- Farming remains paused so a missed prompt can't restart the run.
+        Game.status = "Detonator: no dialogue detected after 8 tries; check manually"
+        Game.world2CashOut = false
+        Game.world2CashOutFinished = true
+        warn("[Deforestation] World 2: Detonator attempts exhausted; completion NOT confirmed")
+        return
+    end
+
+    local function promptPosition(prompt)
+        local parent = prompt.Parent
+        if parent and parent:IsA("Attachment") then return parent.WorldPosition end
+        if parent and parent:IsA("BasePart") then return parent.Position end
+        if parent and parent:IsA("Model") then return parent:GetPivot().Position end
+        return nil
+    end
+
+    -- Search real prompts rather than blindly pressing E at a coordinate.
+    -- A prompt may be attached to an Attachment inside the detonator.
+    local cashPrompt
+    local bestDistance = math.huge
+    for _, node in ipairs(workspace:GetDescendants()) do
+        if node:IsA("ProximityPrompt") and node.Enabled then
+            local action = (tostring(node.ActionText) .. " " .. tostring(node.ObjectText)):lower()
+            if action:find("cash out", 1, true) or action:find("cashout", 1, true)
+                or action:find("detonator", 1, true) then
+                local at = promptPosition(node)
+                local distance = at and (root.Position - at).Magnitude or math.huge
+                if distance < bestDistance then
+                    bestDistance, cashPrompt = distance, node
+                end
+            end
+        end
+    end
+
+    if not cashPrompt then
+        Game.status = "Detonator: Cash Out prompt not found (waiting for load)"
+        Game.world2CashOutLastTry = os.clock() + 2
+        return
+    end
+
+    local at = promptPosition(cashPrompt)
+    local activationRange = math.max(3, cashPrompt.MaxActivationDistance - 2)
+    if at and bestDistance > activationRange then
+        -- Get within the game's actual prompt range before attempting E.
+        -- Stand alongside the device, avoiding the prompt's exact coordinates.
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.CFrame = CFrame.new(at + Vector3.new(0, 1.5, math.min(3, activationRange * 0.5)))
+        Game.world2CashOutLastTry = os.clock() + 1.5
+        Game.status = "Detonator: moving within Cash Out prompt range"
+        return
+    end
+
+    if Game.world2CashOutTries == 0 then
+        Game.world2CashOutBaseline = visible
+    end
+    Game.world2CashOutTries += 1
+    local attempt = Game.world2CashOutTries
+    Game.status = "Detonator: activating Cash Out (" .. attempt .. "/8)"
+
+    -- The old version used a quick 0.08-second tap or silently relied on
+    -- fireproximityprompt. Hold E for the prompt's actual HoldDuration and
+    -- try the executor prompt function separately if available.
+    local holdTime = math.clamp((tonumber(cashPrompt.HoldDuration) or 0) + 0.35, 0.35, 3.5)
+    local sentInput = pcall(function()
+        local vim = game:GetService("VirtualInputManager")
+        vim:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+        task.wait(holdTime)
+        vim:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+    end)
+    if not sentInput and type(keypress) == "function" and type(keyrelease) == "function" then
+        pcall(function()
+            keypress(0x45)
+            task.wait(holdTime)
+            keyrelease(0x45)
+        end)
+    end
+    if type(fireproximityprompt) == "function" then
+        local ok, err = pcall(fireproximityprompt, cashPrompt)
+        if not ok then
+            warn("[Deforestation] Detonator prompt function failed: " .. tostring(err))
+        end
+    end
+    print(string.format("[Deforestation] Detonator attempt %d/8; prompt=%s; distance=%.1f; hold=%.2fs; input=%s",
+        attempt, cashPrompt:GetFullName(), bestDistance, holdTime, tostring(sentInput)))
+    Game.world2CashOutLastTry = os.clock() + 3
+
+end)
+
 setupLobbyTab()
 setupShopTab()
 setupPlayerTab()
