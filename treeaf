@@ -11,7 +11,7 @@ do
     end
 end
 
-local SCRIPT_VERSION = "v4.2"
+local SCRIPT_VERSION = "v4.3"
 local GAME_NAME = "Deforestation"
 local GAME_KEY = "TheForest"
 local DISCORD_INVITE = "https://discord.gg/synapsex"
@@ -1045,10 +1045,21 @@ end
 -- Protect the World 1-only Businessman against World 2 HUD/zone changes.
 -- The HUD is preferred; zone keys and configuration order provide a fallback
 -- when the HUD does not explicitly print "World 2".
+local WORLD2_ZONES = {
+    scrubflats = true,
+    pearpatch = true,
+    saguarofield = true,
+    deadvlei = true,
+    redcanyon = true,
+    joshuagrove = true,
+    petrifiedforest = true,
+    cardongiants = true,
+}
+
 local function isWorld2Active()
     local context = Game.dynamicContext
     local zone = normalizeZoneLabel(Flags.Zone)
-    if zone == "scrubflats" or zone == "cardongiants" then return true end
+    if WORLD2_ZONES[zone] then return true end
     if context and context.world == 2 then return true end
     if context and context.world == 1 then return false end
     local index = zoneIndex(Flags.Zone)
