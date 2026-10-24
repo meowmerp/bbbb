@@ -11,7 +11,7 @@ do
     end
 end
 
-local SCRIPT_VERSION = "v3.2"
+local SCRIPT_VERSION = "v3.3"
 local GAME_NAME = "Deforestation"
 local GAME_KEY = "TheForest"
 local DISCORD_INVITE = "https://discord.gg/synapsex"
@@ -150,6 +150,8 @@ local Game = {
     finalTalkAttempts = 0,
     finalTarget = nil,
     goldenAspensChecked = false,
+    nextBossHint = nil,
+    nextBossArea = nil,
     finalRejected = false,
     finalReturnCFrame = nil,
 }
@@ -459,6 +461,7 @@ local function readBossProgress()
     local camera = workspace.CurrentCamera
     local viewport = camera and camera.ViewportSize or Vector2.new(1920,1080)
     local labels = {}
+    local nextBossHint = nil
     for _, node in ipairs(gui:GetDescendants()) do
         if visibleHudLabel(node) then
             local text = cleanAreaHudText(node.Text)
@@ -473,6 +476,14 @@ local function readBossProgress()
                 state.timerVisible = true
             end
             if pos.X >= viewport.X * 0.50 and pos.Y <= viewport.Y * 0.35 then
+                -- Read the announced boss dynamically (e.g. "Clear it all to wake Old Spinehide").
+                -- This works for World 2 without maintaining a list of boss names.
+                local candidate = text:match("[Tt][Oo]%s+[Ww][Aa][Kk][Ee]%s+(.+)")
+                    or text:match("^[Tt][Hh][Ee]%s+(.+)%s+[Ii][Ss]%s+[Aa][Ww][Aa][Kk][Ee]")
+                if candidate then
+                    candidate = candidate:gsub("%s*[!%.]+%s*$", ""):match("^%s*(.-)%s*$")
+                    if #candidate >= 3 and #candidate <= 60 then nextBossHint = candidate end
+                end
                 local pct = areaProgress(text)
                 if pct then
                     state.progress = pct
@@ -511,6 +522,12 @@ local function readBossProgress()
             end
         end
     end
+    -- Cache the upcoming boss per AREA marker, preventing old zone names from lingering.
+    if state.marker ~= Game.nextBossArea then
+        Game.nextBossArea = state.marker
+        Game.nextBossHint = nil
+    end
+    if nextBossHint then Game.nextBossHint = nextBossHint end
     return state
 end
 
@@ -2378,6 +2395,7 @@ local function overviewRows()
         { Text = "Cash", Value = "$" .. short(cashValue()) .. "  Gems " .. short(gemsValue()) },
         { Text = "Logs", Value = tostring(carried()) .. (Flags.AutoSell and (pickupDisabledForZone() and "  (pickup disabled)" or ("  (sell at " .. tostring(sellThreshold()) .. ")")) or (" / " .. tostring(capacity()) .. " normal cap")) },
         { Text = "Zone", Value = zoneLabel(Flags.Zone) .. (zoneUnlocked(Flags.Zone) and "" or " (locked)") },
+        { Text = "Next Boss", Value = Game.bossPhase and (Game.bossName or Game.nextBossHint or "Unknown") or (Game.nextBossHint or "Waiting for HUD") },
         { Text = "Cycle", Value = Game.dayNight },
         { Text = "Session", Value = Game.trees .. " trees, " .. Game.sells .. " sells, " .. Game.bought .. " buys" },
     }
@@ -3109,7 +3127,7 @@ local function setupMainTab()
     local Overview = MainTab:AddLeftGroupbox({ Name = "Overview", Icon = "activity" })
     Overview:CreateStatusList({
         Name = "Status",
-        MaxRows = 5,
+        MaxRows = 7,
         UpdateRate = 0.5,
         Update = overviewRows,
     })
