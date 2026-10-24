@@ -11,7 +11,7 @@ do
     end
 end
 
-local SCRIPT_VERSION = "v4.3"
+local SCRIPT_VERSION = "v4.4"
 local GAME_NAME = "Deforestation"
 local GAME_KEY = "TheForest"
 local DISCORD_INVITE = "https://discord.gg/synapsex"
@@ -1056,15 +1056,36 @@ local WORLD2_ZONES = {
     cardongiants = true,
 }
 
+-- Independently read the LIVE top-right area name. During boss/completion
+-- phases AutoDetectZone is intentionally paused, so Flags.Zone can be stale.
+local function liveWorld2Zone()
+    local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if not gui then return nil end
+    local camera = workspace.CurrentCamera
+    local size = camera and camera.ViewportSize or Vector2.new(1920, 1080)
+    for _, node in ipairs(gui:GetDescendants()) do
+        if visibleHudLabel(node) then
+            local pos = node.AbsolutePosition
+            if pos.X >= size.X * 0.48 and pos.Y <= size.Y * 0.38 then
+                local content = cleanAreaHudText(node.Text)
+                local prefix = content:match("^(.-)%s+[Aa][Rr][Ee][Aa]%s*%d+%s*/%s*%d+")
+                local candidate = normalizeZoneLabel(prefix or content)
+                if WORLD2_ZONES[candidate] then return candidate end
+            end
+        end
+    end
+    return nil
+end
+
 local function isWorld2Active()
+    if liveWorld2Zone() then return true end
     local context = Game.dynamicContext
-    local zone = normalizeZoneLabel(Flags.Zone)
-    if WORLD2_ZONES[zone] then return true end
+    if WORLD2_ZONES[normalizeZoneLabel(Flags.Zone)] then return true end
+    if context and WORLD2_ZONES[normalizeZoneLabel(context.zoneKey)] then return true end
+    if context and WORLD2_ZONES[normalizeZoneLabel(context.zoneName)] then return true end
     if context and context.world == 2 then return true end
     if context and context.world == 1 then return false end
     local index = zoneIndex(Flags.Zone)
-    -- World 1 has eight configured zones. The additional area entries
-    -- belong to the newer world when the game exposes a combined order.
     if index and index > 8 then return true end
     return false
 end
@@ -1072,7 +1093,8 @@ end
 local function cancelWorld1BusinessmanInWorld2()
     if not isWorld2Active() then return false end
     if Game.finalStage or (Game.finalSequence and not Game.world2CashOut
-        and not Game.world2CashOutFinished) then
+        and not Game.world2CashOutFinished)
+        or (type(Game.status) == "string" and Game.status:find("Businessman", 1, true)) then
         Game.finalStage = nil
         Game.finalTarget = nil
         Game.finalNextAction = 0
@@ -1081,6 +1103,12 @@ local function cancelWorld1BusinessmanInWorld2()
         Game.finalDone = false
         Game.goldenAspensChecked = false
         Game.finalReturnCFrame = nil
+        -- This pause belonged to the cancelled World 1 finale, not a boss.
+        Game.bossPhase = false
+        Game.bossDefeated = false
+        Game.bossCleared = false
+        Game.bossSeen = false
+        Game.bossAreaKey = nil
         Game.status = "World 2 detected; World 1 Businessman disabled"
         print("[Deforestation] World 2: cancelled World 1 Businessman sequence")
     end
@@ -1124,6 +1152,18 @@ local function monitorBossAndAdvance()
     cancelWorld1BusinessmanInWorld2()
     if not Flags.AutoChop and not Flags.AutoSell and not Flags.AutoPickup then return end
     local zone = Flags.Zone
+    -- AutoDetectZone pauses during boss combat; never use a stale GoldenAspens
+    -- value when the top-right HUD confirms a World 2 area.
+    local hudW2 = liveWorld2Zone()
+    if hudW2 then
+        for _, key in ipairs(zoneOrder()) do
+            if normalizeZoneLabel(key) == hudW2 or normalizeZoneLabel(zoneLabel(key)) == hudW2 then
+                zone = key
+                if Flags.Zone ~= key then Flags.Zone = key end
+                break
+            end
+        end
+    end
     local state = readBossProgress()
     local completionRoute = worldCompletionRoute(zone)
     -- A live boss overrides stale checkmarks and premature victory state.
