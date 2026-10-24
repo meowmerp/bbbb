@@ -11,7 +11,7 @@ do
     end
 end
 
-local SCRIPT_VERSION = "v3.0"
+local SCRIPT_VERSION = "v3.1"
 local GAME_NAME = "Deforestation"
 local GAME_KEY = "TheForest"
 local DISCORD_INVITE = "https://discord.gg/synapsex"
@@ -1733,7 +1733,11 @@ local function chopTree(tree)
     end
     if (tonumber(tree:GetAttribute("HP")) or 0) <= 0 then
         Game.trees += 1
-        task.wait(1)
+        -- No log collection is needed in this zone: immediately find the next tree.
+        -- Keep the normal post-chop delay when collecting logs is enabled.
+        if not pickupDisabledForZone() then
+            task.wait(1)
+        end
     end
 end
 
