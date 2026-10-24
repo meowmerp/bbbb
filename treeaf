@@ -11,7 +11,7 @@ do
     end
 end
 
-local SCRIPT_VERSION = "v4.4"
+local SCRIPT_VERSION = "v4.5"
 local GAME_NAME = "Deforestation"
 local GAME_KEY = "TheForest"
 local DISCORD_INVITE = "https://discord.gg/synapsex"
@@ -1857,6 +1857,23 @@ local function searchForMissingTrees()
         local tree = nearestTree()
         if tree then
             Game.status = "Tree found in " .. zoneLabel(Flags.Zone)
+        elseif step == #SEARCH_OFFSETS
+            and isWorld2Active()
+            and (liveWorld2Zone() == "cardongiants"
+                or normalizeZoneLabel(zoneLabel(Flags.Zone)) == "cardongiants")
+            and not Game.finalSequence
+            and not Game.world2CashOut
+            and not Game.world2CashOutFinished then
+            -- World 2 final-area fallback: after all 12 exploration points
+            -- found no remaining tree, use the existing Detonator sequence.
+            -- Do not alter v7 boss targeting or World 1's ending.
+            Game.world2CashOut = true
+            Game.world2CashOutStartedAt = os.clock()
+            Game.world2CashOutLastTry = 0
+            Game.world2CashOutTries = 0
+            Game.finalSequence = true
+            Game.status = "Cardon Giants: 12 searches found no trees; heading to Detonator"
+            print("[Deforestation] Cardon Giants: 12 searches found no trees; starting Detonator Cash Out")
         end
     end
 end
