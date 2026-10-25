@@ -11,7 +11,7 @@ do
     end
 end
 
-local SCRIPT_VERSION = "v4.7"
+local SCRIPT_VERSION = "v4.8"
 local GAME_NAME = "Deforestation"
 local GAME_KEY = "TheForest"
 local DISCORD_INVITE = "https://discord.gg/synapsex"
@@ -1148,6 +1148,46 @@ local function worldCompletionRoute(zone)
     return nil
 end
 
+-- Save a recent position for the "waiting for next zone unlock" fallback.
+-- This is independent of the boss fighting/target selection code.
+local lastUnlockCheckpoint = nil
+local lastUnlockCheckpointAt = 0
+local lastUnlockReturnAt = 0
+local lastUnlockReturnZone = nil
+
+local function recordUnlockCheckpoint()
+    if unloaded or isLobbyPlace() or Game.finalSequence or Game.world2CashOut
+        or Game.world2CashOutFinished then return end
+    if type(Game.status) == "string" and Game.status:find("waiting for next zone unlock", 1, true) then
+        return
+    end
+    local _, root = getRoot()
+    if not root then return end
+    lastUnlockCheckpoint = root.CFrame
+    lastUnlockCheckpointAt = os.clock()
+end
+
+local function returnToUnlockCheckpoint(zone)
+    -- Re-teleport only once per zone per waiting episode; don't loop every frame.
+    local now = os.clock()
+    if lastUnlockReturnZone == zone and now - lastUnlockReturnAt < 30 then
+        return false
+    end
+    if not lastUnlockCheckpoint then
+        Game.status = "Boss defeated; no saved location to return to yet"
+        return false
+    end
+    local _, root = getRoot()
+    if not root then return false end
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.CFrame = lastUnlockCheckpoint
+    lastUnlockReturnAt = now
+    lastUnlockReturnZone = zone
+    Game.status = "Boss defeated; returned to last saved position"
+    print("[Deforestation] Next zone locked; returned to 30-second position checkpoint")
+    return true
+end
+
 local function monitorBossAndAdvance()
     cancelWorld1BusinessmanInWorld2()
     if not Flags.AutoChop and not Flags.AutoSell and not Flags.AutoPickup then return end
@@ -1298,6 +1338,7 @@ local function monitorBossAndAdvance()
         end
     end
     Game.status = "Boss defeated; waiting for next zone unlock"
+    returnToUnlockCheckpoint(zone)
 end
 
 -- Final Golden Aspens interaction.  The businessman position shown in the
@@ -3752,6 +3793,8 @@ end
 
 setupMainTab()
 -- Read area HUD, then switch from farming to the v7 boss combat phase.
+recordUnlockCheckpoint()
+startWorker("UnlockPositionCheckpoint", 30, recordUnlockCheckpoint)
 startWorker("ZoneAndCycle", 0.25, function()
     if not Game.bossPhase then
         detectCurrentZone()
