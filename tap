@@ -5490,8 +5490,8 @@ group:AddToggle("PerfGameSettings", {
 })
 group:AddToggle("PerfHideHatching", {
     Text = "Hide hatching and crafting",
-    Default = true,
-    Tooltip = getconnections and "While performance mode is on, eggs you hatch and pets you craft no longer play their animation (the game has no setting for this). Hatching and crafting still happen."
+    Default = false,
+    Tooltip = getconnections and "Works independently of Performance Mode. Suppresses hatch and craft animation listeners while enabled."
         or "Your executor has no getconnections, so hatching cannot be hidden.",
 })
 group:AddDropdown("PerfHidePets", {
@@ -5709,7 +5709,7 @@ local function unmuteVisuals()
 end
 
 local function refreshVisuals()
-    if type(getconnections) == "function" and Ui.on("PerfMode") and Ui.on("PerfHideHatching") then
+    if type(getconnections) == "function" and Ui.on("PerfHideHatching") then
         muteVisuals()
     elseif next(muted) ~= nil then
         unmuteVisuals()
@@ -7977,7 +7977,7 @@ __modules["vendor/customui"] = function(use)
         function ctl:SetValues(values)
             params.Values = values
             if self._native then
-                for _, method in ipairs({"Refresh","SetValues","SetOptions"}) do
+                for _, method in ipairs({"SetOptions","Refresh","SetValues"}) do
                     if type(self._native[method]) == "function" then
                         pcall(self._native[method],self._native,values)
                         break
@@ -8003,6 +8003,10 @@ __modules["vendor/customui"] = function(use)
             ctl.Value = params.Default or params.Min or 0
             ctl._native = group:Slider({Name=params.Text or flag,Flag=flag,Min=params.Min,Max=params.Max,Step=params.Rounding and 1 or 0.1,Default=ctl.Value,Suffix=params.Suffix,Callback=changed})
             Lib.Options[flag] = ctl
+        elseif kind == "Input" then
+            ctl.Value = params.Default or ""
+            ctl._native = group:Input({Name=params.Text or flag,Flag=flag,Default=ctl.Value,Callback=changed})
+            Lib.Options[flag] = ctl
         end
         return ctl
     end
@@ -8011,6 +8015,7 @@ __modules["vendor/customui"] = function(use)
         function wrap:AddToggle(flag,p) return newControl(g,"Toggle",flag,p) end
         function wrap:AddDropdown(flag,p) return newControl(g,"Dropdown",flag,p) end
         function wrap:AddSlider(flag,p) return newControl(g,"Slider",flag,p) end
+        function wrap:AddInput(flag,p) return newControl(g,"Input",flag,p) end
         function wrap:AddButton(opts)
             local fn = opts.Func or opts.Callback
             local button = g:Button({Name=opts.Text or "Run",Callback=function() if fn then fn() end end})
@@ -8909,164 +8914,146 @@ end
 
 return Performance
 end
-__modules["shared/settings"] = function(use) -- src/shared/settings.luau
--- Settings tab: menu options, the official Obsidian ThemeManager and SaveManager addons.
--- Each game's features/settings calls Settings.build with its config folder and what a missing
--- executor function changes there. Settings.finish() loads the autoload config; main calls it
--- after every feature is built so a saved config can switch toggles on only once their handlers
--- exist.
-
+__modules["shared/settings"] = function(use)
+-- Custom GUI configuration manager, independent from the old Obsidian addons.
 local Env = use("shared/env")
-local Http = use("shared/http")
 local Ui = use("shared/ui")
 local Life = use("shared/life")
-
-local ADDONS = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/addons/"
-
+local Http = game:GetService("HttpService")
 local Settings = {}
-
-local function fetch(file)
-    local ok, result = pcall(function()
-        return Http.load(ADDONS .. file, file)()
-    end)
-    Env.elevate()
-    return ok and result or nil, result
+local DIR = "TapSimulatorCustom/profiles"
+local DEFAULT_NAME = "default"
+local selectedName = DEFAULT_NAME
+local function safeName(value)
+    value = tostring(value or ""):gsub("[^%w_%-]", "_"):sub(1, 40)
+    return value ~= "" and value or DEFAULT_NAME
 end
-
--- options.folder: where this game's configs are saved (under HubHub/).
--- options.effects: { [executor function] = "what goes missing without it" }.
-function Settings.build(options)
-    local Library, Options = Ui.Library, Ui.Options
-    local tab = Ui.Tabs.Settings
-
-    local menu = tab:AddGroupbox({ Side = "Left", Name = "Menu", IconName = "sliders-horizontal" })
-    menu:AddDropdown("NotificationSide", {
-        Text = "Notification side",
-        Values = { "Left", "Right" },
-        Default = "Right",
-        Callback = function(value)
-            Library:SetNotifySide(value)
-        end,
-    })
-    menu:AddDropdown("DPIScale", {
-        Text = "DPI scale",
-        Values = { "50%", "75%", "100%", "125%", "150%", "175%", "200%" },
-        Default = "100%",
-        Callback = function(value)
-            Library:SetDPIScale(tonumber((value:gsub("%%", ""))))
-        end,
-    })
-    menu:AddDivider()
-    menu:AddLabel("Menu bind"):AddKeyPicker("MenuKeybind", {
-        Default = "RightShift",
-        NoUI = true,
-        Text = "Menu keybind",
-    })
-    menu:AddButton("Unload", function()
-        Library:Unload()
-    end)
-    Library.ToggleKeybind = Options.MenuKeybind
-
-    -- What this executor lacks and what that changes, so a bug report says it up front.
-    local compat = tab:AddGroupbox({ Side = "Left", Name = "Compatibility", IconName = "cpu" })
-    local lines = { "Executor: " .. Env.executor }
-    for _, name in ipairs(Env.missing) do
-        lines[#lines + 1] = string.format("No %s: %s.", name, options.effects[name] or "some features are limited")
+local function ensureDir()
+    if not (isfolder and makefolder) then return false end
+    for _, dir in ipairs({"TapSimulatorCustom", DIR}) do
+        if not isfolder(dir) then local ok=pcall(makefolder,dir); if not ok then return false end end
     end
-    if #Env.missing == 0 then
-        lines[#lines + 1] = "Required function names are available. Runtime support depends on the executor."
+    return true
+end
+local function path(name) return DIR .. "/" .. safeName(name) .. ".json" end
+local function getValue(control)
+    if control == nil then return nil end
+    return control.Value
+end
+local function capture()
+    local values = {}
+    for key, control in pairs(Ui.Toggles) do
+        local value=getValue(control)
+        if type(value)=="boolean" then values[key]=value end
     end
-    compat:AddLabel(table.concat(lines, "\n"), true)
-    local runtimeLabel = compat:AddLabel("Runtime: ready.", true)
-    Life.loop("settings:runtime", 2, function()
-        local messages = {}
-        for name, reason in pairs(Env.requestIssues or {}) do
-            messages[#messages + 1] = name .. ": " .. reason
-        end
-        for name, reason in pairs(Life.errors) do
-            if name ~= "settings:runtime" then
-                messages[#messages + 1] = name .. ": " .. (tostring(reason):match("^[^\n]+") or "unavailable")
-            end
-        end
-        table.sort(messages)
-        local extra = math.max(0, #messages - 4)
-        while #messages > 4 do table.remove(messages) end
-        if extra > 0 then messages[#messages + 1] = string.format("%d more runtime messages.", extra) end
-        runtimeLabel:SetText(#messages > 0 and table.concat(messages, "\n") or "Runtime: ready.")
-    end)
-
-    if not Env.canSave or not Env.loadstring then
-        local storage = tab:AddGroupbox({ Side = "Right", Name = "Saved settings", IconName = "save" })
-        storage:AddLabel("Saved configs and custom themes are unavailable on this executor. You can still change the controls for this session.", true)
-        function Settings.finish() end
-        return Settings
-    end
-
-    -- Each addon is set up under pcall: one that breaks (no file functions, an upstream change)
-    -- costs its own section, not the whole Settings tab.
-    local SaveManager, saveError = fetch("SaveManager.lua")
-    if SaveManager then
-        local ok, err = pcall(function()
-            SaveManager:SetLibrary(Library)
-            SaveManager:IgnoreThemeSettings()
-            SaveManager:SetIgnoreIndexes({ "MenuKeybind" })
-            SaveManager:SetFolder("HubHub/" .. options.folder)
-            SaveManager:BuildConfigSection(tab)
-        end)
-        Env.elevate()
-        if not ok then
-            SaveManager, saveError = nil, err
+    for key, control in pairs(Ui.Options) do
+        local value=getValue(control)
+        if type(value)=="string" or type(value)=="number" or type(value)=="boolean" or type(value)=="table" then
+            values[key]=value
         end
     end
-    if not SaveManager then
-        Ui.notify("Hub Hub", "Could not load the config manager: " .. tostring(saveError), 6)
-    end
-
-    local ThemeManager, themeError = fetch("ThemeManager.lua")
-    if ThemeManager then
-        local ok, err = pcall(function()
-            ThemeManager:SetLibrary(Library)
-            ThemeManager:SetFolder("HubHub")
-            -- The crimson palette as "Default"; FontFace must be one of the Font Face dropdown values.
-            ThemeManager:SetDefaultTheme({
-                BackgroundColor = "0d0c12",
-                MainColor = "1e1b28",
-                AccentColor = "eb4060",
-                OutlineColor = "302b3e",
-                FontColor = "f0eef6",
-                FontFace = "BuilderSans",
-            })
-            ThemeManager:ApplyToTab(tab)
-            local _, hasSavedDefault = ThemeManager:GetDefaultTheme()
-            if hasSavedDefault then
-                ThemeManager:LoadDefault()
-            else
-                Options.ThemeManager_ThemeList:SetValue("Default")
-            end
-        end)
-        Env.elevate()
-        if not ok then
-            ThemeManager, themeError = nil, err
-        end
-    end
-    if not ThemeManager then
-        Ui.notify("Hub Hub", "Could not load the theme manager: " .. tostring(themeError), 6)
-    end
-    Env.elevate()
-
-    function Settings.finish()
-        if SaveManager then
-            local ok, err = pcall(SaveManager.LoadAutoloadConfig, SaveManager)
-            Env.elevate()
-            if not ok then
-                Ui.notify("Hub Hub", "Autoload failed: " .. tostring(err), 6)
+    return {version=1,values=values}
+end
+local function apply(data)
+    if type(data)~="table" or type(data.values)~="table" then return false,"invalid profile" end
+    local applied=0
+    -- Apply options before toggles, so automations see their restored parameters.
+    for _, bucket in ipairs({Ui.Options,Ui.Toggles}) do
+        for key,value in pairs(data.values) do
+            local control=(key ~= "CustomConfigName" and key ~= "CustomConfigChoice") and bucket[key] or nil
+            if control and type(control.SetValue)=="function" then
+                local ok=pcall(control.SetValue,control,value)
+                if ok then applied+=1 end
             end
         end
     end
-
+    return true,applied
+end
+local function save(name)
+    if not (writefile and ensureDir()) then return false,"file writes unavailable" end
+    local ok,err=pcall(function() writefile(path(name),Http:JSONEncode(capture())) end)
+    return ok,err
+end
+local function load(name)
+    if not (isfile and readfile and isfile(path(name))) then return false,"profile not found" end
+    local ok,data=pcall(function() return Http:JSONDecode(readfile(path(name))) end)
+    if not ok then return false,data end
+    return apply(data)
+end
+local function list()
+    local found={}
+    if listfiles and ensureDir() then
+        local ok,items=pcall(listfiles,DIR)
+        if ok and type(items)=="table" then
+            for _,value in ipairs(items) do
+                local n=tostring(value):gsub("\\","/"):match("([^/]+)%.json$")
+                if n then table.insert(found,n) end
+            end
+        end
+    end
+    table.sort(found)
+    if #found==0 then found[1]=DEFAULT_NAME end
+    return found
+end
+local function notify(msg) Ui.notify("Tap Simulator Config", tostring(msg),5) end
+function Settings.build(_)
+    local tab=Ui.Tabs.Settings
+    local group=tab:AddGroupbox({Side="Right",Name="Configuration Profiles",IconName="save"})
+    local available=list()
+    local dropdown=group:AddDropdown("CustomConfigChoice",{
+        Text="Saved profiles",Values=available,Default=available[1],
+        Callback=function(value) selectedName=safeName(value) end,
+    })
+    local nameBox=group:AddInput("CustomConfigName",{
+        Text="Profile name",Default=DEFAULT_NAME,
+        Callback=function(value) selectedName=safeName(value) end,
+    })
+    local function refresh()
+        available=list()
+        dropdown:SetValues(available)
+    end
+    group:AddButton({Text="Save profile",Func=function()
+        local ok,err=save(selectedName)
+        notify(ok and ("Saved profile: "..selectedName) or ("Save failed: "..tostring(err)))
+        if ok then refresh() end
+    end})
+    group:AddButton({Text="Load profile",Func=function()
+        local ok,result=load(selectedName)
+        notify(ok and ("Loaded "..selectedName.." ("..tostring(result).." settings)") or ("Load failed: "..tostring(result)))
+    end})
+    group:AddButton({Text="Delete profile",Func=function()
+        if not (delfile and isfile and isfile(path(selectedName))) then notify("Cannot delete: profile missing or file access unavailable") return end
+        local ok,err=pcall(delfile,path(selectedName))
+        notify(ok and ("Deleted: "..selectedName) or ("Delete failed: "..tostring(err)))
+        if ok then refresh() end
+    end})
+    group:AddButton({Text="Refresh profiles",Func=refresh})
+    group:AddButton({Text="Set as autoload",Func=function()
+        if not (writefile and ensureDir()) then notify("File writes unavailable") return end
+        local ok,err=pcall(writefile,DIR.."/autoload.txt",selectedName)
+        notify(ok and ("Autoload set: "..selectedName) or ("Autoload failed: "..tostring(err)))
+    end})
+    group:AddButton({Text="Clear autoload",Func=function()
+        local name=DIR.."/autoload.txt"
+        if delfile and isfile and isfile(name) then pcall(delfile,name) end
+        notify("Autoload cleared")
+    end})
+    group:AddLabel("Profiles are stored in "..DIR..". Save manually after changing settings. Autoload applies after features initialize.",true)
+    local menu=tab:AddGroupbox({Side="Left",Name="Menu",IconName="settings"})
+    menu:AddButton({Text="Unload script",Func=function() Ui.Library:Unload() end})
+    local info=tab:AddGroupbox({Side="Left",Name="Compatibility",IconName="cpu"})
+    info:AddLabel("Executor: "..tostring(Env.executor).."\nConfig file saving: "..(writefile and readfile and "available" or "unavailable"),true)
     return Settings
 end
-
+function Settings.finish()
+    if not (readfile and isfile and isfile(DIR.."/autoload.txt")) then return end
+    local ok,name=pcall(readfile,DIR.."/autoload.txt")
+    if ok then
+        local loaded,result=load(name)
+        if loaded then notify("Autoloaded profile: "..safeName(name))
+        else notify("Autoload failed: "..tostring(result)) end
+    end
+end
 return Settings
 end
 __modules["shared/ui"] = function(use) -- src/shared/ui.luau
