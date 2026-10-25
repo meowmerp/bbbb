@@ -1,0 +1,228 @@
+-- Tap Simulator: Reborn | Independent, expandable edition using your GitHub GUI
+-- v1.0 -- Original implementation. Does not load Slopix/Corny modules or servers.
+-- Features can be extended by adding a module via Hub.RegisterFeature(tabName, groupName, definition).
+local VERSION = "v1.0"
+local GUI_URL = "https://raw.githubusercontent.com/meowmerp/bbbb/refs/heads/main/gui"
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+local player = Players.LocalPlayer
+
+local env = (type(getgenv) == "function" and getgenv()) or _G
+if env.__TapSimulatorCustomHubStop then pcall(env.__TapSimulatorCustomHubStop) end
+local alive = true
+local connections = {}
+local Hub = {
+    Version = VERSION,
+    Flags = { AutoTap = false, AutoClicker = false, AutoRebirth = false, TapRate = 8, RebirthEvery = 2 },
+    Counters = { Taps = 0, RebirthRequests = 0 },
+    Features = {},
+    Status = "Starting",
+}
+env.__TapSimulatorCustomHub = Hub
+local function disconnect()
+    if not alive then return end
+    alive = false
+    for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
+    if Hub.Flags.AutoClicker then
+        local re = ReplicatedStorage:FindFirstChild("RemoteServices")
+        local service = re and re:FindFirstChild("AutoClickService")
+        local events = service and service:FindFirstChild("RE")
+        local remote = events and events:FindFirstChild("AutoClickRequested")
+        if remote then pcall(function() remote:FireServer({ Enabled = false }) end) end
+    end
+    if Hub.Window then pcall(function() Hub.Window:Destroy() end) end
+    Hub.Status = "Stopped"
+end
+env.__TapSimulatorCustomHubStop = disconnect
+
+local function remote(service, name)
+    local root = ReplicatedStorage:FindFirstChild("RemoteServices")
+    local svc = root and root:FindFirstChild(service)
+    local re = svc and svc:FindFirstChild("RE")
+    return re and re:FindFirstChild(name)
+end
+local function fire(service, name, payload)
+    local r = remote(service, name)
+    if not r then return false, "Missing " .. service .. "." .. name end
+    local ok, err = pcall(function() r:FireServer(payload) end)
+    return ok, err
+end
+
+-- Optional player-data reader. Unlike writing to a client-side Data table,
+-- only the game's legitimate request remotes can change your server data.
+local controller
+local function data()
+    if controller == nil then
+        local c = ReplicatedStorage:FindFirstChild("Controllers")
+        local core = c and c:FindFirstChild("Core")
+        local module = core and core:FindFirstChild("DataController")
+        if module then
+            local ok, value = pcall(require, module)
+            controller = ok and value or false
+        else
+            return nil
+        end
+    end
+    if not controller then return nil end
+    local ok, replica = pcall(function()
+        if type(controller.GetReplica) == "function" then return controller:GetReplica() end
+        if type(controller.Get) == "function" then return controller:Get() end
+    end)
+    return ok and replica and replica.Data or nil
+end
+Hub.Data = data
+Hub.Fire = fire
+Hub.Remote = remote
+
+local source = game:HttpGet(GUI_URL .. "?v=" .. HttpService:GenerateGUID(false), true)
+local compiled, compileError = loadstring(source)
+assert(compiled, "[Tap Simulator] GUI compile failed: " .. tostring(compileError))
+local Library = compiled()
+assert(type(Library) == "table" and type(Library.CreateWindow) == "function", "[Tap Simulator] Invalid GUI library")
+pcall(function() Library:LoadFont({ Name = "ValleySans" }) end)
+pcall(function() Library:SetDefaultTheme("Rose") end)
+local Window = Library:CreateWindow({
+    Name = "Tap Simulator",
+    LoadingSubtitle = VERSION,
+    ToggleUIKeybind = "RightControl",
+    ConfigurationSaving = { Enabled = true, FolderName = "TapSimulatorCustom", FileName = "default" },
+    ToggleButton = { Platform = "Mobile" },
+    Home = { Title = "Tap Simulator: Reborn", Tier = VERSION, Stats = { "Players", "Session", "FPS", "Ping" } },
+})
+Hub.Window = Window
+local tabs = {}
+for _, def in ipairs({
+    { "Main", "house" }, { "Tapping", "hand" }, { "Pets", "egg" },
+    { "Craft", "hammer" }, { "Rewards", "gift" }, { "World", "globe" },
+    { "Minigames", "gamepad-2" }, { "Settings", "settings" },
+}) do tabs[def[1]] = Window:CreateTab({ Name = def[1], Icon = def[2] }) end
+Hub.Tabs = tabs
+
+-- This module registry is the main extension point for future features.
+-- Each feature runs independently and does not depend on the GUI implementation.
+function Hub.RegisterFeature(name, run, every)
+    assert(type(name) == "string" and type(run) == "function")
+    assert(Hub.Features[name] == nil, "Feature already exists: " .. name)
+    Hub.Features[name] = { Run = run, Every = every or 1, Errors = 0 }
+    task.spawn(function()
+        while alive do
+            local current = Hub.Features[name]
+            local ok, err = xpcall(current.Run, tostring)
+            if not ok then
+                current.Errors += 1
+                Hub.Status = name .. ": " .. string.sub(tostring(err), 1, 80)
+                if current.Errors == 1 or current.Errors % 15 == 0 then warn("[Tap Simulator]", name, err) end
+            else
+                current.Errors = 0
+            end
+            task.wait(math.max(0.05, tonumber(current.Every) or 1))
+        end
+    end)
+end
+function Hub.NewGroup(tabName, name, side)
+    local tab = assert(tabs[tabName], "Missing tab " .. tostring(tabName))
+    if side == "Right" then return tab:AddRightGroupbox({ Name = name, Icon = "settings" }) end
+    return tab:AddLeftGroupbox({ Name = name, Icon = "activity" })
+end
+function Hub.AddToggle(group, label, flag, default)
+    Hub.Flags[flag] = default == true
+    return group:CreateToggle({
+        Name = label, Flag = flag, CurrentValue = default == true,
+        Callback = function(value) Hub.Flags[flag] = value == true end,
+    })
+end
+function Hub.AddSlider(group, label, flag, low, high, step, default)
+    Hub.Flags[flag] = default
+    return group:CreateSlider({
+        Name = label, Flag = flag, Range = { low, high }, Increment = step,
+        CurrentValue = default,
+        Callback = function(value) Hub.Flags[flag] = tonumber(value) or default end,
+    })
+end
+
+local overview = Hub.NewGroup("Main", "Overview")
+overview:CreateStatusList({
+    Name = "Session", MaxRows = 6, UpdateRate = 1,
+    Update = function()
+        local d = data()
+        local currency = d and d.Currencies or {}
+        return {
+            { Text = "Status", Value = Hub.Status },
+            { Text = "Taps", Value = tostring(Hub.Counters.Taps) },
+            { Text = "Rebirths", Value = tostring(Hub.Counters.RebirthRequests) .. " requests" },
+            { Text = "Coins", Value = tostring(currency.Coins or "Loading") },
+            { Text = "Auto Tap", Value = Hub.Flags.AutoTap and "ON" or "OFF" },
+        }
+    end,
+})
+local main = Hub.NewGroup("Main", "Quick Controls", "Right")
+main:CreateStatusList({ Name = "Modules", MaxRows = 2, UpdateRate = 5, Update = function() return {{ Text = "Core", Value = "Tapping + Rebirth" }, { Text = "Other tabs", Value = "Extension slots" }} end })
+
+local tapGroup = Hub.NewGroup("Tapping", "Tap Automation")
+Hub.AddToggle(tapGroup, "Auto Tap", "AutoTap", false)
+Hub.AddSlider(tapGroup, "Taps Per Second", "TapRate", 1, 10, 1, 8)
+Hub.AddToggle(tapGroup, "Game Auto Clicker", "AutoClicker", false)
+
+local rebirthGroup = Hub.NewGroup("Tapping", "Rebirth", "Right")
+Hub.AddToggle(rebirthGroup, "Auto Rebirth", "AutoRebirth", false)
+Hub.AddSlider(rebirthGroup, "Rebirth Interval", "RebirthEvery", 1, 15, 1, 3)
+rebirthGroup:CreateButton({
+    Name = "Rebirth Once", Callback = function()
+        local ok, why = fire("RebirthService", "RebirthRequested", { Index = 1 })
+        if not ok then Hub.Status = tostring(why) end
+    end,
+})
+
+-- Keep the sections visible now, so new features can be added without restructuring.
+for _, item in ipairs({
+    { "Pets", "Hatching" }, { "Pets", "Equip & Enchant" },
+    { "Craft", "Pet Machines" }, { "Craft", "Potions" },
+    { "Rewards", "Daily & Quests" }, { "Rewards", "Chests & Spins" },
+    { "World", "Islands & Creatures" }, { "World", "World Events" },
+    { "Minigames", "Defense & Mining" }, { "Minigames", "Other Minigames" },
+}) do
+    local section = Hub.NewGroup(item[1], item[2], "Left")
+    section:CreateStatusList({ Name = "Module", MaxRows = 1, UpdateRate = 10, Update = function() return {{ Text = "Status", Value = "Not implemented yet" }} end })
+end
+
+local settings = Hub.NewGroup("Settings", "Script")
+settings:CreateButton({ Name = "Stop Script", Callback = disconnect })
+settings:CreateStatusList({ Name = "Extensions", MaxRows = 1, UpdateRate = 5, Update = function() return {{ Text = "Feature API", Value = "Ready" }} end })
+
+local TAP_SEQUENCE_KEY = "__CustomTapSimulatorSequence"
+local sequence = tonumber(env[TAP_SEQUENCE_KEY]) or 0
+local nextTap = 0
+Hub.RegisterFeature("AutoTap", function()
+    if not Hub.Flags.AutoTap then return end
+    local now = os.clock()
+    if now < nextTap then return end
+    nextTap = now + (1 / math.clamp(tonumber(Hub.Flags.TapRate) or 8, 1, 10))
+    sequence += 1
+    env[TAP_SEQUENCE_KEY] = sequence
+    local ok, err = fire("TapService", "TapRequested", { Auto = false, ClientSequence = sequence, Source = "button" })
+    if ok then
+        Hub.Counters.Taps += 1
+        Hub.Status = "Auto tapping"
+    else
+        Hub.Status = tostring(err)
+    end
+end, 0.05)
+
+local lastClicker
+Hub.RegisterFeature("AutoClicker", function()
+    if lastClicker == Hub.Flags.AutoClicker then return end
+    local ok, err = fire("AutoClickService", "AutoClickRequested", { Enabled = Hub.Flags.AutoClicker })
+    if ok then lastClicker = Hub.Flags.AutoClicker else Hub.Status = tostring(err) end
+end, 0.5)
+
+local nextRebirth = 0
+Hub.RegisterFeature("AutoRebirth", function()
+    if not Hub.Flags.AutoRebirth then return end
+    if os.clock() < nextRebirth then return end
+    nextRebirth = os.clock() + math.max(1, tonumber(Hub.Flags.RebirthEvery) or 3)
+    local ok, err = fire("RebirthService", "RebirthRequested", { Index = 1 })
+    if ok then Hub.Counters.RebirthRequests += 1 else Hub.Status = tostring(err) end
+end, 0.5)
+Hub.Status = "Ready"
+print("[Tap Simulator] " .. VERSION .. " loaded with your GUI. Extension API: getgenv().__TapSimulatorCustomHub")
