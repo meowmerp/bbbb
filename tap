@@ -7931,6 +7931,9 @@ __modules["vendor/customui"] = function(use)
     assert(make, "Custom GUI compilation failed: " .. tostring(err))
     local Native = make()
     assert(type(Native) == "table" and type(Native.CreateWindow) == "function", "Custom GUI did not return a library")
+    -- Match the Deforestation GUI's typography and default theme.
+    pcall(function() Native:LoadFont({ Name = "ValleySans" }) end)
+    pcall(function() Native:SetDefaultTheme("Rose") end)
     local Lib = { Options = {}, Toggles = {} }
     local closing = {}
     local nativeWindow
@@ -8058,13 +8061,32 @@ __modules["vendor/customui"] = function(use)
     end
     function Lib:CreateWindow(cfg)
         nativeWindow=Native:CreateWindow({
-            Name="Tap Simulator",LoadingSubtitle="Full Feature Edition",
-            ToggleUIKeybind="RightControl",ConfigurationSaving={Enabled=true,FolderName="TapSimulatorCustom",FileName="full"},
-            Home={Title="Tap Simulator: Reborn",Tier="Full",Stats={"Players","Session","FPS","Ping"}}
+            Name="Tap Simulator",LoadingSubtitle="v1.4",
+            ToggleUIKeybind="RightControl",
+            ConfigurationSaving={Enabled=true,FolderName="Ouroboros/TapSimulator",FileName="default"},
+            ToggleButton={Platform="Mobile"},
+            Home={Title="Welcome to Tap Simulator!",Tier="v1.4",Stats={"Players","Session","FPS","Ping"}}
         })
         local wrapper={}
         function wrapper:AddTab(name,icon,description)
             local tab=nativeWindow:CreateTab({Name=name,Icon=icon or "activity"})
+            if name == "Settings" then
+                -- Use exactly the same first-party GUI settings controls as Deforestation.
+                local menu = tab:AddLeftGroupbox({Name="Menu",Icon="monitor"})
+                menu:CreateKeybind({Name="Toggle UI",CurrentKeybind="RightControl",Flag="ToggleUIKey",Callback=function() end,
+                    OnChanged=function(key) pcall(function() nativeWindow:SetKeybind(key) end) end})
+                menu:CreateDropdown({Name="Toggle button",Options={"Mobile only","Mobile & PC"},
+                    CurrentOption="Mobile only",AllowNone=false,Flag="ToggleButtonPlatform",
+                    Callback=function(value)
+                        local label=type(value)=="table" and value[1] or value
+                        pcall(function() nativeWindow:SetToggleButtonPlatform(label=="Mobile & PC" and "Both" or "Mobile") end)
+                    end})
+                menu:CreateButton({Name="Unload",Icon="power",Callback=function()
+                    Native:Confirm({Title="Unload?",ConfirmText="Unload",Callback=function() Lib:Unload() end})
+                end})
+                tab:CreateConfigManager({Name="Configs",Side="Left"})
+                tab:CreateThemeManager({Name="Themes",Side="Right"})
+            end
             return tabWrap(tab)
         end
         return wrapper
@@ -8914,147 +8936,19 @@ end
 
 return Performance
 end
+-- Tree-style GUI settings are registered natively in vendor/customui when Settings tab is created.
 __modules["shared/settings"] = function(use)
--- Custom GUI configuration manager, independent from the old Obsidian addons.
-local Env = use("shared/env")
-local Ui = use("shared/ui")
-local Life = use("shared/life")
-local Http = game:GetService("HttpService")
-local Settings = {}
-local DIR = "TapSimulatorCustom/profiles"
-local DEFAULT_NAME = "default"
-local selectedName = DEFAULT_NAME
-local function safeName(value)
-    value = tostring(value or ""):gsub("[^%w_%-]", "_"):sub(1, 40)
-    return value ~= "" and value or DEFAULT_NAME
-end
-local function ensureDir()
-    if not (isfolder and makefolder) then return false end
-    for _, dir in ipairs({"TapSimulatorCustom", DIR}) do
-        if not isfolder(dir) then local ok=pcall(makefolder,dir); if not ok then return false end end
+    local Env = use("shared/env")
+    local Ui = use("core/ui")
+    local Settings = {}
+    function Settings.build(_)
+        local group = Ui.Tabs.Settings:AddGroupbox({Side="Right",Name="Script Info",IconName="info"})
+        group:AddLabel("Configs and themes are managed by the same GUI components as Deforestation.",true)
+        group:AddLabel("Executor: "..tostring(Env.executor),true)
+        return Settings
     end
-    return true
-end
-local function path(name) return DIR .. "/" .. safeName(name) .. ".json" end
-local function getValue(control)
-    if control == nil then return nil end
-    return control.Value
-end
-local function capture()
-    local values = {}
-    for key, control in pairs(Ui.Toggles) do
-        local value=getValue(control)
-        if type(value)=="boolean" then values[key]=value end
-    end
-    for key, control in pairs(Ui.Options) do
-        local value=getValue(control)
-        if type(value)=="string" or type(value)=="number" or type(value)=="boolean" or type(value)=="table" then
-            values[key]=value
-        end
-    end
-    return {version=1,values=values}
-end
-local function apply(data)
-    if type(data)~="table" or type(data.values)~="table" then return false,"invalid profile" end
-    local applied=0
-    -- Apply options before toggles, so automations see their restored parameters.
-    for _, bucket in ipairs({Ui.Options,Ui.Toggles}) do
-        for key,value in pairs(data.values) do
-            local control=(key ~= "CustomConfigName" and key ~= "CustomConfigChoice") and bucket[key] or nil
-            if control and type(control.SetValue)=="function" then
-                local ok=pcall(control.SetValue,control,value)
-                if ok then applied+=1 end
-            end
-        end
-    end
-    return true,applied
-end
-local function save(name)
-    if not (writefile and ensureDir()) then return false,"file writes unavailable" end
-    local ok,err=pcall(function() writefile(path(name),Http:JSONEncode(capture())) end)
-    return ok,err
-end
-local function load(name)
-    if not (isfile and readfile and isfile(path(name))) then return false,"profile not found" end
-    local ok,data=pcall(function() return Http:JSONDecode(readfile(path(name))) end)
-    if not ok then return false,data end
-    return apply(data)
-end
-local function list()
-    local found={}
-    if listfiles and ensureDir() then
-        local ok,items=pcall(listfiles,DIR)
-        if ok and type(items)=="table" then
-            for _,value in ipairs(items) do
-                local n=tostring(value):gsub("\\","/"):match("([^/]+)%.json$")
-                if n then table.insert(found,n) end
-            end
-        end
-    end
-    table.sort(found)
-    if #found==0 then found[1]=DEFAULT_NAME end
-    return found
-end
-local function notify(msg) Ui.notify("Tap Simulator Config", tostring(msg),5) end
-function Settings.build(_)
-    local tab=Ui.Tabs.Settings
-    local group=tab:AddGroupbox({Side="Right",Name="Configuration Profiles",IconName="save"})
-    local available=list()
-    local dropdown=group:AddDropdown("CustomConfigChoice",{
-        Text="Saved profiles",Values=available,Default=available[1],
-        Callback=function(value) selectedName=safeName(value) end,
-    })
-    local nameBox=group:AddInput("CustomConfigName",{
-        Text="Profile name",Default=DEFAULT_NAME,
-        Callback=function(value) selectedName=safeName(value) end,
-    })
-    local function refresh()
-        available=list()
-        dropdown:SetValues(available)
-    end
-    group:AddButton({Text="Save profile",Func=function()
-        local ok,err=save(selectedName)
-        notify(ok and ("Saved profile: "..selectedName) or ("Save failed: "..tostring(err)))
-        if ok then refresh() end
-    end})
-    group:AddButton({Text="Load profile",Func=function()
-        local ok,result=load(selectedName)
-        notify(ok and ("Loaded "..selectedName.." ("..tostring(result).." settings)") or ("Load failed: "..tostring(result)))
-    end})
-    group:AddButton({Text="Delete profile",Func=function()
-        if not (delfile and isfile and isfile(path(selectedName))) then notify("Cannot delete: profile missing or file access unavailable") return end
-        local ok,err=pcall(delfile,path(selectedName))
-        notify(ok and ("Deleted: "..selectedName) or ("Delete failed: "..tostring(err)))
-        if ok then refresh() end
-    end})
-    group:AddButton({Text="Refresh profiles",Func=refresh})
-    group:AddButton({Text="Set as autoload",Func=function()
-        if not (writefile and ensureDir()) then notify("File writes unavailable") return end
-        local ok,err=pcall(writefile,DIR.."/autoload.txt",selectedName)
-        notify(ok and ("Autoload set: "..selectedName) or ("Autoload failed: "..tostring(err)))
-    end})
-    group:AddButton({Text="Clear autoload",Func=function()
-        local name=DIR.."/autoload.txt"
-        if delfile and isfile and isfile(name) then pcall(delfile,name) end
-        notify("Autoload cleared")
-    end})
-    group:AddLabel("Profiles are stored in "..DIR..". Save manually after changing settings. Autoload applies after features initialize.",true)
-    local menu=tab:AddGroupbox({Side="Left",Name="Menu",IconName="settings"})
-    menu:AddButton({Text="Unload script",Func=function() Ui.Library:Unload() end})
-    local info=tab:AddGroupbox({Side="Left",Name="Compatibility",IconName="cpu"})
-    info:AddLabel("Executor: "..tostring(Env.executor).."\nConfig file saving: "..(writefile and readfile and "available" or "unavailable"),true)
+    function Settings.finish() end
     return Settings
-end
-function Settings.finish()
-    if not (readfile and isfile and isfile(DIR.."/autoload.txt")) then return end
-    local ok,name=pcall(readfile,DIR.."/autoload.txt")
-    if ok then
-        local loaded,result=load(name)
-        if loaded then notify("Autoloaded profile: "..safeName(name))
-        else notify("Autoload failed: "..tostring(result)) end
-    end
-end
-return Settings
 end
 __modules["shared/ui"] = function(use) -- src/shared/ui.luau
 -- The window, its tabs, notifications, and small helpers features build their panels from.
