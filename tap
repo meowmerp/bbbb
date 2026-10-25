@@ -1,7 +1,7 @@
 -- Tap Simulator: Reborn | Independent, expandable edition using your GitHub GUI
--- v1.0 -- Original implementation. Does not load Slopix/Corny modules or servers.
+-- v1.1 -- Expanded implementation. Does not load Slopix/Corny modules or servers.
 -- Features can be extended by adding a module via Hub.RegisterFeature(tabName, groupName, definition).
-local VERSION = "v1.0"
+local VERSION = "v1.1"
 local GUI_URL = "https://raw.githubusercontent.com/meowmerp/bbbb/refs/heads/main/gui"
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -74,6 +74,27 @@ end
 Hub.Data = data
 Hub.Fire = fire
 Hub.Remote = remote
+local function invoke(service, name, ...)
+    local root = ReplicatedStorage:FindFirstChild("RemoteServices")
+    local svc = root and root:FindFirstChild(service)
+    local rf = svc and svc:FindFirstChild("RF")
+    local rem = rf and rf:FindFirstChild(name)
+    if not rem then return false, "Missing " .. service .. "." .. name end
+    local args = table.pack(...)
+    local done, result = false, nil
+    task.spawn(function()
+        result = table.pack(pcall(function()
+            return rem:InvokeServer(table.unpack(args, 1, args.n))
+        end))
+        done = true
+    end)
+    local deadline = os.clock() + 8
+    while alive and not done and os.clock() < deadline do task.wait(.05) end
+    if not done then return false, "timeout" end
+    return table.unpack(result, 1, result.n)
+end
+Hub.Invoke = invoke
+
 
 local source = game:HttpGet(GUI_URL .. "?v=" .. HttpService:GenerateGUID(false), true)
 local compiled, compileError = loadstring(source)
@@ -174,18 +195,7 @@ rebirthGroup:CreateButton({
     end,
 })
 
--- Keep the sections visible now, so new features can be added without restructuring.
-for _, item in ipairs({
-    { "Pets", "Hatching" }, { "Pets", "Equip & Enchant" },
-    { "Craft", "Pet Machines" }, { "Craft", "Potions" },
-    { "Rewards", "Daily & Quests" }, { "Rewards", "Chests & Spins" },
-    { "World", "Islands & Creatures" }, { "World", "World Events" },
-    { "Minigames", "Defense & Mining" }, { "Minigames", "Other Minigames" },
-}) do
-    local section = Hub.NewGroup(item[1], item[2], "Left")
-    section:CreateStatusList({ Name = "Module", MaxRows = 1, UpdateRate = 10, Update = function() return {{ Text = "Status", Value = "Not implemented yet" }} end })
-end
-
+-- Each feature's controls are defined alongside its independent worker below.
 local settings = Hub.NewGroup("Settings", "Script")
 settings:CreateButton({ Name = "Stop Script", Callback = disconnect })
 settings:CreateStatusList({ Name = "Extensions", MaxRows = 1, UpdateRate = 5, Update = function() return {{ Text = "Feature API", Value = "Ready" }} end })
@@ -224,5 +234,267 @@ Hub.RegisterFeature("AutoRebirth", function()
     local ok, err = fire("RebirthService", "RebirthRequested", { Index = 1 })
     if ok then Hub.Counters.RebirthRequests += 1 else Hub.Status = tostring(err) end
 end, 0.5)
+
+-- EXTENDED FEATURES: independent implementations using the game's request API.
+local function addSection(tab, name, side) return Hub.NewGroup(tab, name, side) end
+local function toggle(group, label, flag, enabled) return Hub.AddToggle(group,label,flag,enabled or false) end
+local function slider(group, label, flag, minimum, maximum, initial)
+    return Hub.AddSlider(group,label,flag,minimum,maximum,1,initial)
+end
+local function button(group, name, fn)
+    group:CreateButton({Name=name,Callback=function()
+        local ok,err=pcall(fn)
+        if not ok then Hub.Status=tostring(err) warn("[Tap Simulator]",name,err) end
+    end})
+end
+local function getSub(root, ...)
+    local t=root
+    for _,key in ipairs({...}) do t=type(t)=="table" and t[key] or nil end
+    return t
+end
+local function config(path)
+    local node=ReplicatedStorage
+    for _,part in ipairs(path) do node=node and node:FindFirstChild(part) end
+    if not (node and node:IsA("ModuleScript")) then return nil end
+    local ok,res=pcall(require,node)
+    return ok and type(res)=="table" and res or nil
+end
+local function iterateOrder(conf,fallback)
+    if type(conf)=="table" and type(conf.Order)=="table" and #conf.Order>0 then return conf.Order end
+    return fallback
+end
+local function requestOk(ok,reply)
+    return ok and (type(reply)~="table" or reply.Success~=false)
+end
+
+-- General character / movement helpers
+local function rootPart()
+    local char=player.Character
+    return char and char:FindFirstChild("HumanoidRootPart")
+end
+local function goToModel(model)
+    local hrp=rootPart()
+    if not (hrp and model) then return false end
+    local ok,pivot=pcall(function() return model:GetPivot() end)
+    if not ok then return false end
+    hrp.AssemblyLinearVelocity=Vector3.zero
+    hrp.CFrame=CFrame.new(pivot.Position+Vector3.new(0,0,5),pivot.Position)
+    return true
+end
+
+local upgradeGroup=addSection("Tapping","Auto Upgrades","Right")
+toggle(upgradeGroup,"Buy Available Upgrades","AutoUpgrade",false)
+slider(upgradeGroup,"Check Every (seconds)","UpgradeEvery",2,30,6)
+local upgradeOrder=iterateOrder(config({"Shared","Progression","UpgradeConfig"}),{
+    "FreeAutoClicker","ClickMultiplier","HatchSpeed","CriticalChance","AutoClickerSpeed","Teleport"})
+Hub.RegisterFeature("AutoUpgrade",function()
+    if not Hub.Flags.AutoUpgrade then return end
+    for _,name in ipairs(upgradeOrder) do
+        if not alive or not Hub.Flags.AutoUpgrade then break end
+        local ok,result=invoke("UpgradeService","Purchase",{Name=name})
+        if ok and type(result)=="table" and result.Success then
+            Hub.Counters.Upgrades=(Hub.Counters.Upgrades or 0)+1
+            Hub.Status="Bought "..name
+        end
+        task.wait(.45)
+    end
+end,6)
+
+local skillGroup=addSection("Tapping","Skill Tree","Right")
+toggle(skillGroup,"Unlock Affordable Skills","AutoSkills",false)
+local skillCfg=config({"Shared","Progression","SkillTreeConfig"})
+local skillNodes={}
+local function collectSkill(node,depth)
+    if depth>5 or type(node)~="table" then return end
+    for k,v in pairs(node) do
+        if type(v)=="table" then
+            if type(v.Name)=="string" then skillNodes[v.Name]=true end
+            collectSkill(v,depth+1)
+        end
+    end
+end
+collectSkill(skillCfg,0)
+Hub.RegisterFeature("AutoSkills",function()
+    if not Hub.Flags.AutoSkills then return end
+    local d=data()
+    local current=getSub(d,"SkillTree","Unlocked") or {}
+    for name in pairs(skillNodes) do
+        if not alive or not Hub.Flags.AutoSkills then break end
+        if current[name]~=true then
+            local ok,r=invoke("SkillTreeService","Unlock",{Name=name})
+            if ok and type(r)=="table" and r.Success then
+                Hub.Counters.Skills=(Hub.Counters.Skills or 0)+1
+            end
+            task.wait(.35)
+        end
+    end
+end,9)
+
+local pets=addSection("Pets","Pet Management")
+toggle(pets,"Equip Best Pets","AutoEquipBest",false)
+button(pets,"Equip Best Now",function()
+    local ok,why=fire("PetService","PetActionRequested",{Action="EquipBest"})
+    Hub.Status=ok and "Requested equip best" or tostring(why)
+end)
+Hub.RegisterFeature("AutoEquipBest",function()
+    if not Hub.Flags.AutoEquipBest then return end
+    fire("PetService","PetActionRequested",{Action="EquipBest"})
+end,12)
+
+local hatch=addSection("Pets","Egg Hatching","Right")
+toggle(hatch,"Auto Hatch Selected Egg","AutoHatch",false)
+slider(hatch,"Eggs Per Request","HatchCount",1,3,1)
+slider(hatch,"Hatch Interval (seconds)","HatchEvery",1,15,3)
+-- Choose egg names from the game's shipped egg config, or enter a custom name in Hub.Flags.EggName.
+local eggConfig=config({"Shared","Pets","LaunchEggConfig"}) or {}
+local eggNames={}
+for name,definition in pairs(eggConfig) do
+    if type(name)=="string" and type(definition)=="table" and name~="Test" then
+        eggNames[#eggNames+1]=name
+    end
+end
+table.sort(eggNames)
+Hub.Flags.EggName=eggNames[1]
+local eggIndex=1
+button(hatch,"Select Next Egg",function()
+    if #eggNames==0 then Hub.Status="No egg config found" return end
+    eggIndex=eggIndex%#eggNames+1
+    Hub.Flags.EggName=eggNames[eggIndex]
+    Hub.Status="Selected egg: "..Hub.Flags.EggName
+end)
+hatch:CreateStatusList({Name="Selected Egg",MaxRows=2,UpdateRate=1,Update=function()
+    return {{Text="Egg",Value=tostring(Hub.Flags.EggName or "Unavailable")},
+        {Text="Available Eggs",Value=tostring(#eggNames)}}
+end})
+local hatchSequence=0
+Hub.RegisterFeature("AutoHatch",function()
+    if not Hub.Flags.AutoHatch then return end
+    local egg=Hub.Flags.EggName
+    if type(egg)~="string" then Hub.Status="No egg selected" return end
+    local eggsFolder=workspace:FindFirstChild("Eggs")
+    local model=eggsFolder and eggsFolder:FindFirstChild(egg)
+    if model then goToModel(model) end
+    hatchSequence+=1
+    local ok,reason=fire("EggService","EggHatchRequested",{
+        Egg=egg,Count=math.clamp(tonumber(Hub.Flags.HatchCount) or 1,1,3),
+        Auto=true,Seq=hatchSequence
+    })
+    if ok then
+        Hub.Counters.HatchRequests=(Hub.Counters.HatchRequests or 0)+1
+        Hub.Status="Hatching "..egg
+    else Hub.Status=tostring(reason) end
+end,3)
+
+local craft=addSection("Craft","Pet Crafting")
+toggle(craft,"Auto Craft Golden","CraftGolden",false)
+toggle(craft,"Auto Craft Diamond","CraftDiamond",false)
+-- Craft All is protected by normal in-game progression and proximity checks.
+Hub.RegisterFeature("AutoCraft",function()
+    if not (Hub.Flags.CraftGolden or Hub.Flags.CraftDiamond) then return end
+    local machines=workspace:FindFirstChild("Machines")
+    for _,entry in ipairs({{"CraftGolden","Golden"},{"CraftDiamond","Diamond"}}) do
+        if Hub.Flags[entry[1]] then
+            local model=machines and machines:FindFirstChild(entry[2].."Machine")
+            if model then goToModel(model) end
+            fire("MachineService","MachineCraftRequested",{Action="CraftAll",Machine=entry[2]})
+            task.wait(.6)
+        end
+    end
+end,15)
+
+local quests=addSection("Rewards","Quests")
+toggle(quests,"Claim Completed Quests","AutoQuests",false)
+Hub.RegisterFeature("AutoQuests",function()
+    if not Hub.Flags.AutoQuests then return end
+    local qs=getSub(data(),"Quests")
+    if type(qs)~="table" then return end
+    for id,q in pairs(qs) do
+        if not alive or not Hub.Flags.AutoQuests then break end
+        if type(q)=="table" and q.Completed and not q.Claimed then
+            local ok,r=invoke("QuestService","ClaimQuest",{Quest=id})
+            if requestOk(ok,r) then Hub.Counters.Quests=(Hub.Counters.Quests or 0)+1 end
+            task.wait(.4)
+        end
+    end
+end,7)
+
+local offline=addSection("Rewards","Offline & Daily","Right")
+toggle(offline,"Auto Claim Offline Earnings","AutoOffline",false)
+button(offline,"Claim Offline Now",function()
+    local ok,r=invoke("OfflineRewardsService","Claim",false)
+    Hub.Status=ok and "Offline claim attempted" or tostring(r)
+end)
+Hub.RegisterFeature("AutoOffline",function()
+    if Hub.Flags.AutoOffline then invoke("OfflineRewardsService","Claim",false) end
+end,90)
+
+local chests=addSection("Rewards","Chests & Wheels")
+toggle(chests,"Auto Claim Chests","AutoChests",false)
+toggle(chests,"Auto Spin Wheels","AutoWheels",false)
+Hub.RegisterFeature("AutoChests",function()
+    if not Hub.Flags.AutoChests then return end
+    local cfg=config({"Shared","Rewards","TapChestConfig"})
+    local ids={}
+    if cfg then for id in pairs(cfg) do if type(id)=="string" then ids[#ids+1]=id end end end
+    for _,id in ipairs(ids) do
+        if not Hub.Flags.AutoChests then break end
+        invoke("TapChestService","Claim",id)
+        task.wait(.4)
+    end
+end,20)
+Hub.RegisterFeature("AutoWheels",function()
+    if not Hub.Flags.AutoWheels then return end
+    for _,wheel in ipairs({"Normal","Golden"}) do
+        invoke("EventWheelService","Spin",{WheelType=wheel})
+        task.wait(.5)
+    end
+end,35)
+
+local world=addSection("World","Island & Event Options")
+toggle(world,"Collect Nearby Pickups","AutoPickups",false)
+slider(world,"Pickup Range","PickupRange",5,50,20)
+Hub.RegisterFeature("AutoPickups",function()
+    if not Hub.Flags.AutoPickups then return end
+    local root=rootPart()
+    if not root then return end
+    local CollectionService=game:GetService("CollectionService")
+    for _,name in ipairs({"CloudRainPickup"}) do
+        for _,object in ipairs(CollectionService:GetTagged(name)) do
+            if not alive or not Hub.Flags.AutoPickups then return end
+            local part=object:IsA("BasePart") and object or (object:IsA("Model") and object.PrimaryPart)
+            if part and part.Parent and (part.Position-root.Position).Magnitude<Hub.Flags.PickupRange then
+                root.CFrame=part.CFrame
+                task.wait(.15)
+            end
+        end
+    end
+end,3)
+
+-- Honest feature inventory for game-specific systems not yet independently rebuilt.
+for _,item in ipairs({
+    {"Pets","Shrine, Enchant & Treats"},
+    {"Craft","Potions & Honey Pot"},
+    {"Rewards","Pet Index & Shiny Stars"},
+    {"World","Creature Hunts & World Events"},
+    {"Minigames","Defense, Mining & Digging"},
+    {"Minigames","Memory, Obbies & Events"},
+}) do
+    local title=item[2]
+    local section=addSection(item[1],title,"Right")
+    section:CreateStatusList({Name="Status",MaxRows=1,UpdateRate=10,Update=function()
+        return {{Text="Feature",Value="Needs implementation"}}
+    end})
+end
+local advanced=addSection("Main","Added Features","Right")
+advanced:CreateStatusList({Name="New Modules",MaxRows=6,UpdateRate=2,Update=function()
+    return {
+        {Text="Upgrades",Value=tostring(Hub.Counters.Upgrades or 0)},
+        {Text="Skills",Value=tostring(Hub.Counters.Skills or 0)},
+        {Text="Egg Requests",Value=tostring(Hub.Counters.HatchRequests or 0)},
+        {Text="Quest Claims",Value=tostring(Hub.Counters.Quests or 0)},
+        {Text="Selected Egg",Value=tostring(Hub.Flags.EggName or "None")},
+    }
+end})
+
 Hub.Status = "Ready"
 print("[Tap Simulator] " .. VERSION .. " loaded with your GUI. Extension API: getgenv().__TapSimulatorCustomHub")
